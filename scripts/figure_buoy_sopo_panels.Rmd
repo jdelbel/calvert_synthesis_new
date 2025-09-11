@@ -1,0 +1,1680 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Some new interpolation tutorials to consider:
+https://search.r-project.org/CRAN/refmans/rioja/html/interp.dataset.html
+https://github.com/hdugan/NTLlakeloads
+
+```{r}
+#Upload packages
+library(tidyverse)
+library(here)
+library(readxl)
+library(patchwork)
+library(lubridate)
+library(MBA)
+library(mgcv)
+library(FNN)
+library(zoo)
+library(reshape2)
+library(rioja)
+library(egg)
+library(palr)
+library(ggsci)
+library(gsw)
+
+```
+
+```{r}
+#QC'd Buoy fluorescence data
+#Put buoy QC pipline into Claude for suggestions.
+
+#2022
+b_f <- read.csv(here("outputs", "qc_buoy_2025-09-08.csv"))
+
+#Buoy salinity data
+buoy_ts <- read.csv(here("files", "ts_2025-09-08.csv"))
+
+#Corrected CTD fluorescence data
+ctd_fl <- read_csv(here("outputs", "qc_quench_kc10_fzh01_2025-09-08.csv"))
+
+#Downloading discrete chlorophyll samples - This could be done using the API
+cd <- read_csv(here("files", "chl_kc10_fzh01_2025-09-08.csv"))
+
+ctd <- read_csv(here("files", "ctd_kc10_fzh01_2025-08-09.csv"))
+
+#cm = chlorophylly march 
+cm <- read_csv(here("files", "chl_2022-03-09.csv")) 
+#cs = chlorophyll september
+cs <- read_csv(here("files", "chl_2022-09-09.csv")) 
+
+#CHEMTAX outputs
+chem <- read_csv(here("files", "chemtax_kc10_2024.csv"))
+
+#I think here I am downloading all of the wind data from the lookout?
+wind <- read_csv(here("files", "lo_wind_2025-09-08.csv"))
+
+weath <- read_csv(here("files", "enviro_weather_2025-04-14.csv"))
+```
+```{r}
+ctd_calc <- ctd %>% 
+  mutate(date = date(`Measurement time`)) %>%
+  filter(`Cast Direction Flag` == "d") %>% 
+  # filter(is.na(`Fluorometry Chlorophyll flag`)) %>% 
+  select(castpk = `Cast PK`,
+         ctd_num =`CTD serial number`,
+         date, m_time = `Measurement time`,
+         station = Station,
+         longitude = `Station Longitude`,
+         latitude = `Station Latitude`,
+         pres = `Pressure (dbar)`,
+         sal = `Salinity (PSU)`,
+         temp = `Temperature (deg C)`) %>%
+  mutate(
+    # Calculate absolute salinity from practical salinity
+    sa = gsw_SA_from_SP(sal, pres, longitude, latitude),  # Adjust lat/lon for your study area
+    # Calculate conservative temperature from in-situ temperature
+    ct = gsw_CT_from_t(sa, temp, pres),
+    # Calculate in-situ density (kg/m³)
+    density = gsw_rho(sa, ct, pres),
+    # Calculate potential density anomaly (sigma-theta, kg/m³ - 1000)
+    sigma_theta = gsw_sigma0(sa, ct)
+  )
+
+daily_ctd <- ctd_calc %>%
+  filter(!is.na(sal), !is.na(temp), !is.na(sigma_theta)) %>%  # Remove missing values
+  
+  # Step 1: Calculate daily means by depth
+  group_by(date, pres) %>%
+  summarise(
+    sal_daily = mean(sal, na.rm = TRUE),
+    temp_daily = mean(temp, na.rm = TRUE),
+    sigma_theta_daily = mean(sigma_theta, na.rm = TRUE),
+    .groups = 'drop'
+  )
+```
+
+
+
+
+```{r}
+#Pulling out discharge model outputs for each watershed type and pivoting to long format for plotting
+q <- weath %>% 
+  select(date, Q_GM, Q_SM, Q_RA) %>% 
+  pivot_longer(c(Q_GM:Q_RA), names_to = "Watershed_group", values_to = "Q") %>% 
+  drop_na() %>% 
+  group_by(date) %>% 
+  mutate(n = n()) %>% 
+  ungroup() %>% 
+  mutate(year = year(date))
+```
+
+```{r}
+#Pulling out the median nightly buoy fluorescence value from my QC process
+buoy_fl <- b_f %>% 
+  filter(year %in% c(2022, 2024, 2025))
+
+ctd_fl <- ctd_fl %>% 
+  mutate(year = year(date))
+```
+
+```{r}
+#Pulling out buoy salinity data without flags for 2022 and 2024 and calculating daily mean
+buoy_ts <- buoy_ts %>% 
+  mutate(measurementTime = mdy_hm(measurementTime),
+         date = date(measurementTime)) %>% 
+  filter(year %in% c(2022, 2024, 2025)) %>% 
+  group_by(date) %>% 
+  summarise(mean_sal = mean(WaterSalinity[WaterSalinity_UQL == 2], na.rm = TRUE),
+            mean_temp = mean(WaterTemp[WaterTemp_UQL == 2], na.rm = TRUE),
+            .groups = "drop")
+
+wind_dm <- wind %>% 
+  mutate(measurementTime = mdy_hm(measurementTime),
+         date = date(measurementTime)) %>% 
+  filter(year %in% c(2022, 2024, 2025)) %>% 
+  group_by(date) %>% 
+  summarise(WindSpd_Med = median(WindSpd_Avg[WindSpd_UQL == 2], na.rm = TRUE),
+            WindDir_Med = median(WindDir_Avg[WindDir_UQL == 2], na.rm = TRUE),
+            .groups = "drop") %>% 
+  mutate(year = year(date))
+  
+```
+
+
+```{r}
+#Pulling out the Bulk chlorophyll data for 2022, setting the 0m depth to 1m to join with the CTD fluorometer data and then changing an issue sample with the size-fractionated sum concentration
+cd <- cd %>% 
+  filter(filter_type == "Bulk GF/F" & line_out_depth == 0) %>% 
+  select(date, chla) %>% 
+  mutate(chla = case_when(date == "2022-05-05" ~ 1.41,
+                          TRUE ~ as.numeric(chla)))
+```
+
+```{r}
+#There were two saturated CTD casts in 2022 and here, I am prepping to iterpolate from discrete sample profiles - this is OK here as they are mixed conditions lacking strong peaks.
+
+#Wrangling the March 2022 discrete chlorophyll fluorescence profile
+cm <- cm %>% 
+  filter(filter_type == "Bulk GF/F") %>% 
+  select(date, pres = line_out_depth, chla) %>% 
+  mutate(pres = case_when(pres == 0 ~ 1,
+                          TRUE ~ as.numeric(pres)))
+#Wrangling the September 2022 discrete chlorophyll fluorescence profile
+cs <- cs %>% 
+  filter(filter_type == "Bulk GF/F") %>% 
+  select(date, pres = line_out_depth, chla) %>% 
+  mutate(pres = case_when(pres == 0 ~ 1,
+                          TRUE ~ as.numeric(pres)))
+
+#Combining the MArch and September discrete chlorophyll profile
+c_interp <- rbind(cm, cs)
+
+#Converting discrete chlorophyll profiles to wide format.
+c_interp <- c_interp %>% 
+  pivot_wider(names_from = "date", values_from = "chla")
+```
+
+
+```{r}
+#Performing the interpolation.
+
+# Select chlorophyll data and depths
+spec <- c_interp %>%
+  select(`2022-03-09`, `2022-09-09`)
+
+depth <- c_interp$pres
+
+# Interpolate to 1m intervals covering full depth range
+x.new <- seq(1, max(depth), by = 1)  # Goes to 325m now
+sp.interp <- interp.dataset(y = spec, x = depth, xout = x.new,
+                           method = "loess", span = 0.8)
+
+# Create interpolated dataframe
+interp <- as.data.frame(sp.interp) %>% 
+  mutate(pres = x.new) %>% 
+  pivot_longer(cols = 1:2, names_to = "date", values_to = "f_npq") %>% 
+  mutate(date = as.Date(date),
+         year = year(date),
+         f_npq = round(f_npq, 2)) %>% 
+  select(date, year, pres, f_npq)
+```
+
+```{r}
+#Wrangling the buoy fluorometer data and joining 2022 and 2024 with both
+buoy_fl <- buoy_fl %>% 
+  mutate(date = lubridate::ymd(date_corr),
+         year = lubridate::year(date),
+         yday = lubridate::yday(date)) %>% 
+  left_join(cd) %>% 
+  left_join(buoy_ts)
+```
+
+```{r}
+#Working with chemtax data to make it easy to plot
+
+#Making the date column a date format
+chem <- chem %>% 
+  mutate(date = lubridate::mdy(Date)) %>%
+  select(date, cyan = Cyanobacteria, hapt = Hapto, 
+         GA = `Prasinophytes-3`, cryp = Cryptophytes,
+         dino = `Dinoflagellates-1`, raph = Raphido,
+         dict = Dictyo, diat = `Diatoms-1`) %>% #rename groups
+  pivot_longer(c(cyan:diat), names_to = "group",
+               values_to = "contribution") %>%  #pivot longer
+  group_by(date, group) %>% 
+  summarise(contribution = mean(contribution)) %>% #Calculating daily mean for duplicates.
+  ungroup() %>% 
+  group_by(date) %>% 
+  mutate(tchla = sum(contribution)) %>% #Calculating TChla concentrations for each day
+  ungroup()
+
+
+#checking to see if there are any duplicates - there were replicates taken for DFO comparisons. None found because I already averaged these for the manuscript.
+chem_dup <- chem%>%
+  distinct(date, tchla) %>% 
+  group_by(date) %>% 
+  mutate(dup = n()) %>% 
+  ungroup() %>% 
+  filter(dup > 1)
+
+#Good to move forward
+```
+
+
+
+```{r}
+#Creating the 2022 wind speed cubed plot - what if i added wind direction or vector here?
+f_wind_22 <- wind_dm %>%
+  filter(year == 2022) %>%
+  ggplot() +
+  geom_line(aes(x = date, y = WindSpd_Med^3),
+            size = 2) +
+  ylim(0, 6000) +
+  labs(y = bquote(Wind~"("*m^3*s^3*")")) +
+  scale_x_date(limits = as_date(c("2022-01-01", "2022-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  theme(text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+
+print(f_wind_22)
+```
+
+```{r}
+#Creating the 2022 wind speed cubed plot - what if i added wind direction or vector here?
+f_wind_24 <- wind_dm %>%
+  filter(year == 2024) %>%
+  ggplot() +
+  geom_line(aes(x = date, y = WindSpd_Med^3),
+            size = 2) +
+  ylim(0, 6000) +
+  labs(y = bquote(Wind~"("*m^3*s^-3*")")) +
+  scale_x_date(limits = as_date(c("2024-01-01", "2024-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  theme(text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+
+print(f_wind_24)
+```
+
+```{r}
+#Creating the 2022 wind speed cubed plot - what if i added wind direction or vector here?
+f_wind_25 <- wind_dm %>%
+  filter(year == 2025) %>%
+  ggplot() +
+  geom_line(aes(x = date, y = WindSpd_Med^3),
+            size = 2) +
+  ylim(0, 6000) +
+  labs(y = bquote(Wind~"("*m^3*s^-3*")")) +
+  scale_x_date(limits = as_date(c("2025-01-01", "2025-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  theme(text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+
+print(f_wind_25)
+```
+
+```{r}
+#Setting up the joined buoy surface discrete chlorophyll 2m nightly median fluorescence and 2m daily mean salinity/temperature for plotting - pivoting long.
+
+buoy_fl_long <- buoy_fl %>%
+  select(date_corr, chla, fl_med_day, mean_sal, mean_temp) %>% 
+  pivot_longer(c(chla, fl_med_day, mean_sal, mean_temp),
+              names_to = "par", values_to = "val") %>% 
+  mutate(date = date(date_corr),
+         year = year(date))  
+```
+
+```{r}
+#Creating buoy figure for 2022 - discrete surface chlorophyll, daily fluorescence/temp/sal
+f_buoy_22 <- buoy_fl_long %>% 
+  filter(year == 2022) %>% 
+  ggplot(aes(x = date, y = val, color = par)) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "fl_med_day"),
+            size = 2) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "mean_sal"),
+            size = 2) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "mean_temp"),
+            size = 2) +
+  geom_point(data = filter(buoy_fl_long,
+                          par == "chla"),
+            size = 4, pch = 8, stroke = 2) +
+  ggsci::scale_color_jama(labels = c(expression(Chl[Discrete]),
+                                         expression(Chl[BUOY]),
+                                         expression(Salinity[BUOY]),
+                                     expression(Temp[BUOY]))) +
+  scale_x_date(limits = as_date(c("2022-01-01", "2022-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  ylab(expression(atop(Chl~"(mg" ~ m^-3*")",
+                       paste("Salinity,"~"Temp")))) +
+  labs(color = NULL) +
+  theme_bw() +
+  theme(legend.position = "right",
+        text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+
+print(f_buoy_22)
+```
+
+```{r}
+#Creating buoy figure for 2022 - discrete surface chlorophyll, daily fluorescence/temp/sal
+f_buoy_24 <- buoy_fl_long %>% 
+  filter(year == 2024) %>% 
+  ggplot(aes(x = date, y = val, color = par)) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "fl_med_day"),
+            size = 2) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "mean_sal"),
+            size = 2) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "mean_temp"),
+            size = 2) +
+  geom_point(data = filter(buoy_fl_long,
+                          par == "chla"),
+            size = 4, pch = 8, stroke = 2) +
+  ggsci::scale_color_jama(labels = c(expression(Chl[Discrete]),
+                                         expression(Chl[BUOY]),
+                                         expression(Salinity[BUOY]),
+                                     expression(Temp[BUOY]))) +
+  scale_x_date(limits = as_date(c("2024-01-01", "2024-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  ylab(expression(atop(Chl~"(mg" ~ m^-3*")",
+                       paste("Salinity,"~"Temp")))) +
+  labs(color = NULL) +
+  theme_bw() +
+  theme(legend.position = "right",
+        text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+
+print(f_buoy_24)
+```
+```{r}
+#Creating buoy figure for 2022 - discrete surface chlorophyll, daily fluorescence/temp/sal
+f_buoy_25 <- buoy_fl_long %>% 
+  filter(year == 2025) %>% 
+  ggplot(aes(x = date, y = val, color = par)) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "fl_med_day"),
+            size = 2) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "mean_sal"),
+            size = 2) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "mean_temp"),
+            size = 2) +
+  geom_point(data = filter(buoy_fl_long,
+                          par == "chla"),
+            size = 4, pch = 8, stroke = 2) +
+  ggsci::scale_color_jama(labels = c(expression(Chl[Discrete]),
+                                         expression(Chl[BUOY]),
+                                         expression(Salinity[BUOY]),
+                                     expression(Temp[BUOY]))) +
+  scale_x_date(limits = as_date(c("2025-01-01", "2025-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  ylab(expression(atop(Chl~"(mg" ~ m^-3*")",
+                       paste("Salinity,"~"Temp")))) +
+  labs(color = NULL) +
+  theme_bw() +
+  theme(legend.position = "right",
+        text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+
+print(f_buoy_25)
+```
+
+
+
+```{r}
+#Adding in 2022 interpolated CTD fluorescence profiles to fill gap of bad data
+
+ctd_fl <- ctd_fl %>% 
+  mutate(year = year(date)) %>% 
+  filter(year %in% c(2022, 2024, 2025)) %>% 
+  select(date, year, pres, f_npq)
+
+ctd_fl <- rbind(ctd_fl, interp)
+
+
+```
+
+```{r}
+#Setting color palette
+
+# Option 3: Viridis-inspired but with dark blue start
+fluor_palette_v3 <- colorRampPalette(c(
+  "#08306b",  # Deep navy blue
+  "#1f4e7a",  # Dark blue
+  "#2e6b89",  # Medium blue
+  "#4d8fc7",  # Bright blue
+  "#2fb3d4",  # Vivid cyan-blue (bloom threshold)
+  "#00a693",  # Bright teal
+  "#4daf4a",  # Vibrant green
+  "#8cc152",  # Lime green
+  "#ffd23f",  # Bright yellow
+  "#ff8c42",  # Vivid orange
+  "#e74c3c"   # Bold red-orange
+))
+
+# Generate color vectors (50 colors for smooth gradients)
+colors_v3 <- fluor_palette_v3(50)
+
+# Function to create breaks that emphasize bloom threshold
+create_fluor_breaks <- function(max_val = 50, bloom_threshold = 5) {
+  # More breaks in the 0-10 range to capture bloom dynamics
+  c(0, 1, 2, 3, 4, bloom_threshold, 7, 10, 15, 20, 30, 40, max_val)
+}
+
+overall_range <- ctd_fl %>% 
+  filter(pres < 51) %>% 
+  summarise(min_val = min(f_npq, na.rm = TRUE),
+            max_val = max(f_npq, na.rm = TRUE))
+```
+
+```{r}
+#Creating CTD profile plot for each year.
+
+f_ctd_fl_22 <- ctd_fl %>% 
+  filter(pres < 51 & year == 2022) %>% 
+  ggplot(aes(x = date)) +
+  geom_tile(aes(y = pres, fill = f_npq)) +
+  geom_hline(yintercept = 5,
+             linetype = "dashed", size = 1, color = "white") +
+  scale_y_reverse(breaks = seq(0, 50, by = 10)) +
+
+  scale_fill_gradientn(colors = colors_v3,
+                     values = scales::rescale(c(0, 2, 5, 10, 20, 50)),
+                     limits = c(overall_range$min_val, overall_range$max_val)) +
+  labs(fill = bquote(CTD[FLU]~"(mg" ~ m^-3*")"),
+       y = "Depth") +
+  scale_x_date(limits = as_date(c("2022-01-01", "2022-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  theme(text = element_text(size = 38), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        # axis.text.x = element_blank(),
+        legend.position = "right",
+        legend.key.height = unit(1.8, "cm"),
+        legend.title = element_text(size = 30, angle = 270),
+        legend.title.align = 0.5,
+        legend.direction = "vertical",
+        axis.text.x = element_blank()
+        ) +
+    guides(fill = guide_colourbar(title.position = "right"))
+
+print(f_ctd_fl_22)
+```
+
+```{r}
+#Creating CTD profile plot for each year.
+
+f_ctd_fl_24 <- ctd_fl %>% 
+  filter(pres < 51 & year == 2024) %>% 
+  ggplot(aes(x = date)) +
+  geom_tile(aes(y = pres, fill = f_npq)) +
+
+  geom_hline(yintercept = 5,
+             linetype = "dashed", size = 1, color = "white") +
+  scale_y_reverse(breaks = seq(0, 50, by = 10)) +
+  scale_fill_gradientn(colors = colors_v3,
+                     values = scales::rescale(c(0, 2, 5, 10, 20, 50)),
+                     limits = c(overall_range$min_val, overall_range$max_val)) +
+  labs(fill = bquote(CTD[FLU]~"(mg" ~ m^-3*")"),
+       y = "Depth") +
+  scale_x_date(limits = as_date(c("2024-01-01", "2024-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  theme(text = element_text(size = 38), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        # axis.text.x = element_blank(),
+        legend.position = "right",
+        legend.key.height = unit(1.8, "cm"),
+        legend.title = element_text(size = 30, angle = 270),
+        legend.title.align = 0.5,
+        legend.direction = "vertical",
+        axis.text.x = element_blank()
+        ) +
+    guides(fill = guide_colourbar(title.position = "right"))
+
+print(f_ctd_fl_24)
+```
+```{r}
+#Creating CTD profile plot for each year.
+
+f_ctd_fl_25 <- ctd_fl %>% 
+  filter(pres < 51 & year == 2025) %>% 
+  ggplot(aes(x = date)) +
+  geom_tile(aes(y = pres, fill = f_npq), width = 20) +
+  geom_hline(yintercept = 5,
+             linetype = "dashed", size = 1, color = "white") +
+  scale_y_reverse(breaks = seq(0, 50, by = 10)) +
+  scale_fill_gradientn(colors = colors_v3,
+                     values = scales::rescale(c(0, 2, 5, 10, 20, 50)),
+                     limits = c(overall_range$min_val, overall_range$max_val)) +
+  labs(fill = bquote(CTD[FLU]~"(mg" ~ m^-3*")"),
+       y = "Depth") +
+  scale_x_date(limits = as_date(c("2025-01-01", "2025-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  theme(text = element_text(size = 38), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        # axis.text.x = element_blank(),
+        legend.position = "right",
+        legend.key.height = unit(1.8, "cm"),
+        legend.title = element_text(size = 30, angle = 270),
+        legend.title.align = 0.5,
+        legend.direction = "vertical",
+        axis.text.x = element_blank()
+        ) +
+    guides(fill = guide_colourbar(title.position = "right"))
+
+print(f_ctd_fl_25)
+```
+
+
+```{r}
+
+
+# First, modify plots to remove redundant axes and legends
+# Wind plots - only leftmost gets y-axis, only bottom row gets x-axis
+f_wind_22_mod <- f_wind_22 + 
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+f_wind_24_mod <- f_wind_24 + 
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank())
+
+f_wind_25_mod <- f_wind_25 + 
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank())
+
+# Buoy plots - only leftmost gets y-axis and legend
+f_buoy_22_mod <- f_buoy_22 + 
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        legend.position = "none")
+
+f_buoy_24_mod <- f_buoy_24 + 
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        legend.position = "none")
+
+f_buoy_25_mod <- f_buoy_25 + 
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank())
+
+# CTD plots - only leftmost gets y-axis, only rightmost gets legend, bottom row gets x-axis
+f_ctd_fl_22_mod <- f_ctd_fl_22 + 
+  theme(axis.text.x = element_text(color = "black"),
+        legend.position = "none")
+
+f_ctd_fl_24_mod <- f_ctd_fl_24 + 
+  theme(axis.text.x = element_text(color = "black"),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        legend.position = "none")
+
+f_ctd_fl_25_mod <- f_ctd_fl_25 + 
+  theme(axis.text.x = element_text(color = "black"),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank()) # Keep legend on rightmost
+
+# Combine plots
+combined_plot <- (f_wind_22_mod | f_wind_24_mod | f_wind_25_mod) /
+                 (f_buoy_22_mod | f_buoy_24_mod | f_buoy_25_mod) /
+                 (f_ctd_fl_22_mod | f_ctd_fl_24_mod | f_ctd_fl_25_mod)
+
+# Add column titles
+combined_plot <- combined_plot + 
+  plot_annotation(
+    title = NULL,
+    theme = theme(plot.title = element_text(size = 40))
+  )
+
+# Add year labels at the top
+combined_plot_final <- wrap_elements(
+  grid::textGrob("2022", gp = grid::gpar(fontsize = 35))) |
+  wrap_elements(
+  grid::textGrob("2024", gp = grid::gpar(fontsize = 35))) |
+  wrap_elements(
+  grid::textGrob("2025", gp = grid::gpar(fontsize = 35))) 
+
+combined_plot_final <- combined_plot_final / combined_plot + 
+  plot_layout(heights = c(0.05, 1))
+
+test <- ggarrange(f_wind_22_mod, f_wind_24_mod, f_wind_25_mod,
+                  f_buoy_22_mod, f_buoy_24_mod, f_buoy_25_mod,
+                  f_ctd_fl_22_mod, f_ctd_fl_24_mod, f_ctd_fl_25_mod,
+                        ncol = 3)
+
+print(combined_plot_final)
+
+ggsave(here("figures", "panel_kc10_buoy_2022_2024_2025.png"),
+       test,
+        width = 35, height = 12, dpi = 300)
+```
+
+```{r}
+f_july_2022 <- buoy_fl %>% 
+  left_join(weath) %>% 
+  mutate(month = month(date)) %>% 
+  filter(year == 2022 & month == 7)
+
+f_july_2022 %>% 
+  ggplot(aes(x = fl_med_day, y = lag(mean_sal, 10))) +
+  geom_point()
+```
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+#Setting plotting order phytoplankton groups
+
+#Order phytoplankton groups roughly from smallest to largest - create order list
+order_chem <- c("cyan", "hapt", "GA", "cryp",
+                   "dino", "raph", "dict", "diat")
+
+#Chemtax full data - Specify order of phyto groups for figures
+chem <- arrange(mutate(chem,
+                                group = factor(group,
+                                levels = order_chem)))
+```
+
+```{r}
+f_chem_22 <- chem %>%
+  ggplot() +
+  geom_bar(aes(date, contribution, fill = fct_rev(group)),
+           position = "stack", stat = "identity",
+           alpha = 1, color = "black", size = 1) +
+  ggsci::scale_fill_npg() +
+  scale_x_date(limits = as.Date(c("2022-01-01", "2022-12-31")),
+               expand = c(0, 0),
+               date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  labs(y = bquote("Phyto. (mg" ~ m^-3*")"),
+       fill = "Group") +
+  theme(
+        legend.position = "right",
+        legend.key.height = unit(0.5, "cm"),
+        legend.title = element_blank(),
+        text = element_text(size = 38), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank())
+
+print(f_chem_22)
+```
+```{r}
+f_chem_24 <- chem %>%
+  ggplot() +
+  geom_bar(aes(date, contribution, fill = fct_rev(group)),
+           position = "stack", stat = "identity",
+           alpha = 1, color = "black", size = 1) +
+  ggsci::scale_fill_npg() +
+  scale_x_date(limits = as.Date(c("2024-01-01", "2024-12-31")),
+               expand = c(0, 0),
+               date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  labs(y = bquote("Phyto. (mg" ~ m^-3*")"),
+       fill = "Group") +
+  theme(
+        legend.position = "right",
+        legend.key.height = unit(0.5, "cm"),
+        legend.title = element_blank(),
+        text = element_text(size = 38), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank())
+
+print(f_chem_24)
+```
+```{r}
+f_22_panel <- ggarrange(f_wind_22, f_buoy_22, f_ctd_fl_22, f_chem_22,
+                        ncol = 1)
+
+ggsave(here("figures", "panel_kc10_2022_buoy_discrete.png"), f_22_panel,
+        width = 16, height = 16, dpi = 300)
+
+f_24_panel <- ggarrange(f_wind_24, f_buoy_24, f_ctd_fl_24, f_chem_24,
+                        ncol = 1)
+
+ggsave(here("figures", "panel_kc10_2024_buoy_discrete.png"), f_24_panel,
+        width = 16, height = 16, dpi = 300)
+```
+
+
+```{r}
+wind_22_24 <- wind %>% 
+  filter(year == 2022 | year == 2024) %>% 
+  mutate(yday = yday(date))
+
+  ggplot() + 
+  geom_line(data = wind_22_24, aes(x = yday, y = WindSpd_Med^3,
+                               color = as.factor(year)),
+            size = 2) +
+  ggsci::scale_color_aaas() +
+  labs(y = bquote(Wind~"("*m^-3*s^-3*")"),
+       color = NULL) +
+  facet_grid(year~.) +
+  # scale_x_date(limits = as_date(c("2022-01-01", "2022-12-31")),
+  #              expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  theme(text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        # axis.text.x = element_blank(),
+        legend.position = "none")
+
+ggsave(here("figures", "panel_kc10_2022_2024_wind.png"), 
+        width = 16, height = 10, dpi = 300)  
+```
+```{r}
+# Order locations from fjord to shelf
+riv_loc <- c("Q_GM",
+             "Q_SM",
+             "Q_RA",
+             "Q_tot")
+
+q <- arrange(mutate(q, 
+                      Watershed_group = factor(Watershed_group,
+                                               levels = riv_loc)))
+```
+
+```{r}
+f5 <- q %>% 
+  filter(year == 2022) %>% 
+  ggplot(aes(x = date, y = Q/10^3, fill = Watershed_group)) +
+  geom_area() +
+  scale_fill_uchicago() +
+  scale_x_date(limits = as.Date(c("2022-01-01", "2022-12-31")),
+               expand = c(0, 0),
+               date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  labs(y = bquote("Dis." ~ "("*10^3~m^3*~s^-1*")"),
+       fill = NULL) +
+  ylim(0, 5) +
+  theme(
+        legend.position = "right",
+        # legend.position = c(1.02, 0.5),
+        legend.key.height = unit(0.5, "cm"),
+        # legend.text = element_text(size = 25),
+        legend.title = element_blank(),
+        text = element_text(size = 38), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank())
+        # axis.text.y = element_blank())
+```
+
+```{r}
+# test3 <- ggarrange(f1, f2, f5, ncol = 1)
+# 
+#   
+# 
+# ggsave(here("figures", "panel_kc10_2022_CHEMTAX_2_FW.png"), test3,
+#         width = 16, height = 12, dpi = 300)
+```
+```{r}
+q_22 <- q %>% 
+  filter(year == 2022)
+
+#2022-07-12 to 15 discharge peaks
+#2022-07-24 to 26 buoy salinity minimum
+#so 9ish day lag?
+#is this consistent?
+
+
+```
+
+
+
+
+```{r}
+
+f6 <- q %>% 
+  filter(year == 2024) %>% 
+  ggplot(aes(x = date, y = Q/10^3, fill = Watershed_group)) +
+  geom_area() +
+  scale_fill_uchicago() +
+  scale_x_date(limits = as.Date(c("2024-01-01", "2024-12-31")),
+               expand = c(0, 0),
+               date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  labs(y = bquote("Dis." ~ "("*10^3~m^3*~s^-1*")"),
+       fill = NULL) +
+  ylim(0, 5) +
+  theme(
+        legend.position = "right",
+        # legend.position = c(1.02, 0.5),
+        legend.key.height = unit(0.5, "cm"),
+        # legend.text = element_text(size = 25),
+        legend.title = element_blank(),
+        text = element_text(size = 38), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank())
+        # axis.text.y = element_blank())
+
+```
+
+```{r}
+test4 <- ggarrange(f5, f6, ncol = 1)
+
+  
+
+ggsave(here("figures", "panel_kc10_2022_2024_Q.png"), test4,
+        width = 16, height = 8, dpi = 300)
+```
+
+```{r}
+b_all <- rbind(b22, b24)
+
+bf1 <- b_all %>% 
+  left_join(weath) %>%
+  mutate(month = month(date)) %>% 
+  filter(year == 2022) %>% 
+  mutate(month = month(date)) %>% 
+  ggplot(aes(x = lag(Q_Total/10^3, 9), y = mean_sal)) +
+  geom_point(aes(color = as.factor(month)), size = 4) +
+  geom_smooth(method = "lm") +
+  facet_grid(year~.) +
+  ggpubr::stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")),
+                   p.accuracy = 0.001, size = 9, label.y.npc = 0.1) +
+  ggpubr::stat_regline_equation(size = 9, label.y.npc = 0.16) +
+  ylim(15, 32) +
+  xlim(0, 5) +
+  labs(x = bquote(Q[TOTAL-9] ~ "("*10^3~m^3*~s^-1*")"),
+       y = bquote(Salinity[BUOY]),
+       color = "Month") +
+  scale_color_viridis_d(option = "turbo") +
+  theme_bw() +
+  theme(text = element_text(size = 30),
+        legend.position = "right",
+        axis.text = element_text(color = 'black'),
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+bf2 <- b_all %>% 
+  left_join(weath) %>% 
+  filter(year == 2024) %>% 
+  mutate(month = month(date)) %>% 
+  ggplot(aes(x = lag(Q_Total/10^3, 6), y = mean_sal)) +
+  geom_point(aes(color = as.factor(month)), size = 4) +
+  geom_smooth(method = "lm") +
+  facet_grid(year~.) +
+  ggpubr::stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")),
+                   p.accuracy = 0.001, size = 9, label.y.npc = 0.1) +
+  ggpubr::stat_regline_equation(size = 9, label.y.npc = 0.16) +
+  ylim(15, 32) +
+  xlim(0, 5) +
+  labs(x = bquote(Q[TOTAL-6] ~ "("*10^3~m^3*~s^-1*")"),
+       y = bquote(Salinity[BUOY]),
+       color = "Month") +
+  scale_color_viridis_d(option = "turbo") +
+  theme_bw() +
+  theme(text = element_text(size = 30),
+        legend.position = "right",
+        axis.text = element_text(color = 'black'),
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+bfig <- bf1/bf2 + plot_layout(guides = "collect")
+
+ggsave(here("figures", "discharge_buoy_sal.png"), bfig,
+        width = 8, height = 12, dpi = 300)
+```
+
+```{r}
+b_all <- b_all %>% 
+  group_by(year) %>% 
+  mutate(csum = cumsum(fl_med_day)) %>% 
+  mutate(max = max(csum)) %>% 
+  ungroup()
+```
+
+```{r}
+dates <- as.data.frame(seq(as.Date("2024-01-01"),as.Date("2024-12-04"),1))
+
+b24_cor1 <- b24 %>% 
+  filter(date <= "2024-03-19" | date >= "2024-03-25")
+
+b24_cor2 <- dates %>% 
+  rename(date = `seq(as.Date("2024-01-01"), as.Date("2024-12-04"), 1)`) %>% 
+  left_join(b24_cor1) %>% 
+  select(date, fl_med_day)
+
+b24_cor3 <- data.frame(date = seq(b24_cor2$date[1], b24_cor2$date[nrow(b24_cor2)], by = 1)) %>%
+  full_join(b24_cor2, by = "date") %>%
+  mutate(fl_fill = na.approx(fl_med_day))
+
+b22_cm <- b22 %>% 
+  mutate(med = median(fl_med_day),
+         fl_med = fl_med_day - med,
+         csum = cumsum(fl_med)) %>% 
+  select(date, fl = fl_med_day, csum)
+
+b24_cm <- b24_cor3 %>% 
+  mutate(med = median(fl_fill),
+         fl_med = fl_fill - med,
+         csum = cumsum(fl_med)) %>% 
+  select(date, fl = fl_fill, csum)
+
+cm <- rbind(b22_cm, b24_cm)
+
+
+csf_1 <- cm %>% 
+  mutate(yday = yday(date),
+         year = year(date),
+         date2 = as.Date(yday, origin = "2024-01-01")) %>% 
+  ggplot(aes(x = date2, y = fl)) +
+  geom_line(aes(color = as.factor(year)), size = 2) +
+  scale_x_date(date_breaks = "months", date_labels = "%b") +
+  scale_color_simpsons()+
+  scale_color_jama() +
+  ylab(bquote("Flu"[BUOY]~"(mg" ~ m^-2*")")) +
+  labs(color = NULL) +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank())
+
+csf_2 <- cm %>% 
+  mutate(yday = yday(date),
+         year = year(date),
+         date2 = as.Date(yday, origin = "2024-01-01")) %>% 
+  ggplot(aes(x = date2, y = csum)) +
+  geom_line(aes(color = as.factor(year)), size = 2) +
+  scale_x_date(date_breaks = "months", date_labels = "%b") +
+  scale_color_jama() +
+  ylab(bquote("Int. Flu"[BUOY]~"(mg" ~ m^-2*")")) +
+  labs(color = NULL) +
+  theme_bw() +
+  theme(legend.position = c(0.9, 0.13),
+        text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank())
+
+csfig <- csf_1/csf_2 
+
+ggsave(here("figures", "cum_sum.png"), csfig,
+        width = 16, height = 10, dpi = 300)
+```
+
+
+
+```{r}
+fs1 <- b22 %>% 
+  left_join(weath) %>% 
+  mutate(month = month(date)) %>%
+  ggplot(aes(x = mean_sal, y = fl_med_day)) +
+  geom_point(aes(color = as.factor(month)), size = 4) +
+  scale_color_viridis_d(option = "turbo") +
+  labs(x = bquote(Salinity[BUOY]),
+       y = bquote(flu[Buoy]~"("*mg~m^-3*")"),
+       color = "Month") +
+  xlim(15, 32) +
+  ylim(0, 22) +
+  ggtitle("2022") +
+  theme_bw() +
+  theme(text = element_text(size = 30),
+        legend.position = "right",
+        axis.text = element_text(color = 'black'),
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+fs2 <- b24 %>%
+  left_join(weath) %>% 
+  mutate(month = month(date)) %>%
+  ggplot(aes(x = mean_sal, y = fl_med_day)) +
+  geom_point(aes(color = as.factor(month)), size = 4) +
+  scale_color_viridis_d(option = "turbo") +
+  xlim(15, 32) +
+  ylim(0, 22) +
+  labs(x = bquote(Salinity[BUOY]),
+       y = bquote(FLu[Buoy]~"("*mg~m^-3*")"),
+       color = "Month") +
+  ggtitle("2024") +
+  theme_bw() +
+  theme(text = element_text(size = 30),
+        legend.position = "right",
+        axis.text = element_text(color = 'black'),
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+fsfig <- fs1/fs2 + plot_layout(guides = "collect")
+
+ggsave(here("figures", "buoy_sal_flu.png"), fsfig,
+        width = 8, height = 12, dpi = 300)
+```
+```{r}
+ft1 <- b22 %>% 
+  left_join(weath) %>% 
+  mutate(month = month(date)) %>%
+  ggplot(aes(x = mean_temp, y = fl_med_day)) +
+  geom_point(aes(color = as.factor(month)), size = 4) +
+  scale_color_viridis_d(option = "turbo") +
+  labs(x = bquote(Temp[BUOY]),
+       y = bquote(flu[Buoy]~"("*mg~m^-3*")"),
+       color = "Month") +
+  xlim(4, 17) +
+  ylim(0, 22) +
+  ggtitle("2022") +
+  theme_bw() +
+  theme(text = element_text(size = 30),
+        legend.position = "right",
+        axis.text = element_text(color = 'black'),
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+ft2 <- b24 %>%
+  left_join(weath) %>% 
+  mutate(month = month(date)) %>%
+  ggplot(aes(x = mean_temp, y = fl_med_day)) +
+  geom_point(aes(color = as.factor(month)), size = 4) +
+  scale_color_viridis_d(option = "turbo") +
+  xlim(4, 17) +
+  ylim(0, 22) +
+  labs(x = bquote(Temp[BUOY]),
+       y = bquote(FLu[Buoy]~"("*mg~m^-3*")"),
+       color = "Month") +
+  ggtitle("2024") +
+  theme_bw() +
+  theme(text = element_text(size = 30),
+        legend.position = "right",
+        axis.text = element_text(color = 'black'),
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+ftfig <- ft1/ft2 + plot_layout(guides = "collect")
+
+ggsave(here("figures", "buoy_temp_flu.png"), ftfig,
+        width = 8, height = 12, dpi = 300)
+```
+```{r}
+fw1 <- b22 %>% 
+  left_join(weath) %>% 
+  mutate(month = month(date)) %>%
+  ggplot(aes(x = wind_b1_3, y = fl_med_day)) +
+  geom_point(aes(color = as.factor(month)), size = 4) +
+  scale_color_viridis_d(option = "turbo") +
+  labs(x = bquote(WS[LO-3-AVG]~"("*m~s^-1*")"),
+       y = bquote(flu[Buoy]~"("*mg~m^-3*")"),
+       color = "Month") +
+  xlim(0, 15) +
+  ylim(0, 22) +
+  ggtitle("2022") +
+  theme_bw() +
+  theme(text = element_text(size = 30),
+        legend.position = "right",
+        axis.text = element_text(color = 'black'),
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+fw2 <- b24 %>%
+  left_join(weath) %>% 
+  mutate(month = month(date)) %>%
+  ggplot(aes(x = wind_b1_3, y = fl_med_day)) +
+  geom_point(aes(color = as.factor(month)), size = 4) +
+  scale_color_viridis_d(option = "turbo") +
+  xlim(0, 15) +
+  ylim(0, 22) +
+  labs(x = bquote(WS[LO-3-AVG]~"("*m~s^-1*")"),
+       y = bquote(FLu[Buoy]~"("*mg~m^-3*")"),
+       color = "Month") +
+  ggtitle("2024") +
+  theme_bw() +
+  theme(text = element_text(size = 30),
+        legend.position = "right",
+        axis.text = element_text(color = 'black'),
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+fwfig <- fw1/fw2 + plot_layout(guides = "collect")
+
+ggsave(here("figures", "buoy_wind_flu.png"), fwfig,
+        width = 8, height = 12, dpi = 300)
+```
+
+```{r}
+up_dm <- up %>% 
+  mutate(date = date(time),
+         upwelling_index = as.numeric(upwelling_index)) %>% 
+  group_by(date) %>% 
+  summarise(up_dm = mean(upwelling_index)) %>% 
+  ungroup()
+
+b22 <- b22 %>% 
+  left_join(up_dm)
+
+b24 <- b24 %>% 
+  left_join(up_dm)
+
+b24 %>% 
+  mutate(month = month(date)) %>%
+  ggplot(aes(x = up_dm, y = mean_sal)) +
+  geom_point(aes(color = as.factor(month)), size = 4) +
+  scale_color_viridis_d(option = "turbo") +
+  labs(x = bquote(WS[LO-3-AVG]~"("*m~s^-1*")"),
+       y = bquote(flu[Buoy]~"("*mg~m^-3*")"),
+       color = "Month") +
+  # xlim(0, 15) +
+  # ylim(0, 22) +
+  ggtitle("2022") +
+  theme_bw() +
+  theme(text = element_text(size = 30),
+        legend.position = "right",
+        axis.text = element_text(color = 'black'),
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+```
+
+```{r}
+b22 <- b22 %>% 
+  left_join(weath) %>% 
+  select(date, f = fl_med_day, t = mean_temp, s = mean_sal, ws = w_dm, wd = w_dm)
+
+b22 <- b22 %>% 
+  mutate(doy = yday(date))
+```
+
+
+```{r}
+# GAM Analysis for Daily Fluorescence Time Series
+# Dataset: b22 with daily means of ws, wd, t, s, f
+
+library(mgcv)
+library(gratia)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+
+# ============================================================================
+# 1. DATA PREPARATION
+# ============================================================================
+
+# Assuming your data has a date column - adjust as needed
+# b22$date <- as.Date(b22$date)  # uncomment if needed
+
+# Create time variables for temporal patterns
+b22 <- b22 %>%
+  mutate(
+    # Day of year for seasonal patterns
+    doy = yday(date),
+    
+    # Convert wind to u,v components (more appropriate for GAM)
+    wind_u = ws * cos(wd * pi/180),
+    wind_v = ws * sin(wd * pi/180),
+    
+    # Create lagged variables (ecological responses often delayed)
+    ws_lag1 = lag(ws, 1),
+    ws_lag2 = lag(ws, 2),
+    ws_lag3 = lag(ws, 3),
+    t_lag1 = lag(t, 1),
+    s_lag1 = lag(s, 1),
+    
+    # Derived variables
+    temp_change = t - lag(t, 1),          # daily temperature change
+    sal_change = s - lag(s, 1),           # daily salinity change
+    density_proxy = s/t,                  # rough density proxy
+    
+    # Log transform fluorescence (often skewed)
+    log_f = log(f + 0.01),               # small constant to handle zeros
+    
+    # Time index for temporal correlation
+    time_index = row_number()
+  )
+
+# Check for missing values
+summary(b22)
+
+# ============================================================================
+# 2. EXPLORATORY ANALYSIS
+# ============================================================================
+
+# Quick visualization of relationships
+par(mfrow=c(2,3))
+plot(b22$ws, b22$f, main="Wind Speed vs Fluorescence")
+plot(b22$t, b22$f, main="Temperature vs Fluorescence")
+plot(b22$s, b22$f, main="Salinity vs Fluorescence")
+plot(b22$wind_u, b22$f, main="U-wind vs Fluorescence")
+plot(b22$wind_v, b22$f, main="V-wind vs Fluorescence")
+plot(b22$doy, b22$f, main="Seasonal Pattern")
+
+# Time series plot
+ggplot(b22, aes(x=date)) +
+  geom_line(aes(y=f, color="Fluorescence")) +
+  geom_line(aes(y=ws*max(f)/max(ws), color="Wind Speed")) +
+  scale_y_continuous(sec.axis = sec_axis(~.*max(b22$ws)/max(b22$f), name="Wind Speed")) +
+  labs(title="Fluorescence and Wind Speed Time Series") +
+  theme_minimal()
+```
+
+
+```{r}
+# ============================================================================
+# 3. GAM MODELS
+# ============================================================================
+
+# Model 1: Basic model with current conditions
+# For single year: reduce seasonal complexity
+m1 <- gam(f ~ 
+          s(ws, k=10) + 
+          s(t, k=10) + 
+          s(s, k=10) +
+          s(doy, bs="cc", k=6),   # reduced k for single year seasonality
+        data = b22,
+        family = Gamma(link="log"),
+        na.action = na.exclude)
+
+# Alternative: Simple seasonal terms instead of splines
+m1_alt <- gam(f ~ 
+              s(ws, k=10) + 
+              s(t, k=10) + 
+              s(s, k=10) +
+              sin(2*pi*doy/365) + cos(2*pi*doy/365) +  # simple harmonic
+              sin(4*pi*doy/365) + cos(4*pi*doy/365),   # semi-annual
+            data = b22,
+            family = Gamma(link="log"),
+            na.action = na.exclude)
+
+# Model 2: Using wind components instead of speed/direction
+# Reduced seasonal complexity for single year
+m2 <- gam(f ~ 
+          s(wind_u, k=10) + 
+          s(wind_v, k=10) + 
+          s(t, k=10) + 
+          s(s, k=10) +
+          s(doy, bs="cc", k=6),
+        data = b22,
+        family = Gamma(link="log"),
+        na.action = na.exclude)
+
+# Model 3: Include lagged effects
+# For single year, focus on shorter lags
+m3 <- gam(f ~ 
+          s(ws, k=10) + 
+          s(ws_lag1, k=8) + 
+          s(ws_lag2, k=6) +    # reduced complexity for lags
+          s(t, k=10) + 
+          s(t_lag1, k=8) +
+          s(s, k=10) +
+          s(doy, bs="cc", k=6),
+        data = b22,
+        family = Gamma(link="log"),
+        na.action = na.exclude)
+
+# Model 4: Include interactions
+# Be conservative with interactions for single year
+m4 <- gam(f ~ 
+          s(ws, k=10) + 
+          s(t, k=10) + 
+          s(s, k=10) +
+          s(t, s, k=15) +           # reduced interaction complexity
+          s(doy, bs="cc", k=6),
+        data = b22,
+        family = Gamma(link="log"),
+        na.action = na.exclude)
+
+# Model 5: Include rate of change variables
+m5 <- gam(f ~ 
+          s(ws, k=10) + 
+          s(t, k=10) + 
+          s(s, k=10) +
+          s(temp_change, k=6) +    # reduced k for derivatives
+          s(sal_change, k=6) +
+          s(doy, bs="cc", k=6),
+        data = b22,
+        family = Gamma(link="log"),
+        na.action = na.exclude)
+
+# For single year data, consider these alternatives:
+
+# Option 1: No seasonal term if environmental drivers capture seasonality
+m_no_season <- gam(f ~ 
+                   s(ws, k=10) + 
+                   s(t, k=10) + 
+                   s(s, k=10),
+                 data = b22,
+                 family = Gamma(link="log"),
+                 na.action = na.exclude)
+
+# Option 2: Seasonal-varying coefficients (simplified version)
+# Note: Fixed the tensor product syntax
+m_seasonal_varying <- gam(f ~ 
+                          s(ws, k=10) + 
+                          s(t, k=10) + 
+                          s(s, k=10) +
+                          te(doy, ws, k=c(4,6)) +  # tensor product interaction
+                          te(doy, t, k=c(4,6)),    # tensor product interaction
+                        data = b22,
+                        family = Gamma(link="log"),
+                        na.action = na.exclude)
+
+# Check if seasonal patterns are confounded with environmental drivers
+cor_matrix <- cor(b22[,c("t", "s", "ws", "doy")], use="pairwise.complete.obs")
+print("Correlation matrix (check for seasonal confounding):")
+print(round(cor_matrix, 3))
+```
+
+
+```{r}
+# ============================================================================
+# 4. MODEL COMPARISON
+# ============================================================================
+
+# Compare models (including single-year alternatives)
+model_list <- list(m1, m2, m3, m4, m5, m_no_season, m1_alt, m_seasonal_varying)
+model_names <- c("Basic", "Wind_UV", "Lagged", "Interactions", "Rate_Change", 
+                 "No_Season", "Alt_Season", "Seasonal_Varying")
+
+# Calculate AIC and deviance explained safely
+aic_values <- sapply(model_list, function(x) {
+  tryCatch(AIC(x), error = function(e) NA)
+})
+
+dev_expl_values <- sapply(model_list, function(x) {
+  tryCatch(summary(x)$dev.expl, error = function(e) NA)
+})
+
+model_comparison <- data.frame(
+  Model = model_names,
+  AIC = aic_values,
+  Deviance_Explained = dev_expl_values
+)
+
+print(model_comparison)
+```
+
+
+```{r}
+# Select best model (lowest AIC, excluding failed models)
+valid_models <- !is.na(model_comparison$AIC)
+if(any(valid_models)) {
+  best_idx <- which.min(model_comparison$AIC[valid_models])
+  best_model_idx <- which(valid_models)[best_idx]
+  best_model <- model_list[[best_model_idx]]
+  
+  print("=== SINGLE YEAR DATA DIAGNOSTICS ===")
+  print(paste("Best model:", model_comparison$Model[best_model_idx]))
+  print(paste("Sample size:", nrow(b22[complete.cases(b22[,c("f","ws","t","s")]),])))
+  print(paste("Effective degrees of freedom:", round(sum(best_model$edf), 1)))
+  print(paste("Ratio of observations to EDF:", 
+              round(nrow(b22[complete.cases(b22[,c("f","ws","t","s")]),]) / sum(best_model$edf), 1)))
+} else {
+  print("No valid models found - check your data")
+  best_model <- m1  # fallback to basic model
+}
+```
+
+
+```{r}
+# ============================================================================
+# 5. MODEL DIAGNOSTICS
+# ============================================================================
+
+# Check model assumptions
+gam.check(best_model)
+
+# Plot residuals
+par(mfrow=c(2,2))
+plot(best_model)
+
+# Check for temporal autocorrelation in residuals
+residuals <- residuals(best_model)
+acf(residuals, na.action=na.pass, main="Residual Autocorrelation")
+```
+
+
+```{r}
+# ============================================================================
+# 6. VISUALIZATION OF RESULTS
+# ============================================================================
+
+# Plot smooth functions using gratia
+draw(best_model)
+
+# Individual effect plots
+p1 <- draw(best_model, select="s(ws)")
+p2 <- draw(best_model, select="s(t)")
+p3 <- draw(best_model, select="s(s)")
+p4 <- draw(best_model, select="s(doy)")
+
+# Print individual plots
+print(p1)
+print(p2)
+print(p3)
+print(p4)
+```
+
+
+```{r}
+# ============================================================================
+# 7. PREDICTIONS AND SCENARIOS
+# ============================================================================
+
+# Predict fluorescence under different wind scenarios
+wind_scenarios <- expand.grid(
+  ws = seq(min(b22$ws, na.rm=T), max(b22$ws, na.rm=T), length.out=20),
+  t = mean(b22$t, na.rm=T),
+  s = mean(b22$s, na.rm=T),
+  doy = 180  # mid-year
+)
+
+# Add predictions
+wind_scenarios$predicted_f <- predict(best_model, newdata=wind_scenarios, type="response")
+
+# Plot wind effect
+ggplot(wind_scenarios, aes(x=ws, y=predicted_f)) +
+  geom_line(color="blue", size=1.2) +
+  labs(title="Predicted Fluorescence Response to Wind Speed",
+       x="Wind Speed", y="Predicted Fluorescence") +
+  theme_minimal()
+```
+
+
+```{r}
+# ============================================================================
+# 8. SUMMARY STATISTICS
+# ============================================================================
+
+# Model summary
+summary(best_model)
+
+# Variable importance (approximate)
+smooth_terms <- best_model$smooth
+if(length(smooth_terms) > 0) {
+  var_importance <- data.frame(
+    Variable = sapply(smooth_terms, function(x) x$label),
+    F_statistic = sapply(smooth_terms, function(x) x$F.stat),
+    p_value = sapply(smooth_terms, function(x) x$p.value),
+    EDF = sapply(smooth_terms, function(x) x$edf)
+  )
+  
+  print("Variable Importance (F-statistics):")
+  print(var_importance[order(var_importance$F_statistic, decreasing=T),])
+}
+```
+```{r}
+# Model summary
+summary(best_model)
+
+# Extract variable importance from summary
+gam_summary <- summary(best_model)
+
+# Get smooth terms table
+smooth_table <- gam_summary$s.table
+
+# Create variable importance data frame
+if(nrow(smooth_table) > 0) {
+  var_importance <- data.frame(
+    Variable = rownames(smooth_table),
+    F_statistic = smooth_table[, "F"],
+    p_value = smooth_table[, "p-value"],
+    EDF = smooth_table[, "edf"]
+  )
+  
+  print("Variable Importance (F-statistics):")
+  print(var_importance[order(var_importance$F_statistic, decreasing = TRUE), ])
+}
+
+# Alternative: Use anova() for a cleaner output
+print("ANOVA table for smooth terms:")
+anova(best_model)
+# The key difference is that you need to extract the information from summary(best_model)$s.table rather than trying to access it directly from the smooth objects. The anova() function also provides a clean way to see the significance tests for all smooth terms.
+# This will properly show you the F-statistics, p-values, and effective degrees of freedom for ranking variable importance in your GAM.RetryClaude does not have the ability to run the code it generates yet.Claude can make mistakes. Please double-check responses.
+```
+
+
+```{r}
+# ============================================================================
+# 9. ADDITIONAL ANALYSIS OPTIONS
+# ============================================================================
+
+# If you want to account for temporal autocorrelation more explicitly
+# m_gamm <- gamm(f ~ 
+#                s(ws, k=10) + 
+#                s(t, k=10) + 
+#                s(s, k=10) +
+#                s(doy, bs="cc", k=6),
+#              correlation = corAR1(form = ~ time_index),
+#              data = b22,
+#              family = Gamma(link="log"))
+
+# If you want to use a different distribution
+# m_tw <- gam(f ~ 
+#             s(ws, k=10) + 
+#             s(t, k=10) + 
+#             s(s, k=10) +
+#             s(doy, bs="cc", k=6),
+#           data = b22,
+#           family = tw(link="log"))  # Tweedie distribution
+```
+
+```{r}
+# Plot the temperature smooth to see the relationship
+plot(best_model, select = 2)  # Assuming s(t) is the second smooth term
+
+# Or use ggplot with gratia package for better plots
+library(gratia)
+draw(best_model, select = "s(s)")
+
+# Or plot all smooths at once
+plot(best_model, pages = 1)
+```
+
+```{r}
+draw(best_model) + 
+  theme_minimal() +
+  labs(title = "Environmental drivers of phytoplankton response")
+```
+```{r}
+gam.check(best_model)
+```
+
+```{r}
+improved_model <- gam(f ~ s(ws, k = 20) + s(t, k = 20) + s(s, k = 20) + 
+                     te(doy, ws, k = c(20, 20)) + 
+                     te(doy, t, k = c(20, 20)),
+                     family = Gamma(link = "log"),
+                     data = b22)
+
+gam.check(improved_model)
+```
+
+
+
+```{r}
+# Create individual smooth plots with ggplot styling
+p1 <- draw(improved_model, select = "s(ws)") + 
+  labs(x = "Wind Speed (m/s)", 
+       y = "Partial Effect",
+       title = "(a) Wind Speed") +
+  theme_classic() +
+  theme(text = element_text(size = 12),
+        plot.title = element_text(size = 14, face = "bold"))
+
+p2 <- draw(improved_model, select = "s(t)") + 
+  labs(x = "Temperature (°C)", 
+       y = "Partial Effect",
+       title = "(b) Temperature") +
+  theme_classic() +
+  theme(text = element_text(size = 12),
+        plot.title = element_text(size = 14, face = "bold"))
+
+p3 <- draw(improved_model, select = "s(s)") + 
+  labs(x = "Salinity", 
+       y = "Partial Effect",
+       title = "(c) Salinity") +
+  theme_classic() +
+  theme(text = element_text(size = 12),
+        plot.title = element_text(size = 14, face = "bold"))
+
+# For tensor products, we'll create a separate interaction plot
+p4 <- draw(improved_model, select = "te(doy,ws)") + 
+  labs(x = "Day of Year", 
+       y = "Wind Speed (m/s)",
+       title = "(d) Day × Wind Speed Interaction") +
+  theme_classic() +
+  theme(text = element_text(size = 12),
+        plot.title = element_text(size = 14, face = "bold"))
+
+# Combine into 2x2 panel
+smooth_panel <- grid.arrange(p1, p2, p3, p4, ncol = 2)
+
+```
+```{r}
+# Create data for prediction grid
+doy_seq <- seq(1, 365, length = 50)
+temp_seq <- seq(min(b22$t), max(b22$t), length = 50)  # Replace with actual temp range
+pred_grid <- expand.grid(doy = doy_seq, t = temp_seq)
+pred_grid$ws <- mean(b22$ws, na.rm = TRUE)  # Fix other variables at mean
+pred_grid$s <- mean(b22$s, na.rm = TRUE)
+
+# Get predictions
+pred_grid$fit <- predict(improved_model, newdata = pred_grid, type = "response")
+
+# Create contour plot
+ggplot(pred_grid, aes(x = doy, y = t, z = fit)) +
+  geom_contour_filled(bins = 15) +
+  scale_fill_viridis_d(name = "Predicted\nResponse") +
+  labs(x = "Day of Year", 
+       y = "Temperature (°C)",
+       title = "Seasonal-Temperature Interaction") +
+  theme_classic() +
+  theme(text = element_text(size = 12),
+        plot.title = element_text(size = 14, face = "bold"),
+        legend.position = "right")
+```
+
+```{r}
+# Check your actual data ranges
+summary(b22$doy)
+summary(b22$t)
+range(b22$f, na.rm = TRUE)  # Your response variable
+
+# Check for extreme predictions
+summary(fitted(improved_model))
+max(predict(improved_model, type = "response"))
+
+# Plot with actual data range only
+plot(improved_model, select = "te(doy,t)", scheme = 2)
+```
+
+

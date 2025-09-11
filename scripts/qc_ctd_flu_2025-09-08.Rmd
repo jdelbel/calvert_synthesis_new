@@ -1,0 +1,468 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This worksheet works on created a corrected chlorophyll fluorometer time-series through comparison with discrete chlorophyll samples.
+
+```{r}
+#Upload packages
+library(tidyverse) #wrangling
+library(here) #file management
+library(readxl) #reading excel files
+library(lubridate) #working with dates and time
+
+#Plotting
+library(ggsci) #Nice color schemes
+library(patchwork) #plotting panels
+library(egg) #I think this is for panel plotting as well.
+
+#Interpolation
+library(rioja) # add fits to discrete data
+```
+
+```{r}
+#Downloading baseline corrected chlorophyll fluorescence profiles
+f <- read_csv(here("files", "ctd_kc10_fzh01_2025-08-09.csv"))
+
+#Downloading chlorophyll data for joining
+c <- read_csv(here("files", "chl_kc10_fzh01_ 2025-09-08.csv"))
+```
+```{r}
+#Working with the discrete chlorophyll dataset
+
+#Pulling out bulk data with appropriate flags and running a daily mean in case there are duplicates
+#Allowing SVC and ADL as generally OK.
+c_qc <- c %>% 
+  select(date, station = site_id, line_out_depth, filter_type, chla, chla_flag) %>% 
+  filter(filter_type == "Bulk GF/F") %>% 
+  filter(chla_flag == "AV" | chla_flag == "SVC" | chla_flag == "ADL" | is.na(chla_flag)) 
+
+#Calculating a daily mean value in case of duplicates and setting the 0m sampling depth to 1m to match with the closest CTD fluorometer record
+c_dm <- c_qc %>% 
+  group_by(date, station, line_out_depth) %>% 
+  summarise(chl_dm = mean(chla)) %>% 
+  ungroup() %>% 
+  mutate(pres = round(line_out_depth)) %>%
+  drop_na() %>% 
+  group_by(date, station) %>% 
+  mutate(n_dep = n()) %>% 
+  ungroup() %>% 
+  filter(n_dep >= 3) %>% #This could be altered to > 3x points maybe?
+  mutate(year = year(date)) %>% 
+  mutate(pres = case_when(pres == 0 ~ 1,
+                          TRUE ~ as.numeric(pres)))
+```
+```{r}
+#working with the size-fractionated dataset to create a size-fractionated sum value where we are missing bulk samples
+
+#Pulling out size-fractionated data
+c_sf <- c %>% 
+  select(date, station = site_id, line_out_depth, filter_type, chla, chla_flag) %>% 
+  filter(!filter_type == "Bulk GF/F") %>% 
+  filter(chla_flag == "AV" | chla_flag == "SVC" | chla_flag == "ADL" | is.na(chla_flag))
+
+#Calculating a daily mean value where there are three filters available to complete the set.
+c_sf_dm <- c_sf %>% 
+  filter(!is.na(chla)) %>%
+  filter(chla > 0) %>% 
+  group_by(date, station, line_out_depth, filter_type) %>% 
+  summarise(avg_chla = mean(chla)) %>%
+  ungroup() %>% 
+  group_by(date, station, line_out_depth) %>% 
+  mutate(n_filt = n()) %>% 
+  ungroup() %>% 
+  group_by(date, station, line_out_depth, filter_type) %>% 
+  mutate(n_type = n()) %>% 
+  ungroup() %>% 
+  filter(n_filt == 3 & n_type == 1) %>% 
+  group_by(date, station, line_out_depth) %>% 
+  mutate(sum = sum(avg_chla)) %>% 
+  ungroup() %>% 
+  mutate(perc = avg_chla/sum) %>% 
+  select(date, station, pres = line_out_depth, filter_type, avg_chla, sum, perc) %>% 
+  mutate(filter_type2 = case_when(filter_type == "2um" ~ "3um",
+                                  TRUE ~ as.character(filter_type)))
+
+#Setting the 0m sampling depth to 1m
+c_sum <- c_sf_dm %>% 
+  distinct(sum, .keep_all = T) %>% 
+  select(date, station, pres, sum) %>% 
+  mutate(pres = case_when(pres == 0 ~ 1,
+                          TRUE ~ as.numeric(pres)))
+
+```
+```{r}
+#Joining the bulk and size-fractionated sum and then creating combined column where the size-fractionated value is used where there are NA's for the bulk.
+c_join <- c_dm %>% 
+  full_join(c_sum) %>% 
+  mutate(chl_comb = case_when(is.na(chl_dm) ~ sum,
+                              !is.na(chl_dm) ~ chl_dm)) %>% 
+  select(date, station, pres, chl_dm, chl_comb) %>% 
+  unite(id, c(date, station), sep = "-", remove = F)
+```
+```{r}
+#Working with CTD fluorescence datasets
+
+#Creating shorter version to work with
+f_s <- f %>% 
+  mutate(date = date(`Measurement time`)) %>% 
+  select(date,
+         ctdNum = `CTD serial number`,
+         castpk = `Cast PK`,
+         pres = `Pressure (dbar)`,
+         station = Station,
+         f = `Fluorometry Chlorophyll (ug/L)`)
+```
+
+```{r}
+#Dropping casts that start deep or end shallow.
+valid_casts <- f_s %>% 
+  group_by(castpk, date, ctdNum, station) %>% 
+  summarise(
+    min_dep = min(pres),
+    max_dep = max(pres),
+    .groups = 'drop'
+  ) %>%
+  filter(
+    min_dep <= 3,      # Keep casts that start at 3m or shallower
+    max_dep >= 100     # Keep casts that reach 100m or deeper
+  )
+
+# Filter the main dataset to keep only valid casts
+prof_qc1 <- f_s %>% 
+  filter(castpk %in% valid_casts$castpk)
+
+# Optional: View the excluded casts for your records
+excluded_shallow <- prof_qc1 %>% 
+  group_by(castpk) %>% 
+  summarise(max_dep = max(pres)) %>% 
+  filter(max_dep < 100)
+
+excluded_deep_start <- prof_qc1 %>% 
+  group_by(castpk) %>% 
+  summarise(min_dep = min(pres)) %>% 
+  filter(min_dep > 3)
+```
+
+```{r}
+#removing data where we know the instrument was malfunctioning - I figured this out via visual inspection in another script and should create a tool to efficiently remove such casts here.
+prof_qc2 <- prof_qc1 %>%
+  mutate(year = year(date)) %>% 
+  filter(!(ctdNum == 80217 & year == 2015)) %>% 
+  filter(!castpk == 3826) %>% #Super weird profile
+  filter(!castpk == 14429) %>% #saturated values
+  filter(!castpk == 18682) %>% #saturated values
+  filter(!castpk == 4990) %>%
+  filter(!castpk == 5074) %>%
+  filter(!castpk == 9403) %>% 
+  filter(!castpk == 3827) %>% 
+  filter(!castpk == 4984) %>% 
+  filter(!castpk == 5107) %>% 
+  filter(!castpk == 5168) %>% 
+  filter(!castpk == 8406) %>% 
+  filter(!castpk == 9403) %>% 
+  filter(!castpk == 23180) %>% 
+  filter(!castpk == 19428) %>% 
+  filter(!castpk == 10271) %>% 
+  mutate(f = replace(f, which(f < 0), NA),
+         f = replace(f, which(f == 0), NA),
+         f = replace(f, which(f < 0.01), NA))
+```
+
+```{r}
+dark_offset <- prof_qc2 %>%
+  filter(pres > 100) %>%  # Only values below 100 dbar (approximately 100 m)
+  group_by(castpk, ctdNum) %>%
+  arrange(f) %>%  # Sort by fluorometry values (lowest first)
+  slice_head(n = 10) %>%  # Take the 10 minimum values
+  summarise(
+    dark_offset_mean = mean(f, na.rm = TRUE),
+    dark_offset_sd = sd(f, na.rm = TRUE),
+    n_values = n(),  # To check you actually have 10 values
+    .groups = 'drop') 
+
+prof_qc3 <- prof_qc2 %>% 
+  left_join(dark_offset) %>% 
+  mutate(f_dr = f - dark_offset_mean) %>% 
+  filter(!is.na(f_dr))
+```
+```{r}
+f_dm <- prof_qc3 %>% 
+  group_by(date, station, pres) %>% 
+  summarise(f_dm = mean(f_dr),
+            n_prof = n()) %>% 
+  ungroup() %>% 
+  mutate(f_dm = round(f_dm, 2)) %>% 
+  unite(id, c(date, station), sep = "-", remove = F) %>% 
+  left_join(c_join)
+```
+
+```{r}
+#Creatiing a dataset to apply linear fits between the chlorophyll and fluorometry data to derive a slope correction.
+
+#I am manually removing large outliers determined from visual inspection. They are all typically from the discrete sample missing a narrow layer below.
+f_fit <- f_dm %>%
+  left_join(c_join) %>% 
+  drop_na() %>% 
+  unite(id, c(date, station), sep = "-", remove = F) %>%
+  filter(!(id == "2014-06-19-KC10" & pres == 5)) %>%
+  filter(!(id == "2017-04-28-KC10" & pres == 5)) %>%
+  filter(!(id == "2017-08-14-KC10" & pres == 5)) %>%
+  filter(!(id == "2017-10-12-KC10" & (pres == 0 | pres == 5))) %>%
+  filter(!(id == "2019-02-14-KC10" & pres == 30)) %>%
+  filter(!(id == "2019-05-11-KC10" & pres < 6)) %>% 
+  filter(!(id == "2023-05-14-KC10" & pres == 10))     
+```
+
+Need to go through and provide rationale why I'm removing things above.
+
+```{r}
+# Fit both models (with and without surface) and select the best slope for a correction based on p-value and r2. When the surface value is not used, it generally means that the fluorometer data are NPQ affected, so a identifier column in put in for this.
+
+#Code to apply fits and extract statistics - used Claude to streamline the method that I derived.
+model <- f_fit %>% 
+  filter(!is.na(chl_comb) & !is.na(f_dm)) %>%
+  group_by(date, station) %>% 
+  summarise({
+    # Check data availability
+    data_no_surf <- filter(cur_data(), pres != 1)
+    data_with_surf <- cur_data()
+    
+    nobs_no_surf <- nrow(data_no_surf)
+    nobs_with_surf <- nrow(data_with_surf)
+    
+    # Initialize variables
+    can_fit_no_surf <- nobs_no_surf >= 2
+    can_fit_with_surf <- nobs_with_surf >= 2
+    
+    # Fit model WITHOUT surface (if possible)
+    if (can_fit_no_surf) {
+      model_no_surf <- lm(chl_comb ~ f_dm, data = data_no_surf)
+      intercept_no_surf <- round(coef(model_no_surf)[1], 2)
+      slope_no_surf <- round(coef(model_no_surf)[2], 2)
+      r2_no_surf <- round(summary(model_no_surf)$adj.r.squared, 2)
+      p.value_no_surf <- round(summary(model_no_surf)$coefficients[2, 4], 5)
+    } else {
+      intercept_no_surf <- slope_no_surf <- r2_no_surf <- p.value_no_surf <- NA
+    }
+    
+    # Fit model WITH surface (if possible)
+    if (can_fit_with_surf) {
+      model_with_surf <- lm(chl_comb ~ f_dm, data = data_with_surf)
+      intercept_with_surf <- round(coef(model_with_surf)[1], 2)
+      slope_with_surf <- round(coef(model_with_surf)[2], 2)
+      r2_with_surf <- round(summary(model_with_surf)$adj.r.squared, 2)
+      p.value_with_surf <- round(summary(model_with_surf)$coefficients[2, 4], 5)
+    } else {
+      intercept_with_surf <- slope_with_surf <- r2_with_surf <- p.value_with_surf <- NA
+    }
+    
+    # Select best model
+    if (!can_fit_no_surf & !can_fit_with_surf) {
+      # Neither model can be fit
+      use_surface <- NA
+      intercept <- slope <- r2 <- p.value <- nobs <- NA
+    } else if (!can_fit_no_surf) {
+      # Only surface model can be fit
+      use_surface <- TRUE
+      intercept <- intercept_with_surf
+      slope <- slope_with_surf
+      r2 <- r2_with_surf
+      p.value <- p.value_with_surf
+      nobs <- nobs_with_surf
+    } else if (!can_fit_with_surf) {
+      # Only no-surface model can be fit
+      use_surface <- FALSE
+      intercept <- intercept_no_surf
+      slope <- slope_no_surf
+      r2 <- r2_no_surf
+      p.value <- p.value_no_surf
+      nobs <- nobs_no_surf
+    } else {
+      # Both models can be fit - choose best based on p-value
+      use_surface <- p.value_with_surf < p.value_no_surf
+      intercept <- ifelse(use_surface, intercept_with_surf, intercept_no_surf)
+      slope <- ifelse(use_surface, slope_with_surf, slope_no_surf)
+      r2 <- ifelse(use_surface, r2_with_surf, r2_no_surf)
+      p.value <- ifelse(use_surface, p.value_with_surf, p.value_no_surf)
+      nobs <- ifelse(use_surface, nobs_with_surf, nobs_no_surf)
+    }
+    
+    # Set slope to NA if p-value > 0.05 OR if slope is negative
+    slope_best <- ifelse(is.na(p.value) || p.value > 0.05 || slope < 0, NA, slope)
+    
+    # Determine if surface is quenched (available but not used)
+    surface_available <- any(data_with_surf$pres == 1)
+    quenched <- surface_available && !isTRUE(use_surface)
+    
+    data.frame(
+      intercept = intercept,
+      slope = slope_best,
+      r2 = r2,
+      p.value = p.value,
+      nobs = nobs,
+      use_surface = use_surface,
+      quenched = quenched
+    )
+  }, .groups = 'drop') %>% 
+  unite(id, c(date, station), sep = "-", remove = F) %>% 
+  arrange(date, station)
+```
+
+
+
+```{r}
+#Creating a sensor list to attach sensor information to the ctd casts - useful if I want to troubleshoot specific sensors - this could probably be included at an earlier step.
+
+#Creating a list of IDs and CTD numbers.
+ctd_num <- f_s %>% 
+  select(date, station, ctdNum) %>% 
+  distinct()
+
+#Joining the CTD numbers to the model fits.
+model <- model %>% 
+  left_join(ctd_num)
+```
+
+
+
+```{r}
+#Was applying these based on visual inspection - do they still align with insignificant comparisons?
+
+model <- model %>% 
+  mutate(slope = case_when(id == "2018-02-19-FZH01" ~ 0.55,
+                                id == "2018-08-18-FZH01" ~ 1.07,
+                                id == "2016-07-22-FZH01" ~ 1,#for these two I think serious discrete issues - SVD
+                                id == "2016-07-08-FZH01" ~ 1, #for these two I think serious discrete issues - SVD
+                                TRUE ~ as.numeric(slope)))
+
+#I can't just use 1, but what do I do? These are important subsurface maxima and the bottle data are bad on these days.
+
+#2016-08-12 might also be an issue - quite low slope - bad chlorophyll data?
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+#Joining the slope correction information to the daily mean fluorescence data frame.
+f_slope_join <- f_dm %>% 
+  left_join(model) %>% 
+  mutate(f_slope = f_dm*slope)
+
+```
+
+
+
+
+```{r}
+# Robust NPQ correction with full profile interpolation
+# Step 1: Identify quenched profiles from discrete samples
+quenched_profiles <- f_slope_join %>% 
+  drop_na(chl_comb, pres) %>% 
+  mutate(
+    f_slope = f_dm * slope,
+    diff = f_slope - chl_comb
+  ) %>%
+  # Identify profiles with quenching in top 5m
+  group_by(id) %>%
+  summarise(
+    is_quenched = any(diff <= -1 & pres <= 5, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(is_quenched) %>%
+  pull(id)
+
+# Step 2: Safer LOESS fitting with error handling
+fit_loess_safe <- function(data, span = 0.5) {
+  # Filter to only bottle data (non-NA chl_comb)
+  bottle_data <- data %>% 
+    filter(!is.na(chl_comb), !is.na(pres)) %>%
+    arrange(pres)
+  
+  # Need at least 3 points and at least one shallow sample (≤10m)
+  if(nrow(bottle_data) < 3) return(rep(NA_real_, nrow(data)))
+  if(min(bottle_data$pres) > 10) return(rep(NA_real_, nrow(data)))
+  
+  # Check for sufficient depth range
+  depth_range <- diff(range(bottle_data$pres))
+  if(depth_range < 1) return(rep(NA_real_, nrow(data)))
+  
+  # Adjust span based on number points
+  n_points <- nrow(bottle_data)
+  adjusted_span <- case_when(
+    n_points <= 4 ~ 0.8,
+    n_points <= 6 ~ 0.6,
+    TRUE ~ span
+  )
+  
+  # Fit LOESS model
+  tryCatch({
+    loess_model <- loess(chl_comb ~ pres, data = bottle_data, span = adjusted_span)
+    
+    # Predict within the range of observed data (no extrapolation)
+    min_depth <- min(bottle_data$pres)
+    max_depth <- max(bottle_data$pres)
+    
+    predicted <- ifelse(
+      data$pres >= min_depth & data$pres <= max_depth & !is.na(data$pres),
+      predict(loess_model, newdata = data.frame(pres = data$pres)),
+      NA_real_
+    )
+    
+    return(predicted)
+  }, error = function(e) {
+    return(rep(NA_real_, nrow(data)))
+  })
+}
+
+# Step 3: Apply correction with proper depth limits
+f_slope_corrected <- f_slope_join %>% 
+  mutate(f_slope = f_dm * slope) %>%
+  group_by(id) %>%
+  mutate(
+    chl_loess = if_else(
+      id %in% quenched_profiles,
+      fit_loess_safe(cur_data()),
+      NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  # Apply NPQ correction only in shallow waters
+  mutate(
+    diff_ratio = f_slope / chl_loess,
+    
+    # Apply correction with strict depth limit
+    f_npq = case_when(
+      # Only correct in top 6m where we have good LOESS fit and clear quenching
+      pres <= 6 & !is.na(chl_loess) & diff_ratio < 0.8 ~ chl_loess,
+      TRUE ~ f_slope
+    ),
+    
+    # Flag which points were corrected
+    npq_cor = pres <= 6 & !is.na(chl_loess) & diff_ratio < 0.8
+  )
+
+test <- f_slope_corrected %>% 
+  filter(!is.na(f_slope))
+```
+
+```{r}
+write.csv(test, here("outputs", "qc_quench_kc10_fzh01_2025-09-08.csv"))
+```
+
+
+
+

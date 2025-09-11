@@ -1,0 +1,549 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Some new interpolation tutorials to consider:
+https://search.r-project.org/CRAN/refmans/rioja/html/interp.dataset.html
+https://github.com/hdugan/NTLlakeloads
+
+```{r}
+#Upload packages
+library(tidyverse)
+library(here)
+library(readxl)
+library(patchwork)
+library(lubridate)
+library(MBA)
+library(mgcv)
+library(FNN)
+library(zoo)
+library(reshape2)
+library(rioja)
+library(egg)
+library(palr)
+library(ggsci)
+library(gsw)
+
+```
+
+```{r}
+#Corrected CTD fluorescence data
+ctd_fl <- read_csv(here("outputs", "qc_quench_kc10_fzh01_2025-09-08.csv"))
+
+ctd <- read_csv(here("files", "ctd_kc10_fzh01_2025-08-09.csv"))
+
+#cm = chlorophylly march 
+cm <- read_csv(here("files", "chl_2022-03-09.csv")) 
+#cs = chlorophyll september
+cs <- read_csv(here("files", "chl_2022-09-09.csv")) 
+
+#Downloading discrete chlorophyll samples - This could be done using the API
+cd <- read_csv(here("files", "chl_kc10_fzh01_2025-09-08.csv"))
+```
+
+```{r}
+ctd_calc <- ctd %>% 
+  mutate(date = date(`Measurement time`)) %>%
+  filter(`Cast Direction Flag` == "d") %>% 
+  # filter(is.na(`Fluorometry Chlorophyll flag`)) %>% 
+  select(castpk = `Cast PK`,
+         ctd_num =`CTD serial number`,
+         date, m_time = `Measurement time`,
+         station = Station,
+         longitude = `Station Longitude`,
+         latitude = `Station Latitude`,
+         pres = `Pressure (dbar)`,
+         sal = `Salinity (PSU)`,
+         temp = `Temperature (deg C)`) %>%
+  mutate(
+    # Calculate absolute salinity from practical salinity
+    sa = gsw_SA_from_SP(sal, pres, longitude, latitude),  # Adjust lat/lon for your study area
+    # Calculate conservative temperature from in-situ temperature
+    ct = gsw_CT_from_t(sa, temp, pres),
+    # Calculate in-situ density (kg/m³)
+    density = gsw_rho(sa, ct, pres),
+    # Calculate potential density anomaly (sigma-theta, kg/m³ - 1000)
+    sigma_theta = gsw_sigma0(sa, ct)
+  )
+
+daily_ctd <- ctd_calc %>%
+  filter(!is.na(sal), !is.na(temp), !is.na(sigma_theta)) %>%  # Remove missing values
+  
+  # Step 1: Calculate daily means by depth
+  group_by(date, pres) %>%
+  summarise(
+    sal_daily = mean(sal, na.rm = TRUE),
+    temp_daily = mean(temp, na.rm = TRUE),
+    sigma_theta_daily = mean(sigma_theta, na.rm = TRUE),
+    .groups = 'drop'
+  )
+```
+
+```{r}
+#There were two saturated CTD casts in 2022 and here, I am prepping to iterpolate from discrete sample profiles - this is OK here as they are mixed conditions lacking strong peaks.
+
+#Wrangling the March 2022 discrete chlorophyll fluorescence profile
+cm <- cm %>% 
+  filter(filter_type == "Bulk GF/F") %>% 
+  select(date, pres = line_out_depth, chla) %>% 
+  mutate(pres = case_when(pres == 0 ~ 1,
+                          TRUE ~ as.numeric(pres)))
+
+#Wrangling the September 2022 discrete chlorophyll fluorescence profile
+cs <- cs %>% 
+  filter(filter_type == "Bulk GF/F") %>% 
+  select(date, pres = line_out_depth, chla) %>% 
+  mutate(pres = case_when(pres == 0 ~ 1,
+                          TRUE ~ as.numeric(pres)))
+
+#Combining the MArch and September discrete chlorophyll profile
+c_interp <- rbind(cm, cs)
+
+#Converting discrete chlorophyll profiles to wide format.
+c_interp <- c_interp %>% 
+  pivot_wider(names_from = "date", values_from = "chla")
+
+#Performing the interpolation.
+
+# Select chlorophyll data and depths
+spec <- c_interp %>%
+  select(`2022-03-09`, `2022-09-09`)
+
+depth <- c_interp$pres
+
+# Interpolate to 1m intervals covering full depth range
+x.new <- seq(1, max(depth), by = 1)  # Goes to 325m now
+sp.interp <- interp.dataset(y = spec, x = depth, xout = x.new,
+                           method = "loess", span = 0.8)
+
+# Create interpolated dataframe
+interp <- as.data.frame(sp.interp) %>% 
+  mutate(pres = x.new) %>% 
+  pivot_longer(cols = 1:2, names_to = "date", values_to = "f_npq") %>% 
+  mutate(date = as.Date(date),
+         station = "KC10",
+         year = year(date),
+         f_npq = round(f_npq, 2)) %>% 
+  select(date, station, year, pres, f_npq)
+
+ctd_fl <- ctd_fl %>% 
+  mutate(year = year(date)) %>% 
+  select(date, station, year, pres, f_npq)
+
+ctd_fl <- rbind(ctd_fl, interp)
+```
+
+```{r}
+ctd_fl_phys <- ctd_fl %>% 
+  left_join(daily_ctd)
+```
+
+
+
+```{r}
+library(akima)
+library(metR)
+
+# Option 3: Viridis-inspired but with dark blue start
+fluor_palette_v3 <- colorRampPalette(c(
+  "#08306b",  # Deep navy blue
+  "#1f4e7a",  # Dark blue
+  "#2e6b89",  # Medium blue
+  "#4d8fc7",  # Bright blue
+  "#2fb3d4",  # Vivid cyan-blue (bloom threshold)
+  "#00a693",  # Bright teal
+  "#4daf4a",  # Vibrant green
+  "#8cc152",  # Lime green
+  "#ffd23f",  # Bright yellow
+  "#ff8c42",  # Vivid orange
+  "#e74c3c"   # Bold red-orange
+))
+
+# Generate color vectors (50 colors for smooth gradients)
+colors_v3 <- fluor_palette_v3(50)
+
+# Function to create breaks that emphasize bloom threshold
+create_fluor_breaks <- function(max_val = 50, bloom_threshold = 5) {
+  # More breaks in the 0-10 range to capture bloom dynamics
+  c(0, 1, 2, 3, 4, bloom_threshold, 7, 10, 15, 20, 30, 40, max_val)
+}
+
+ctd_fl_plot <- ctd_fl_phys %>%
+  mutate(year = year(date),
+         month = month(date)) %>% 
+  filter(pres < 31 & year >= 2016) %>% 
+  group_by(year, month, pres) %>% 
+  summarise(f_npq = median(f_npq), .groups = "drop",
+            temp = median(temp_daily),
+            sal = median(sal_daily),
+            sigma_theta = median(sigma_theta_daily)) %>%
+  mutate(day = 15) %>% 
+  unite(date, c(year, month, day), sep = "-") %>% 
+  mutate(date = date(date)) %>% 
+  filter(date > "2016-02-01")
+```
+
+
+
+```{r}
+library(akima)
+
+# Create regular grid for interpolation
+date_seq <- seq(min(ctd_fl_plot$date), max(ctd_fl_plot$date), length.out = 300)
+pres_seq <- seq(0, 30, length.out = 200)
+
+# Interpolate fluorescence to regular grid
+ctd_interp <- with(ctd_fl_plot, 
+                   interp(x = as.numeric(date), y = pres, z = f_npq,
+                          xo = as.numeric(date_seq), yo = pres_seq))
+
+# Interpolate temperature
+temp_interp <- with(ctd_fl_plot, 
+                    interp(x = as.numeric(date), y = pres, z = temp,
+                           xo = as.numeric(date_seq), yo = pres_seq))
+
+# Interpolate salinity
+sal_interp <- with(ctd_fl_plot, 
+                   interp(x = as.numeric(date), y = pres, z = sal,
+                          xo = as.numeric(date_seq), yo = pres_seq))
+
+# Interpolate sigma theta
+sigma_interp <- with(ctd_fl_plot, 
+                     interp(x = as.numeric(date), y = pres, z = sigma_theta,
+                            xo = as.numeric(date_seq), yo = pres_seq))
+
+# Convert to data frame
+interp_df <- expand.grid(date = date_seq, pres = pres_seq) %>%
+  mutate(
+    f_npq = as.vector(ctd_interp$z),
+    temp = as.vector(temp_interp$z),
+    sal = as.vector(sal_interp$z),
+    sigma_theta = as.vector(sigma_interp$z)
+  ) %>%
+  filter(pres > 0 & pres < 30)
+```
+
+```{r}
+# Calculate integrated fluorescence (0-30m) by month
+ctd_integrated <- ctd_fl %>%
+  filter(pres <= 30) %>%  # 0-30m depth
+  filter(date > "2016-02-01") %>% 
+  mutate(
+    year_month = floor_date(date, "month"),
+    year = year(date),
+    month = month(date)
+  ) %>%
+  group_by(year_month, year, month) %>%
+  # Integrate using trapezoidal rule (approximate)
+  arrange(pres) %>%
+  summarise(
+    integrated_fl = sum(f_npq * c(diff(pres), 0), na.rm = TRUE),  # Simple integration
+    .groups = 'drop'
+  ) %>%
+  # Calculate monthly climatology and anomalies
+  group_by(month) %>%
+  mutate(
+    monthly_mean = mean(integrated_fl, na.rm = TRUE),
+    anomaly = integrated_fl - monthly_mean
+  ) %>%
+  ungroup()
+```
+
+```{r}
+# Define common x-axis settings
+common_x_breaks <- scales::date_breaks("1 year")
+common_x_labels <- scales::date_format("%Y")
+common_x_limits <- range(c(interp_df$date, ctd_integrated$year_month), na.rm = TRUE)
+```
+
+
+```{r}
+p1 <- ggplot(interp_df, aes(x = date, y = pres, fill = f_npq)) +
+  geom_raster() +
+  # Add sigma_theta = 21 contour line
+  geom_contour(aes(z = sigma_theta), breaks = 24, 
+               color = "white", size = 1, alpha = 0.9) +
+  geom_text_contour(aes(z = sigma_theta), breaks = 24,
+                    color = "white", size = 4,
+                    stroke = 0.3, stroke.color = "black",
+                    skip = 10) +
+  scale_x_date(expand = c(0, 0), 
+               breaks = common_x_breaks,
+               labels = common_x_labels,
+               limits = common_x_limits) +
+  scale_y_reverse(expand = c(0, 0),
+                  breaks = seq(0, 50, by = 5),
+                  labels = seq(0, 50, by = 5)) +
+  scale_fill_gradientn(colors = colors_v3,
+                       values = scales::rescale(c(0, 2, 5, 10, 20, 50)),
+                       na.value = "white",
+                       name = "Fluorescence (mg m⁻³)",
+                       guide = guide_colorbar(
+                         title.position = "right",
+                         title.theme = element_text(angle = 270, hjust = 0.5)
+                       )) +
+  labs(x = "Date", y = "Depth (m)") +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    text = element_text(color = "black", size = 25),
+    legend.position = "right",
+    legend.key.height = unit(1.5, "cm"),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank()
+  )
+
+print(p1)
+```
+
+
+
+
+
+```{r}
+# Create bottom panel with line and bars
+p2 <- ggplot(ctd_integrated, aes(x = year_month)) +
+  # Anomaly bars
+  geom_col(aes(y = anomaly, fill = anomaly > 0), 
+           alpha = 0.7, width = 20) +  # width in days
+  # Integrated fluorescence line
+  geom_line(aes(y = integrated_fl), color = "black", size = 0.8) +
+  geom_point(aes(y = integrated_fl), color = "black", size = 1.5) +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "blue")) +
+  scale_x_date(expand = c(0, 0),
+               breaks = common_x_breaks,
+               labels = common_x_labels,
+               limits = common_x_limits) +
+  labs(x = "Date", 
+       y = "Integrated Fluorescence\n(mg m⁻² × m)") +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    axis.text = element_text(color = "black"),
+    legend.position = "none",
+    axis.title.x = element_blank(),
+    text = element_text(color = "black", size = 25),
+  )
+
+print(p2)
+```
+```{r}
+# Calculate density difference (30m - 1m) by date
+density_diff_monthly <- ctd_calc %>%
+  filter(pres %in% c(1, 30)) %>%
+  filter(!is.na(sigma_theta)) %>%
+  mutate(
+    year_month = floor_date(date, "month"),
+    year = year(date),
+    month = month(date)
+  ) %>%
+  group_by(year_month, year, month, castpk) %>%
+  # Check that we have both depths for each cast
+  filter(all(c(1, 30) %in% pres), n() == 2) %>%
+  summarise(
+    # Calculate density difference (30m - 1m)
+    sigma_diff = sigma_theta[pres == 30] - sigma_theta[pres == 1],
+    .groups = 'drop'
+  ) %>%
+  # Calculate monthly mean density difference
+  group_by(year_month, year, month) %>%
+  summarise(
+    monthly_sigma_diff = mean(sigma_diff, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  # Calculate monthly climatology and anomalies
+  group_by(month) %>%
+  mutate(
+    monthly_mean = mean(monthly_sigma_diff, na.rm = TRUE),
+    anomaly = monthly_sigma_diff - monthly_mean
+  ) %>%
+  ungroup()
+
+# Create density difference plot
+p_density <- ggplot(density_diff_monthly, aes(x = year_month)) +
+  # Anomaly bars
+  geom_col(aes(y = anomaly, fill = anomaly > 0), 
+           alpha = 0.7, width = 20) +
+  # Monthly density difference line
+  geom_line(aes(y = monthly_sigma_diff), color = "black", size = 0.8) +
+  geom_point(aes(y = monthly_sigma_diff), color = "black", size = 1.5) +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "blue")) +
+  scale_x_date(expand = c(0, 0),
+               breaks = common_x_breaks,
+               labels = common_x_labels,
+               limits = common_x_limits) +
+  labs(x = "Date", 
+       y = "Density Difference\n(30m - 1m, kg m⁻³)") +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    axis.text = element_text(color = "black"),
+    legend.position = "none",
+    axis.title.x = element_blank(),
+    text = element_text(color = "black", size = 25)
+  )
+
+print(p_density)
+```
+
+
+```{r}
+# Combine panels
+combined_plot <- p1 / p2   # Top panel twice as tall
+
+print(combined_plot)
+
+ggsave(here("figures", "panel_kc10_interp_int.png"), combined_plot,
+       width = 16, height = 8)
+```
+
+```{r}
+#Working with the discrete chlorophyll dataset
+
+#Pulling out bulk data with appropriate flags and running a daily mean in case there are duplicates
+#Allowing SVC and ADL as generally OK.
+c_qc <- cd %>% 
+  select(date, station = site_id, line_out_depth, filter_type, chla, chla_flag) %>% 
+  filter(filter_type == "Bulk GF/F") %>% 
+  filter(chla_flag == "AV" | chla_flag == "SVC" | chla_flag == "ADL" | is.na(chla_flag)) 
+
+#Calculating a daily mean value in case of duplicates and setting the 0m sampling depth to 1m to match with the closest CTD fluorometer record
+c_dm <- c_qc %>% 
+  group_by(date, station, line_out_depth) %>% 
+  summarise(chl_dm = mean(chla)) %>% 
+  ungroup() %>% 
+  mutate(pres = round(line_out_depth)) %>%
+  drop_na() %>% 
+  group_by(date, station) %>% 
+  mutate(n_dep = n()) %>% 
+  ungroup() %>% 
+  filter(n_dep >= 3) %>% #This could be altered to > 3x points maybe?
+  mutate(year = year(date)) %>% 
+  mutate(pres = case_when(pres == 0 ~ 1,
+                          TRUE ~ as.numeric(pres)))
+```
+```{r}
+#working with the size-fractionated dataset to create a size-fractionated sum value where we are missing bulk samples
+
+#Pulling out size-fractionated data
+c_sf <- cd %>% 
+  select(date, station = site_id, line_out_depth, filter_type, chla, chla_flag) %>% 
+  filter(!filter_type == "Bulk GF/F") %>% 
+  filter(chla_flag == "AV" | chla_flag == "SVC" | chla_flag == "ADL" | is.na(chla_flag))
+
+#Calculating a daily mean value where there are three filters available to complete the set.
+c_sf_dm <- c_sf %>% 
+  filter(!is.na(chla)) %>%
+  filter(chla > 0) %>% 
+  group_by(date, station, line_out_depth, filter_type) %>% 
+  summarise(avg_chla = mean(chla)) %>%
+  ungroup() %>% 
+  group_by(date, station, line_out_depth) %>% 
+  mutate(n_filt = n()) %>% 
+  ungroup() %>% 
+  group_by(date, station, line_out_depth, filter_type) %>% 
+  mutate(n_type = n()) %>% 
+  ungroup() %>% 
+  filter(n_filt == 3 & n_type == 1) %>% 
+  group_by(date, station, line_out_depth) %>% 
+  mutate(sum = sum(avg_chla)) %>% 
+  ungroup() %>% 
+  mutate(perc = avg_chla/sum) %>% 
+  select(date, station, pres = line_out_depth, filter_type, avg_chla, sum, perc) %>% 
+  mutate(filter_type2 = case_when(filter_type == "2um" ~ "3um",
+                                  TRUE ~ as.character(filter_type)))
+
+#Setting the 0m sampling depth to 1m
+c_sum <- c_sf_dm %>% 
+  distinct(sum, .keep_all = T) %>% 
+  select(date, station, pres, sum) %>% 
+  mutate(pres = case_when(pres == 0 ~ 1,
+                          TRUE ~ as.numeric(pres)))
+
+```
+```{r}
+#Joining the bulk and size-fractionated sum and then creating combined column where the size-fractionated value is used where there are NA's for the bulk.
+c_join <- c_dm %>% 
+  full_join(c_sum) %>% 
+  mutate(chl_comb = case_when(is.na(chl_dm) ~ sum,
+                              !is.na(chl_dm) ~ chl_dm)) %>% 
+  select(date, station, pres, chl_dm, chl_comb) %>% 
+  unite(id, c(date, station), sep = "-", remove = F)
+```
+```{r}
+c_plot <- c_join %>% 
+  filter(pres %in% c(1, 5, 10)) 
+
+```
+
+```{r}
+# Prepare the chlorophyll data
+c_monthly <- c_plot %>%
+  mutate(
+    year_month = floor_date(date, "month"),
+    year = year(date),
+    month = month(date),
+    depth_label = paste0(pres, "m")  # Create depth labels
+  ) %>%
+  group_by(year_month, pres, depth_label, year, month) %>%
+  summarise(
+    monthly_chl = mean(chl_comb, na.rm = TRUE),  # Assuming your chl column name
+    .groups = 'drop'
+  ) %>%
+  # Calculate monthly climatology and anomalies for each depth
+  group_by(month, pres) %>%
+  mutate(
+    monthly_mean = mean(monthly_chl, na.rm = TRUE),
+    anomaly = monthly_chl - monthly_mean
+  ) %>%
+  ungroup()
+```
+
+
+
+```{r}
+# Create ordered factor for proper facet ordering
+c_monthly <- c_monthly %>%
+  mutate(
+    depth_label = factor(paste0(pres, " m"), 
+                        levels = c("1 m", "5 m", "10 m"))
+  )
+
+# Alternative: Separate anomaly plot by depth
+ggplot(c_monthly, aes(x = year_month)) +
+  # Anomaly bars
+  geom_col(aes(y = anomaly, fill = anomaly > 0), 
+           alpha = 0.7, width = 20) +
+  # Monthly chlorophyll lines and points
+  geom_line(aes(y = monthly_chl), color = "black", size = 1) +
+  geom_point(aes(y = monthly_chl), color = "black", size = 2) +
+  facet_wrap(~depth_label, ncol = 1,
+             strip.position = "right") +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "blue")) +
+  scale_x_date(expand = c(0, 0),
+               breaks = scales::date_breaks("1 year"),
+               labels = scales::date_format("%Y")) +
+  labs(y = "Chlorophyll-a (mg m⁻³)") +  # Removed x = "Date"
+  theme_bw() +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    text = element_text(color = "black", size = 25),
+    axis.text = element_text(color = "black"),
+    legend.position = "none",
+    strip.background = element_rect(fill = "white", color = "black"),
+    strip.text = element_text(size = 20, face = "bold"),
+    axis.title.x = element_blank()  # Remove x-axis title
+  )
+```
+
+
+```{r}
+ggsave(here("figures", "panel_kc10_bottle_depth.png"),
+       width = 16, height = 8)
+```
+
+
+
+
+

@@ -346,7 +346,7 @@ plot_qc_progression <- function(qc_steps) {
 
 
 #Downloading hourly data from the KC10 buoy fl
-chl <- read_csv(here("files", "2025-08-20.1hourSamples.all.csv"))
+chl <- read_csv(here("files", "buoy_fl_2025-09-08.1hourSamples.all.csv"))
 
 # 2024-12-05.1hourSamples.all
 # 2025-08-20.1hourSamples.all
@@ -384,4 +384,4 @@ final_data %>%
   ggplot(aes(x = date_corr, y = fl_med_day, color = as.factor(group))) +
   geom_line()
 
-write.csv(final_data, here("outputs", "qc_buoy_2025-08-20.csv."))
+write.csv(final_data, here("outputs", "qc_buoy_2025-09-08.csv."))
