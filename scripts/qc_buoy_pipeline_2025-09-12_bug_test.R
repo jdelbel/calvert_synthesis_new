@@ -210,7 +210,7 @@ fluorometry_qc_pipeline <- function(raw_data) {
   # ---- STEP 3: Z-score filtering ----
   cat("\nSTEP 3: Z-score outlier removal (|z| > 3)\n")
   step3 <- step2 %>%
-    group_by(month, group) %>%
+    group_by(month, group, year) %>%
     mutate(sd_all = sd(fl),
            mean_all = mean(fl),
            sd_mean_all = (fl - mean_all)/sd_all,
@@ -392,19 +392,4 @@ final_data %>%
 test2 <- final_data %>% 
   filter(date_corr == "2022-03-07")
 
-# Check raw data for this date
-raw_march7 <- chl %>% 
-  filter(as.Date(lubridate::mdy_hm(measurementTime)) == "2022-03-07")
-
-# Check what hours you have
-table(lubridate::hour(lubridate::mdy_hm(raw_march7$measurementTime)))
-
-# Check if it survived Step 1 (spike removal)
-step1_march7 <- qc_results$step1_spikes %>% 
-  filter(date == "2022-03-07")
-
-# Check if it survived Step 2 (nighttime filtering)  
-step2_march7 <- qc_results$step2_nighttime %>% 
-  filter(date == "2022-03-07")
-
-write.csv(final_data, here("outputs", "qc_buoy_2025-09-12.csv."))
+write.csv(final_data, here("outputs", "qc_buoy_2025-09-12_bug_test.csv"))

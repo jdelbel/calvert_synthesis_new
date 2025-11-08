@@ -1,0 +1,153 @@
+
+
+```{r}
+library(tidyverse)
+library(here)
+library(readr)
+library(lubridate)
+```
+
+```{r}
+#2022
+buoy <- read.csv(here("outputs", "qc_buoy_2025-09-12.csv"))
+
+c <- read.csv(here("files", "2025-11-03_HakaiData_chlorophyll.csv"))
+
+```
+
+```{r}
+buoy <- buoy %>% 
+  select(date_corr, fl_med_day) %>% 
+  distinct()
+```
+
+```{r}
+#Working with the discrete chlorophyll dataset
+
+#Pulling out bulk data with appropriate flags and running a daily mean in case there are duplicates
+#Allowing SVC and ADL as generally OK.
+c_qc <- c %>% 
+  select(date, station = site_id, line_out_depth, filter_type, chla, chla_flag) %>% 
+  filter(filter_type == "Bulk GF/F") %>% 
+  filter(chla_flag %in% c("AV", "SVC", "ADL") | is.na(chla_flag)) 
+
+#Calculating a daily mean value in case of duplicates and setting the 0m sampling depth to 1m to match with the closest CTD fluorometer record
+c_dm <- c_qc %>% 
+  group_by(date, station, line_out_depth) %>% 
+  summarise(chl_dm = mean(chla)) %>% 
+  ungroup() %>% 
+  mutate(pres = round(line_out_depth)) %>%
+  drop_na() %>% 
+  group_by(date, station) %>% 
+  mutate(n_dep = n()) %>% 
+  ungroup() %>% 
+  filter(n_dep >= 3) %>% #This could be altered to > 3x points maybe?
+  mutate(year = year(date)) %>% 
+  mutate(pres = case_when(pres == 0 ~ 1,
+                          TRUE ~ as.numeric(pres)))
+```
+```{r}
+#working with the size-fractionated dataset to create a size-fractionated sum value where we are missing bulk samples
+
+#Pulling out size-fractionated data
+c_sf <- c %>% 
+  select(date, station = site_id, line_out_depth, filter_type, chla, chla_flag) %>% 
+  filter(!filter_type == "Bulk GF/F") %>% 
+  filter(chla_flag == "AV" | chla_flag == "SVC" | chla_flag == "ADL" | is.na(chla_flag))
+
+#Calculating a daily mean value where there are three filters available to complete the set.
+c_sf_dm <- c_sf %>% 
+  filter(!is.na(chla)) %>%
+  filter(chla > 0) %>% 
+  group_by(date, station, line_out_depth, filter_type) %>% 
+  summarise(avg_chla = mean(chla)) %>%
+  ungroup() %>% 
+  group_by(date, station, line_out_depth) %>% 
+  mutate(n_filt = n()) %>% 
+  ungroup() %>% 
+  group_by(date, station, line_out_depth, filter_type) %>% 
+  mutate(n_type = n()) %>% 
+  ungroup() %>% 
+  filter(n_filt == 3 & n_type == 1) %>% 
+  group_by(date, station, line_out_depth) %>% 
+  mutate(sum = sum(avg_chla)) %>% 
+  ungroup() %>% 
+  mutate(perc = avg_chla/sum) %>% 
+  select(date, station, pres = line_out_depth, filter_type, avg_chla, sum, perc) %>% 
+  mutate(filter_type2 = case_when(filter_type == "2um" ~ "3um",
+                                  TRUE ~ as.character(filter_type)))
+
+#Setting the 0m sampling depth to 1m
+c_sum <- c_sf_dm %>% 
+  distinct(sum, .keep_all = T) %>% 
+  select(date, station, pres, sum) %>% 
+  mutate(pres = case_when(pres == 0 ~ 1,
+                          TRUE ~ as.numeric(pres)))
+
+```
+
+```{r}
+#Joining the bulk and size-fractionated sum and then creating combined column where the size-fractionated value is used where there are NA's for the bulk.
+c_join <- c_dm %>% 
+  full_join(c_sum) %>% 
+  mutate(chl_comb = case_when(is.na(chl_dm) ~ sum,
+                              !is.na(chl_dm) ~ chl_dm)) %>% 
+  select(date, station, pres, sum, chl_dm, chl_comb) %>% 
+  unite(id, c(date, station), sep = "-", remove = F)
+
+
+```
+```{r}
+sb_timing <- tibble(
+  date = as.Date(c("2015-04-09", "2016-04-08", "2017-04-08", "2018-03-28", 
+                   "2019-05-11", "2020-04-30", "2021-04-10", "2022-03-08", 
+                   "2023-04-03", "2024-03-25", "2025-04-03")),
+  tchla = c(5.27, 7.69, 4.27, 7.40, 4.98, 9.27, 9.18, 12.20, 10.31, 20.39, 11.32),
+  type = c("Chl", "CTD", "HPLC", "Chl", "HPLC", "HPLC", "HPLC", 
+           "Buoy", "Buoy", "Buoy", "Buoy")
+)
+
+sb_timing <- sb_timing %>% 
+  mutate(year = year(date),
+         yday = yday(date)) %>% 
+  mutate(mean_doy = mean(yday))
+```
+
+```{r}
+sb_timing %>%
+  # ggplot(aes(x = yday, y = as.factor(year))) +
+  # geom_point(color = "black", stroke = 3, size = 3) +
+  ggplot(aes(x = yday, y = as.factor(year), size = tchla, fill = tchla)) +
+  geom_point(pch = 21, color = "black", stroke = 2) +
+  geom_vline(xintercept = 98, size = 1, linetype = "dashed") +
+  scale_size_continuous(range = c(1, 25),
+                        limits = c (4, 25),
+                        breaks = scales::pretty_breaks(5)) +
+  scale_fill_distiller(direction = -1,
+                       palette = "RdYlBu",
+                       limits = c(4, 25),
+                       breaks = scales::pretty_breaks(5),
+                       ) +
+  guides(fill = guide_legend(), size = guide_legend()) +
+  coord_cartesian(xlim = c(40, 150)) +
+  ggtitle("SB Timing") +
+  labs(x = "YDAY",
+       y = "Year",
+       fill = "TChla",
+       size = "TChla") +
+ theme_bw() +
+  theme(text = element_text(size = 40),
+        axis.title.y = element_blank(),
+        axis.text = element_text(colour = "black"),
+        legend.position = "right",
+        strip.background = element_blank())
+
+ggsave(here("figures", "bloom_timing_kc10_.png"),
+        width = 9, height = 14, dpi = 300)
+
+```
+
+
+
+
+

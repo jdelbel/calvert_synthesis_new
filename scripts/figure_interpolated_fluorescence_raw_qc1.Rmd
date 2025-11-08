@@ -1,0 +1,224 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Some new interpolation tutorials to consider:
+https://search.r-project.org/CRAN/refmans/rioja/html/interp.dataset.html
+https://github.com/hdugan/NTLlakeloads
+
+```{r}
+#Upload packages
+library(tidyverse)
+library(here)
+library(readxl)
+library(patchwork)
+library(lubridate)
+library(MBA)
+library(mgcv)
+library(FNN)
+library(zoo)
+library(reshape2)
+library(rioja)
+library(egg)
+library(palr)
+library(ggsci)
+library(akima)
+library(metR)
+library(gsw)
+library(rsoi)
+library(ggpubr)
+```
+
+```{r}
+#Corrected CTD fluorescence data
+ctd_fl <- read_csv(here("outputs", "flu_kc10_fzh1_qc1_2025-11-13.csv"))
+
+```
+```{r}
+ctd_fl <- ctd_fl %>% 
+  filter(station == "FZH01")
+```
+
+```{r}
+# Option 3: Viridis-inspired but with dark blue start
+fluor_palette_v3 <- colorRampPalette(c(
+  "#08306b",  # Deep navy blue
+  "#1f4e7a",  # Dark blue
+  "#2e6b89",  # Medium blue
+  "#4d8fc7",  # Bright blue
+  "#2fb3d4",  # Vivid cyan-blue (bloom threshold)
+  "#00a693",  # Bright teal
+  "#4daf4a",  # Vibrant green
+  "#8cc152",  # Lime green
+  "#ffd23f",  # Bright yellow
+  "#ff8c42",  # Vivid orange
+  "#e74c3c"   # Bold red-orange
+))
+
+# Generate color vectors (50 colors for smooth gradients)
+colors_v3 <- fluor_palette_v3(50)
+
+# Function to create breaks that emphasize bloom threshold
+create_fluor_breaks <- function(max_val = 50, bloom_threshold = 5) {
+  # More breaks in the 0-10 range to capture bloom dynamics
+  c(0, 1, 2, 3, 4, bloom_threshold, 7, 10, 15, 20, 30, 40, max_val)
+}
+```
+
+
+```{r}
+plot_month_kc10_fzh1 <- ctd_fl %>%
+  mutate(year = year(date),
+         month = month(date)) %>% 
+  group_by(castpk) %>% 
+  mutate(max_pres = max(pres)) %>% 
+  ungroup() %>% 
+  filter(max_pres > 30) %>% 
+  filter(pres < 31) %>% 
+  group_by(year, month, pres) %>% 
+  summarise(f_npq = median(flu), .groups = "drop") %>%
+  mutate(day = 15) %>% 
+  unite(date, c(year, month, day), sep = "-") %>% 
+  mutate(date = date(date)) %>% 
+  filter(date < "2024-01-01")
+```
+
+
+
+```{r}
+
+
+# Create regular grid for interpolation
+date_seq <- seq(min(plot_month_kc10_fzh1$date), max(plot_month_kc10_fzh1$date), length.out = 300)
+pres_seq <- seq(0, 30, length.out = 200)
+
+# Interpolate fluorescence to regular grid
+ctd_interp <- with(plot_month_kc10_fzh1, 
+                   interp(x = as.numeric(date), y = pres, z = f_npq,
+                          xo = as.numeric(date_seq), yo = pres_seq))
+
+
+
+# Convert to data frame
+interp_df <- expand.grid(date = date_seq, pres = pres_seq) %>%
+  mutate(
+    f_npq = as.vector(ctd_interp$z)) %>%
+  filter(pres > 0 & pres < 30)
+```
+
+```{r}
+# Calculate integrated fluorescence (0-30m) by month
+ctd_integrated <- ctd_fl %>%
+  group_by(castpk) %>% 
+  mutate(max_pres = max(pres)) %>% 
+  ungroup() %>% 
+  filter(max_pres > 30) %>% 
+  filter(pres <= 30) %>%  # 0-30m depth
+  filter(date < "2024-01-01") %>% 
+  mutate(
+    year_month = floor_date(date, "month"),
+    year = year(date),
+    month = month(date)
+  ) %>%
+  group_by(year_month, year, month) %>%
+  # Integrate using trapezoidal rule (approximate)
+  arrange(pres) %>%
+  summarise(
+    integrated_fl = sum(flu * c(diff(pres), 0), na.rm = TRUE),  # Simple integration
+    .groups = 'drop'
+  ) %>%
+  # Calculate monthly climatology and anomalies
+  group_by(month) %>%
+  mutate(
+    monthly_mean = mean(integrated_fl, na.rm = TRUE),
+    anomaly = integrated_fl - monthly_mean
+  ) %>%
+  ungroup()
+```
+
+```{r}
+# Define common x-axis settings
+common_x_breaks <- scales::date_breaks("1 year")
+common_x_labels <- scales::date_format("%Y")
+common_x_limits <- range(c(interp_df$date, ctd_integrated$year_month), na.rm = TRUE)
+```
+
+
+```{r}
+p1 <- ggplot(interp_df, aes(x = date, y = pres, fill = f_npq)) +
+  geom_raster() +
+  # Add sigma_theta = 21 contour line
+  scale_x_date(expand = c(0, 0), 
+               breaks = common_x_breaks,
+               labels = common_x_labels,
+               limits = common_x_limits) +
+  scale_y_reverse(expand = c(0, 0),
+                  breaks = seq(0, 50, by = 5),
+                  labels = seq(0, 50, by = 5)) +
+  scale_fill_gradientn(colors = colors_v3,
+                       values = scales::rescale(c(0, 2, 5, 10, 20, 50)),
+                       na.value = "white",
+                       name = "Fluorescence (mg m⁻³)",
+                       guide = guide_colorbar(
+                         title.position = "right",
+                         title.theme = element_text(angle = 270, hjust = 0.5)
+                       )) +
+  labs(x = "Date", y = "Depth (m)") +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    text = element_text(color = "black", size = 25),
+    legend.position = "right",
+    legend.key.height = unit(1.5, "cm"),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank()
+  )
+
+print(p1)
+```
+
+
+
+
+
+```{r}
+# Create bottom panel with line and bars
+p2 <- ggplot(ctd_integrated, aes(x = year_month)) +
+  # Anomaly bars
+  geom_col(aes(y = anomaly, fill = anomaly > 0), 
+           alpha = 0.7, width = 20) +  # width in days
+  # Integrated fluorescence line
+  geom_line(aes(y = integrated_fl), color = "black", size = 0.8) +
+  geom_point(aes(y = integrated_fl), color = "black", size = 1.5) +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "blue")) +
+  scale_x_date(expand = c(0, 0),
+               breaks = common_x_breaks,
+               labels = common_x_labels,
+               limits = common_x_limits) +
+  labs(x = "Date", 
+       y = "Integrated Fluorescence\n(mg m⁻² × m)") +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    axis.text = element_text(color = "black"),
+    legend.position = "none",
+    axis.title.x = element_blank(),
+    text = element_text(color = "black", size = 25),
+  )
+
+print(p2)
+```
+
+
+
+```{r}
+# Combine panels
+combined_plot <- p1 / p2   # Top panel twice as tall
+
+print(combined_plot)
+
+ggsave(here("figures", "panel_fzh01_monthly_avg_raw_data.png"), combined_plot,
+       width = 16, height = 8)
+```
+

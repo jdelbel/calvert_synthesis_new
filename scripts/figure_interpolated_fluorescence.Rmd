@@ -24,7 +24,8 @@ library(egg)
 library(palr)
 library(ggsci)
 library(gsw)
-
+library(rsoi)
+library(ggpubr)
 ```
 
 ```{r}
@@ -35,12 +36,32 @@ ctd <- read_csv(here("files", "ctd_kc10_fzh01_2025-08-09.csv"))
 
 #cm = chlorophylly march 
 cm <- read_csv(here("files", "chl_2022-03-09.csv")) 
+
 #cs = chlorophyll september
 cs <- read_csv(here("files", "chl_2022-09-09.csv")) 
 
 #Downloading discrete chlorophyll samples - This could be done using the API
 cd <- read_csv(here("files", "chl_kc10_fzh01_2025-09-08.csv"))
+
+fw <- read_csv(here("files", "Daily_flow_long_2014_2024_v2025_04_03.csv"))
 ```
+
+```{r}
+# Download MEI directly
+mei_data <- download_mei()
+
+```
+```{r}
+fw_tot <- fw %>% 
+  filter(Watershed_group == "Q_Total") %>% 
+  mutate(date = date(Date),
+         year = year(date),
+         month = month(date)) %>% 
+  filter(year >= 2017)
+
+```
+
+
 
 ```{r}
 ctd_calc <- ctd %>% 
@@ -138,8 +159,6 @@ ctd_fl <- rbind(ctd_fl, interp)
 ctd_fl_phys <- ctd_fl %>% 
   left_join(daily_ctd)
 ```
-
-
 
 ```{r}
 library(akima)
@@ -543,7 +562,640 @@ ggsave(here("figures", "panel_kc10_bottle_depth.png"),
        width = 16, height = 8)
 ```
 
+```{r}
+mei_data <- mei_data %>% 
+  mutate(month = month(Date)) %>% 
+  rename(year = Year)
 
+test <- ctd_integrated %>% 
+  left_join(mei_data) %>% 
+  group_by(year) %>% 
+  summarise(int_year = mean(integrated_fl),
+            int_anom_year = mean(anomaly),
+            mei_year = mean(MEI)) %>% 
+  ungroup()
 
+test %>% 
+  filter(year > 2016 & year < 2024) %>% 
+  ggplot(aes(x = int_anom_year, y = mei_year, fill = as.factor(year))) +
+  geom_point(pch = 21, size = 3)
 
+test %>% 
+  filter(year > 2016 & year < 2024) %>% 
+  ggplot(aes(x = int_anom_year, y = mei_year, fill = as.factor(year))) +
+  geom_point(pch = 21, size = 3)
+```
+
+```{r}
+library(tidyverse)
+library(patchwork)
+library(ggpubr)
+
+# Annual data
+annual_data <- ctd_integrated %>% 
+  left_join(mei_data, by = c("year", "month")) %>% 
+  group_by(year) %>% 
+  summarise(
+    integrated_fl = mean(integrated_fl, na.rm = TRUE),
+    integrated_anom = mean(anomaly, na.rm = TRUE),
+    mei_annual = mean(MEI, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>% 
+  filter(year > 2016 & year < 2024) 
+
+# Calculate correlations for custom labels
+cor_fl <- cor.test(annual_data$integrated_fl, annual_data$mei_annual)
+cor_anom <- cor.test(annual_data$integrated_anom, annual_data$mei_annual)
+
+# Format p-values
+format_p <- function(p) {
+  if(p < 0.001) return("p < 0.001")
+  else return(paste0("p = ", round(p, 3)))
+}
+
+cor_label_fl <- paste0("r = ", round(cor_fl$estimate, 2), 
+                       ", ", format_p(cor_fl$p.value))
+cor_label_anom <- paste0("r = ", round(cor_anom$estimate, 2), 
+                         ", ", format_p(cor_anom$p.value))
+
+# Define consistent theme with larger text
+theme_custom <- theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  )
+
+# Plot 1: Integrated fluorescence vs MEI
+p1 <- annual_data %>% 
+  ggplot(aes(x = integrated_fl, y = mei_annual)) +
+  geom_smooth(method = "lm", se = TRUE, color = "gray40", 
+              linewidth = 0.8, alpha = 0.3) +
+  geom_point(aes(fill = as.factor(year)), 
+             pch = 21, size = 5, color = "black", stroke = 1) +
+  annotate("text", x = -Inf, y = Inf, label = cor_label_fl,
+           hjust = -0.1, vjust = 1.5, size = 5) +
+  scale_fill_viridis_d(name = "Year", option = "turbo") +
+  labs(x = "Annual Integrated Fluorescence (mg m⁻²·m)",
+       y = "Annual MEI",
+       title = "Integrated Fluorescence vs MEI") +
+  theme_custom +
+  theme(legend.position = "none")
+
+# Plot 2: Fluorescence anomaly vs MEI
+p2 <- annual_data %>% 
+  ggplot(aes(x = integrated_anom, y = mei_annual)) +
+  geom_smooth(method = "lm", se = TRUE, color = "gray40", 
+              linewidth = 0.8, alpha = 0.3) +
+  geom_point(aes(fill = as.factor(year)), 
+             pch = 21, size = 5, color = "black", stroke = 1) +
+  annotate("text", x = -Inf, y = Inf, label = cor_label_anom,
+           hjust = -0.1, vjust = 1.5, size = 5) +
+  scale_fill_viridis_d(name = "Year", option = "turbo") +
+  labs(x = "Annual Integrated Fluorescence Anomaly (mg m⁻²·m)",
+       y = "Annual MEI",
+       title = "Fluorescence Anomaly vs MEI") +
+  theme_custom +
+  theme(legend.position = "right")
+
+# Plot 3: Time series of integrated fluorescence
+# Color represents the actual fluorescence value
+p3 <- annual_data %>% 
+  ggplot(aes(x = year, y = integrated_fl)) +
+  geom_line(color = "steelblue", linewidth = 1.2) +
+  geom_point(aes(fill = integrated_fl), 
+             pch = 21, size = 5, color = "black", stroke = 1) +
+  scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B",
+    midpoint = mean(annual_data$integrated_fl),
+    name = "Fluorescence\n(mg m⁻²·m)"
+  ) +
+  scale_x_continuous(breaks = 2017:2023) +
+  labs(x = NULL,
+       y = "Integrated Fluorescence\n(mg m⁻²·m)",
+       title = "Annual Integrated Fluorescence") +
+  theme_custom +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+# Plot 4: Time series of MEI
+# Color represents ENSO phase (blue = La Niña, red = El Niño)
+p4 <- annual_data %>% 
+  ggplot(aes(x = year, y = mei_annual)) +
+  geom_hline(yintercept = 0, linetype = "dashed", 
+             color = "gray30", linewidth = 0.8) +
+  geom_line(color = "darkorange", linewidth = 1.2) +
+  geom_point(aes(fill = mei_annual), 
+             pch = 21, size = 5, color = "black", stroke = 1) +
+  scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B",
+    midpoint = 0,
+    name = "MEI\n(ENSO phase)"
+  ) +
+  scale_x_continuous(breaks = 2017:2023) +
+  labs(x = "Year",
+       y = "Annual MEI",
+       title = "Annual Multivariate ENSO Index") +
+  theme_custom
+
+# Combine plots
+combined_plot <- (p1 | p2) / p3 / p4 +
+  plot_layout(heights = c(1.2, 0.8, 0.8)) +
+  plot_annotation(
+    title = "Relationship between Integrated Fluorescence and ENSO (MEI)",
+    subtitle = "KC10, Fitz-Hugh Channel, 2017-2023",
+    theme = theme(
+      plot.title = element_text(size = 18, face = "bold"),
+      plot.subtitle = element_text(size = 14)
+    )
+  )
+
+# Display
+combined_plot
+
+# Save at high resolution
+ggsave(here("figures","fluorescence_mei_analysis.png"), combined_plot,
+       width = 14, height = 12, 
+       dpi = 300)
+```
+
+```{r}
+library(tidyverse)
+library(patchwork)
+library(metR)  # for geom_text_contour
+library(here)
+
+# Define common x-axis elements for 2017-2023 period
+common_x_breaks <- seq(as.Date("2017-01-01"), as.Date("2024-01-01"), by = "1 year")
+common_x_labels <- format(common_x_breaks, "%Y")
+common_x_limits <- c(as.Date("2017-01-01"), as.Date("2023-12-31"))
+
+# Define color palette for fluorescence
+colors_v3 <- c("#08519c", "#3182bd", "#6baed6", "#9ecae1", 
+               "#c6dbef", "#ffffcc", "#ffeda0", "#fed976", 
+               "#feb24c", "#fd8d3c", "#fc4e2a", "#e31a1c", "#bd0026")
+
+# Define consistent theme
+theme_panels <- theme_bw() +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    text = element_text(color = "black", size = 25),
+    axis.text = element_text(color = "black"),
+    legend.key.height = unit(1.5, "cm")
+  )
+
+# Panel 1: Interpolated fluorescence with density contour
+p1 <- ggplot(interp_df, aes(x = date, y = pres, fill = f_npq)) +
+  geom_raster() +
+  geom_contour(aes(z = sigma_theta), 
+               breaks = 24, 
+               color = "white", 
+               linewidth = 1, 
+               alpha = 0.9) +
+  geom_text_contour(aes(z = sigma_theta), 
+                    breaks = 24,
+                    color = "white", 
+                    size = 4,
+                    stroke = 0.3, 
+                    stroke.color = "black",
+                    skip = 10) +
+  scale_x_date(expand = c(0, 0), 
+               breaks = common_x_breaks,
+               labels = common_x_labels,
+               limits = common_x_limits) +
+  scale_y_reverse(expand = c(0, 0),
+                  breaks = seq(0, 50, by = 10)) +
+  scale_fill_gradientn(colors = colors_v3,
+                       values = scales::rescale(c(0, 2, 5, 10, 20, 50)),
+                       na.value = "white",
+                       name = "Fluorescence\n(mg m⁻³)",
+                       guide = guide_colorbar(
+                         title.position = "right",
+                         title.theme = element_text(angle = 270, hjust = 0.5)
+                       )) +
+  labs(x = NULL, y = "Depth (m)") +
+  theme_panels +
+  theme(
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    legend.position = "right"
+  )
+
+# Panel 2: Integrated fluorescence with anomaly bars
+p2 <- ggplot(ctd_integrated, aes(x = year_month)) +
+  geom_col(aes(y = anomaly, fill = anomaly > 0), 
+           alpha = 0.7, 
+           width = 20) +
+  geom_line(aes(y = integrated_fl), 
+            color = "black", 
+            linewidth = 0.8) +
+  geom_point(aes(y = integrated_fl), 
+             color = "black", 
+             size = 1.5) +
+  scale_fill_manual(values = c("TRUE" = "#B2182B", "FALSE" = "#2166AC"),
+                    guide = "none") +
+  scale_x_date(expand = c(0, 0),
+               breaks = common_x_breaks,
+               labels = common_x_labels,
+               limits = common_x_limits) +
+  scale_y_continuous(breaks = seq(0, 400, by = 100)) +
+  labs(x = NULL, 
+       y = "Integrated Fluor.\n(mg m⁻² × m)") +
+  theme_panels +
+  theme(
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    legend.position = "none"
+  )
+
+# Panel 3: Monthly MEI
+# Prepare MEI data with date column and phase classification
+mei_plot_data <- mei_data %>%
+  mutate(
+    plot_date = as.Date(Date),
+    Phase = case_when(
+      MEI >= 0.5 ~ "El Niño",
+      MEI <= -0.5 ~ "La Niña",
+      TRUE ~ "Neutral"
+    ),
+    Phase = factor(Phase, levels = c("El Niño", "Neutral", "La Niña"))
+  ) %>%
+  filter(plot_date >= as.Date("2017-01-01") & 
+         plot_date <= as.Date("2023-12-31"))
+
+p3 <- ggplot(mei_plot_data, aes(x = plot_date, y = MEI)) +
+  geom_hline(yintercept = 0, 
+             linetype = "dashed", 
+             color = "gray30", 
+             linewidth = 0.8) +
+  geom_col(aes(fill = Phase), 
+           width = 25,  # width in days
+           alpha = 0.8) +
+  geom_line(color = "black", 
+            linewidth = 0.6) +
+  scale_fill_manual(
+    values = c("El Niño" = "#B2182B", 
+               "La Niña" = "#2166AC", 
+               "Neutral" = "gray70"),
+    name = "ENSO Phase"
+  ) +
+  scale_x_date(expand = c(0, 0),
+               breaks = common_x_breaks,
+               labels = common_x_labels,
+               limits = common_x_limits) +
+  scale_y_continuous(breaks = seq(-2, 3, by = 1)) +
+  labs(x = "Date", 
+       y = "MEI") +
+  theme_panels +
+  theme(legend.position = "right")
+
+# Combine all three panels
+combined_plot <- p1 / p2 / p3 +
+  plot_layout(heights = c(1.2, 0.8, 0.8))
+
+# Display
+print(combined_plot)
+
+# Save
+ggsave(here("figures", "panel_kc10_interp_int_mei.png"), 
+       combined_plot,
+       width = 16, 
+       height = 12,
+       dpi = 300)
+```
+```{r}
+library(tidyverse)
+library(patchwork)
+library(metR)  # for geom_text_contour
+library(here)
+
+# Define common x-axis elements for 2017-2023 period
+common_x_breaks <- seq(as.Date("2017-01-01"), as.Date("2024-01-01"), by = "1 year")
+common_x_labels <- format(common_x_breaks, "%Y")
+common_x_limits <- c(as.Date("2017-01-01"), as.Date("2023-12-31"))
+
+# Define color palette for fluorescence
+colors_v3 <- c("#08519c", "#3182bd", "#6baed6", "#9ecae1", 
+               "#c6dbef", "#ffffcc", "#ffeda0", "#fed976", 
+               "#feb24c", "#fd8d3c", "#fc4e2a", "#e31a1c", "#bd0026")
+
+# Define consistent theme
+theme_panels <- theme_bw() +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    text = element_text(color = "black", size = 25),
+    axis.text = element_text(color = "black"),
+    legend.key.height = unit(1.5, "cm")
+  )
+
+# Calculate monthly discharge and anomalies
+fw_monthly <- fw_tot %>%
+  mutate(year_month = floor_date(date, "month")) %>%
+  group_by(year_month) %>%
+  summarise(
+    Q_monthly = mean(Q, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    month = month(year_month),
+    # Calculate climatological mean for each month
+    Q_clim = mean(Q_monthly[month(year_month) == month], na.rm = TRUE),
+    # Calculate anomaly
+    Q_anomaly = Q_monthly - Q_clim
+  ) %>%
+  ungroup()
+
+# Panel 1: Interpolated fluorescence with density contour
+p1 <- ggplot(interp_df, aes(x = date, y = pres, fill = f_npq)) +
+  geom_raster() +
+  geom_contour(aes(z = sigma_theta), 
+               breaks = 24, 
+               color = "white", 
+               linewidth = 1, 
+               alpha = 0.9) +
+  geom_text_contour(aes(z = sigma_theta), 
+                    breaks = 24,
+                    color = "white", 
+                    size = 4,
+                    stroke = 0.3, 
+                    stroke.color = "black",
+                    skip = 10) +
+  scale_x_date(expand = c(0, 0), 
+               breaks = common_x_breaks,
+               labels = common_x_labels,
+               limits = common_x_limits) +
+  scale_y_reverse(expand = c(0, 0),
+                  breaks = seq(0, 50, by = 10)) +
+  scale_fill_gradientn(colors = colors_v3,
+                       values = scales::rescale(c(0, 2, 5, 10, 20, 50)),
+                       na.value = "white",
+                       name = "Fluorescence\n(mg m⁻³)",
+                       guide = guide_colorbar(
+                         title.position = "right",
+                         title.theme = element_text(angle = 270, hjust = 0.5)
+                       )) +
+  labs(x = NULL, y = "Depth (m)") +
+  theme_panels +
+  theme(
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    legend.position = "right"
+  )
+
+# Panel 2: Integrated fluorescence with anomaly bars
+p2 <- ggplot(ctd_integrated, aes(x = year_month)) +
+  geom_col(aes(y = anomaly, fill = anomaly > 0), 
+           alpha = 0.7, 
+           width = 20) +
+  geom_line(aes(y = integrated_fl), 
+            color = "black", 
+            linewidth = 0.8) +
+  geom_point(aes(y = integrated_fl), 
+             color = "black", 
+             size = 1.5) +
+  scale_fill_manual(values = c("TRUE" = "#B2182B", "FALSE" = "#2166AC"),
+                    guide = "none") +
+  scale_x_date(expand = c(0, 0),
+               breaks = common_x_breaks,
+               labels = common_x_labels,
+               limits = common_x_limits) +
+  scale_y_continuous(breaks = seq(0, 400, by = 100)) +
+  labs(x = NULL, 
+       y = "Integrated Fluor.\n(mg m⁻² × m)") +
+  theme_panels +
+  theme(
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    legend.position = "none"
+  )
+
+# Panel 3: Monthly discharge with anomaly bars
+p3 <- ggplot(fw_monthly, aes(x = year_month)) +
+  geom_col(aes(y = Q_anomaly, fill = Q_anomaly > 0), 
+           alpha = 0.7, 
+           width = 20) +
+  geom_line(aes(y = Q_monthly), 
+            color = "black", 
+            linewidth = 0.8) +
+  geom_point(aes(y = Q_monthly), 
+             color = "black", 
+             size = 1.5) +
+  scale_fill_manual(values = c("TRUE" = "#B2182B", "FALSE" = "#2166AC"),
+                    guide = "none") +
+  scale_x_date(expand = c(0, 0),
+               breaks = common_x_breaks,
+               labels = common_x_labels,
+               limits = common_x_limits) +
+  labs(x = NULL, 
+       y = "Discharge\n(m³ s⁻¹)") +
+  theme_panels +
+  theme(
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    legend.position = "none"
+  )
+
+# Panel 4: Monthly MEI
+mei_plot_data <- mei_data %>%
+  mutate(
+    plot_date = as.Date(Date),
+    Phase = case_when(
+      MEI >= 0.5 ~ "El Niño",
+      MEI <= -0.5 ~ "La Niña",
+      TRUE ~ "Neutral"
+    ),
+    Phase = factor(Phase, levels = c("El Niño", "Neutral", "La Niña"))
+  ) %>%
+  filter(plot_date >= as.Date("2017-01-01") & 
+         plot_date <= as.Date("2023-12-31"))
+
+p4 <- ggplot(mei_plot_data, aes(x = plot_date, y = MEI)) +
+  geom_hline(yintercept = 0, 
+             linetype = "dashed", 
+             color = "gray30", 
+             linewidth = 0.8) +
+  geom_col(aes(fill = Phase), 
+           width = 25,
+           alpha = 0.8) +
+  geom_line(color = "black", 
+            linewidth = 0.6) +
+  scale_fill_manual(
+    values = c("El Niño" = "#B2182B", 
+               "La Niña" = "#2166AC", 
+               "Neutral" = "gray70"),
+    name = "ENSO Phase"
+  ) +
+  scale_x_date(expand = c(0, 0),
+               breaks = common_x_breaks,
+               labels = common_x_labels,
+               limits = common_x_limits) +
+  scale_y_continuous(breaks = seq(-2, 3, by = 1)) +
+  labs(x = "Date", 
+       y = "MEI") +
+  theme_panels +
+  theme(legend.position = "right")
+
+# Combine all four panels
+combined_plot <- p1 / p2 / p3 / p4 +
+  plot_layout(heights = c(1.2, 0.8, 0.8, 0.8))
+
+# Display
+print(combined_plot)
+
+# Save
+ggsave(here("figures", "panel_kc10_interp_int_fw-total_mei.png"), 
+       combined_plot,
+       width = 16, 
+       height = 14,
+       dpi = 300)
+```
+
+```{r}
+library(tidyverse)
+library(patchwork)
+library(ggpubr)
+
+# Calculate annual discharge
+annual_discharge <- fw_tot %>%
+  group_by(year) %>%
+  summarise(
+    Q_annual = mean(Q, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  filter(year > 2016 & year < 2024)
+
+# Join with existing annual data
+annual_data_full <- annual_data %>%
+  left_join(annual_discharge, by = "year")
+
+# Calculate correlations
+cor_mei_q <- cor.test(annual_data_full$mei_annual, annual_data_full$Q_annual)
+cor_fluor_q <- cor.test(annual_data_full$integrated_anom, annual_data_full$Q_annual)
+
+# Format p-values
+format_p <- function(p) {
+  if(p < 0.001) return("p < 0.001")
+  else return(paste0("p = ", round(p, 3)))
+}
+
+cor_label_mei_q <- paste0("r = ", round(cor_mei_q$estimate, 2), 
+                          ", ", format_p(cor_mei_q$p.value))
+cor_label_fluor_q <- paste0("r = ", round(cor_fluor_q$estimate, 2), 
+                            ", ", format_p(cor_fluor_q$p.value))
+
+# Define consistent theme
+theme_custom <- theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  )
+
+# Plot 1: MEI vs Discharge
+p1 <- annual_data_full %>% 
+  ggplot(aes(x = Q_annual, y = mei_annual)) +
+  geom_smooth(method = "lm", se = TRUE, color = "gray40", 
+              linewidth = 0.8, alpha = 0.3) +
+  geom_point(aes(fill = as.factor(year)), 
+             pch = 21, size = 5, color = "black", stroke = 1) +
+  annotate("text", x = -Inf, y = Inf, label = cor_label_mei_q,
+           hjust = -0.1, vjust = 1.5, size = 5) +
+  scale_fill_viridis_d(name = "Year", option = "turbo") +
+  labs(x = "Annual Mean Discharge (m³ s⁻¹)",
+       y = "Annual MEI",
+       title = "MEI vs Freshwater Discharge") +
+  theme_custom +
+  theme(legend.position = "none")
+
+# Plot 2: Fluorescence anomaly vs Discharge
+p2 <- annual_data_full %>% 
+  ggplot(aes(x = Q_annual, y = integrated_anom)) +
+  geom_smooth(method = "lm", se = TRUE, color = "gray40", 
+              linewidth = 0.8, alpha = 0.3) +
+  geom_point(aes(fill = as.factor(year)), 
+             pch = 21, size = 5, color = "black", stroke = 1) +
+  annotate("text", x = -Inf, y = Inf, label = cor_label_fluor_q,
+           hjust = -0.1, vjust = 1.5, size = 5) +
+  scale_fill_viridis_d(name = "Year", option = "turbo") +
+  labs(x = "Annual Mean Discharge (m³ s⁻¹)",
+       y = "Annual Integrated Fluorescence Anomaly (mg m⁻²·m)",
+       title = "Fluorescence Anomaly vs Freshwater Discharge") +
+  theme_custom +
+  theme(legend.position = "right")
+
+# Combine plots
+discharge_plot <- (p1 | p2) +
+  plot_annotation(
+    title = "Relationship between Freshwater Discharge and Climate/Productivity",
+    subtitle = "KC10, Fitz-Hugh Channel, 2017-2023",
+    theme = theme(
+      plot.title = element_text(size = 18, face = "bold"),
+      plot.subtitle = element_text(size = 14)
+    )
+  )
+
+# Display
+discharge_plot
+
+# Save
+ggsave(here("figures", "discharge_relationships.png"), 
+       discharge_plot,
+       width = 14, 
+       height = 6, 
+       dpi = 300)
+
+# Optional: Print summary statistics
+cat("\nCorrelation Summary:\n")
+cat("MEI vs Discharge: r =", round(cor_mei_q$estimate, 3), 
+    ", p =", round(cor_mei_q$p.value, 3), "\n")
+cat("Fluorescence Anomaly vs Discharge: r =", round(cor_fluor_q$estimate, 3), 
+    ", p =", round(cor_fluor_q$p.value, 3), "\n")
+```
+
+```{r}
+# Calculate seasonal MEI (e.g., winter: DJF, spring: MAM, summer: JJA, fall: SON)
+seasonal_data <- ctd_integrated %>% 
+  left_join(mei_data, by = c("year", "month")) %>% 
+  mutate(
+    season = case_when(
+      month %in% c(12, 1, 2) ~ "Winter",
+      month %in% 3:5 ~ "Spring",
+      month %in% 6:8 ~ "Summer",
+      month %in% 9:11 ~ "Fall"
+    )
+  ) %>%
+  group_by(year, season) %>%
+  summarise(
+    integrated_fl = mean(integrated_fl, na.rm = TRUE),
+    integrated_anom = mean(anomaly, na.rm = TRUE),
+    mei_seasonal = mean(MEI, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  filter(year > 2016 & year < 2024)
+
+# Focus on growing season (e.g., Spring-Summer)
+growing_season <- seasonal_data %>%
+  filter(season %in% c("Spring", "Summer")) %>%
+  group_by(year) %>%
+  summarise(
+    integrated_fl = mean(integrated_fl, na.rm = TRUE),
+    integrated_anom = mean(integrated_anom, na.rm = TRUE),
+    mei_growing = mean(mei_seasonal, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Correlations for growing season
+cor_growing <- cor.test(growing_season$integrated_anom, growing_season$mei_growing)
+print(paste("Growing season correlation: r =", round(cor_growing$estimate, 3), 
+            "p =", round(cor_growing$p.value, 3)))
+```
+```{r}
+growing_season %>% 
+  ggplot(aes(x = mei_growing, y = integrated_fl, color = as.factor(year))) +
+  geom_point()
+```
 

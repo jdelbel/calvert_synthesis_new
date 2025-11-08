@@ -1,0 +1,1145 @@
+---
+title: CTD Fluorometer Correction Workbook
+output: html_notebook
+---
+
+This worksheet works on created a corrected chlorophyll fluorometer time-series through comparison with discrete chlorophyll samples.
+
+```{r}
+#Upload packages
+library(tidyverse) #wrangling
+library(here) #file management
+library(readxl) #reading excel files
+library(lubridate) #working with dates and time
+
+#Plotting
+library(ggsci) #Nice color schemes
+library(patchwork) #plotting panels
+library(egg) #I think this is for panel plotting as well.
+
+#Interpolation
+library(rioja) # add fits to discrete data
+```
+
+```{r}
+#Downloading baseline corrected chlorophyll fluorescence profiles
+f <- read_csv(here("files", "8_binAvg-1762199720021.csv"))
+
+#Downloading chlorophyll data for joining
+c <- read_csv(here("files", "2025-11-03_HakaiData_chlorophyll.csv"))
+```
+
+```{r}
+#What stations have I done baseline correction on?
+
+#pulling out what stations are included in the file.
+station <- f %>% 
+  distinct(station)
+
+station_chl <- c %>% 
+  distinct(site_id)
+
+#I wonder if baseline correction is necessary - QC definitely is as bad casts. But could try to identify on the fly through comparison with bottle?
+
+#what stations should I look at?
+
+#FZH08
+#FZH13
+#FZH01
+#UBC7
+#RVRS01
+#HKP04
+#PRUTH
+#HKP01
+
+#These are pretty decent stations to look at - I feel like extending it as broadly as possible would be beneficial, but, I need to consider what type of processing I need to do.
+
+#We don't have bottle data at each station, so I need to take the relationships where we do have bottle matches and apply them more broadly.
+
+#This includes trying to do quenching corrections.
+
+#Having chlorophyll QC'd would actually be pretty beneficial
+```
+
+
+
+```{r}
+#Working with CTD fluorescence datasets
+
+#Filtering to station KC10 and FZH01
+f <- f %>% 
+  filter(station == "KC10" | station == "FZH01")
+
+#Looking at the number of profiles and minimum and maximum dates
+num_f <- f %>%
+  filter(pres == 5) %>% 
+  group_by(station) %>% 
+  summarise(n_prof = n(),
+            min_date = min(date),
+            max_date = max(date)) %>%
+  ungroup()
+
+#Looking at the number of profiles at each station in each year. Pretty comparable. Unfortunately, not the same story with discrete chlorophyll.
+num_f_year <- f %>%
+  mutate(year = year(date)) %>% 
+  filter(pres == 5) %>% 
+  group_by(station, year) %>% 
+  summarise(n_prof = n()) %>%
+  ungroup()
+
+#Looking at days with replicate casts and looking at the time difference between them
+num_dup <- f %>% 
+  filter(pres == 5) %>%
+  group_by(date, station) %>% 
+  summarise(n_prof = n(),
+            min_time = min(time),
+            max_time = max(time)) %>% 
+  ungroup() %>% 
+  filter(n_prof > 1) %>% 
+  mutate(diff_time = difftime(max_time, min_time, units = "hours"))
+
+#For now, I think best to just do a daily mean on fluorescence profiles, but this needs evaluation
+f_dm <- f %>% 
+  group_by(date, station, pres) %>% 
+  summarise(f_dm = mean(flu_cor),
+            n_prof = n()) %>% 
+  ungroup() %>% 
+  mutate(f_dm = round(f_dm, 2)) %>% 
+  unite(id, c(date, station), sep = "-", remove = F)
+
+#Claude could help match profiles with samples by time, but then I run into issue of having casts without match - maybe this is why I am getting mismatches at 5m though. I could theoretically just using the profiles that have a match and ditch the rest.
+```
+
+
+```{r}
+#Working with the discrete chlorophyll dataset
+
+#Pulling out bulk data with appropriate flags and running a daily mean in case there are duplicates
+#Allowing SVC and ADL as generally OK.
+c_qc <- c %>% 
+  select(date, station = site_id, line_out_depth, filter_type, chla, chla_flag) %>% 
+  filter(filter_type == "Bulk GF/F") %>% 
+  filter(chla_flag == "AV" | chla_flag == "SVC" | chla_flag == "ADL" | is.na(chla_flag)) 
+
+#Calculating a daily mean value in case of duplicates and setting the 0m sampling depth to 1m to match with the closest CTD fluorometer record
+c_dm <- c_qc %>% 
+  group_by(date, station, line_out_depth) %>% 
+  summarise(chl_dm = mean(chla)) %>% 
+  ungroup() %>% 
+  mutate(pres = round(line_out_depth)) %>%
+  drop_na() %>% 
+  group_by(date, station) %>% 
+  mutate(n_dep = n()) %>% 
+  ungroup() %>% 
+  filter(n_dep >= 3) %>% #This could be altered to > 3x points maybe?
+  mutate(year = year(date)) %>% 
+  mutate(pres = case_when(pres == 0 ~ 1,
+                          TRUE ~ as.numeric(pres)))
+```
+
+
+```{r}
+#working with the size-fractionated dataset to create a size-fractionated sum value where we are missing bulk samples
+
+#Pulling out size-fractionated data
+c_sf <- c %>% 
+  select(date, station = site_id, line_out_depth, filter_type, chla, chla_flag) %>% 
+  filter(!filter_type == "Bulk GF/F") %>% 
+  filter(chla_flag == "AV" | chla_flag == "SVC" | chla_flag == "ADL" | is.na(chla_flag))
+
+#Calculating a daily mean value where there are three filters available to complete the set.
+c_sf_dm <- c_sf %>% 
+  filter(!is.na(chla)) %>%
+  filter(chla > 0) %>% 
+  group_by(date, station, line_out_depth, filter_type) %>% 
+  summarise(avg_chla = mean(chla)) %>%
+  ungroup() %>% 
+  group_by(date, station, line_out_depth) %>% 
+  mutate(n_filt = n()) %>% 
+  ungroup() %>% 
+  group_by(date, station, line_out_depth, filter_type) %>% 
+  mutate(n_type = n()) %>% 
+  ungroup() %>% 
+  filter(n_filt == 3 & n_type == 1) %>% 
+  group_by(date, station, line_out_depth) %>% 
+  mutate(sum = sum(avg_chla)) %>% 
+  ungroup() %>% 
+  mutate(perc = avg_chla/sum) %>% 
+  select(date, station, pres = line_out_depth, filter_type, avg_chla, sum, perc) %>% 
+  mutate(filter_type2 = case_when(filter_type == "2um" ~ "3um",
+                                  TRUE ~ as.character(filter_type)))
+
+#Setting the 0m sampling depth to 1m
+c_sum <- c_sf_dm %>% 
+  distinct(sum, .keep_all = T) %>% 
+  select(date, station, pres, sum) %>% 
+  mutate(pres = case_when(pres == 0 ~ 1,
+                          TRUE ~ as.numeric(pres)))
+
+```
+
+```{r}
+#Joining the bulk and size-fractionated sum and then creating combined column where the size-fractionated value is used where there are NA's for the bulk.
+c_join <- c_dm %>% 
+  full_join(c_sum) %>% 
+  mutate(chl_comb = case_when(is.na(chl_dm) ~ sum,
+                              !is.na(chl_dm) ~ chl_dm)) %>% 
+  select(date, station, pres, chl_dm, chl_comb) %>% 
+  unite(id, c(date, station), sep = "-", remove = F)
+
+#I should build an offset to correct for the slight difference between the two measures.
+
+#Joining the full discrete chlorophyll dataset to the daily mean fluorometer dataset.
+f_dm <- f_dm %>% 
+  left_join(c_join)
+
+#A comparison of the bulk and SF sum should be plotted and offset applied if needed.
+```
+```{r}
+#Creatiing a dataset to apply linear fits between the chlorophyll and fluorometry data to derive a slope correction.
+
+#I am manually removing large outliers determined from visual inspection. They are all typically from the discrete sample missing a narrow layer below.
+f_fit <- f_dm %>%
+  left_join(c_join) %>% 
+  drop_na() %>% 
+  unite(id, c(date, station), sep = "-", remove = F) %>%
+  filter(!(id == "2014-06-19-KC10" & pres == 5)) %>%
+  filter(!(id == "2017-04-28-KC10" & pres == 5)) %>%
+  filter(!(id == "2017-08-14-KC10" & pres == 5)) %>%
+  filter(!(id == "2017-10-12-KC10" & (pres == 0 | pres == 5))) %>%
+  filter(!(id == "2019-02-14-KC10" & pres == 30)) %>%
+  filter(!(id == "2019-05-11-KC10" & pres < 6)) %>% 
+  filter(!(id == "2023-05-14-KC10" & pres == 10))      
+```
+
+Need to go through and provide rationale why I'm removing things above.
+
+```{r}
+# Fit both models (with and without surface) and select the best slope for a correction based on p-value and r2. When the surface value is not used, it generally means that the fluorometer data are NPQ affected, so a identifier column in put in for this.
+
+#Code to apply fits and extract statistics - used Claude to streamline the method that I derived.
+model <- f_fit %>% 
+  filter(!is.na(chl_comb) & !is.na(f_dm)) %>%
+  group_by(date, station) %>% 
+  summarise({
+    # Check data availability
+    data_no_surf <- filter(cur_data(), pres != 1)
+    data_with_surf <- cur_data()
+    
+    nobs_no_surf <- nrow(data_no_surf)
+    nobs_with_surf <- nrow(data_with_surf)
+    
+    # Initialize variables
+    can_fit_no_surf <- nobs_no_surf >= 2
+    can_fit_with_surf <- nobs_with_surf >= 2
+    
+    # Fit model WITHOUT surface (if possible)
+    if (can_fit_no_surf) {
+      model_no_surf <- lm(chl_comb ~ f_dm, data = data_no_surf)
+      intercept_no_surf <- round(coef(model_no_surf)[1], 2)
+      slope_no_surf <- round(coef(model_no_surf)[2], 2)
+      r2_no_surf <- round(summary(model_no_surf)$adj.r.squared, 2)
+      p.value_no_surf <- round(summary(model_no_surf)$coefficients[2, 4], 5)
+    } else {
+      intercept_no_surf <- slope_no_surf <- r2_no_surf <- p.value_no_surf <- NA
+    }
+    
+    # Fit model WITH surface (if possible)
+    if (can_fit_with_surf) {
+      model_with_surf <- lm(chl_comb ~ f_dm, data = data_with_surf)
+      intercept_with_surf <- round(coef(model_with_surf)[1], 2)
+      slope_with_surf <- round(coef(model_with_surf)[2], 2)
+      r2_with_surf <- round(summary(model_with_surf)$adj.r.squared, 2)
+      p.value_with_surf <- round(summary(model_with_surf)$coefficients[2, 4], 5)
+    } else {
+      intercept_with_surf <- slope_with_surf <- r2_with_surf <- p.value_with_surf <- NA
+    }
+    
+    # Select best model
+    if (!can_fit_no_surf & !can_fit_with_surf) {
+      # Neither model can be fit
+      use_surface <- NA
+      intercept <- slope <- r2 <- p.value <- nobs <- NA
+    } else if (!can_fit_no_surf) {
+      # Only surface model can be fit
+      use_surface <- TRUE
+      intercept <- intercept_with_surf
+      slope <- slope_with_surf
+      r2 <- r2_with_surf
+      p.value <- p.value_with_surf
+      nobs <- nobs_with_surf
+    } else if (!can_fit_with_surf) {
+      # Only no-surface model can be fit
+      use_surface <- FALSE
+      intercept <- intercept_no_surf
+      slope <- slope_no_surf
+      r2 <- r2_no_surf
+      p.value <- p.value_no_surf
+      nobs <- nobs_no_surf
+    } else {
+      # Both models can be fit - choose best based on p-value
+      use_surface <- p.value_with_surf < p.value_no_surf
+      intercept <- ifelse(use_surface, intercept_with_surf, intercept_no_surf)
+      slope <- ifelse(use_surface, slope_with_surf, slope_no_surf)
+      r2 <- ifelse(use_surface, r2_with_surf, r2_no_surf)
+      p.value <- ifelse(use_surface, p.value_with_surf, p.value_no_surf)
+      nobs <- ifelse(use_surface, nobs_with_surf, nobs_no_surf)
+    }
+    
+    # Set slope to NA if p-value > 0.05 OR if slope is negative
+    slope_best <- ifelse(is.na(p.value) || p.value > 0.05 || slope < 0, NA, slope)
+    
+    # Determine if surface is quenched (available but not used)
+    surface_available <- any(data_with_surf$pres == 1)
+    quenched <- surface_available && !isTRUE(use_surface)
+    
+    data.frame(
+      intercept = intercept,
+      slope = slope_best,
+      r2 = r2,
+      p.value = p.value,
+      nobs = nobs,
+      use_surface = use_surface,
+      quenched = quenched
+    )
+  }, .groups = 'drop') %>% 
+  unite(id, c(date, station), sep = "-", remove = F) %>% 
+  arrange(date, station)
+```
+
+```{r}
+#OK the above seems pretty streamlined. I should expand it to more stations and then try to match the corrections to
+```
+
+```{r}
+#Creating a sensor list to attach sensor information to the ctd casts - useful if I want to troubleshoot specific sensors - this could probably be included at an earlier step.
+
+#Creating a list of IDs and CTD numbers.
+ctd_num <- f %>% 
+  select(date, station, ctdNum) %>% 
+  distinct()
+
+#Joining the CTD numbers to the model fits.
+model <- model %>% 
+  left_join(ctd_num)
+```
+```{r}
+#Here I am comparing the slope from KC10 and FZH01 on that days that both were sampled together. The results are not very promising - they should be pretty similar but they are not.
+compare_station_slope <- model %>% 
+  select(date, ctdNum, station, slope) %>% 
+  pivot_wider(names_from = station, values_from = slope) %>% 
+  drop_na()
+```
+
+
+```{r}
+#Was applying these based on visual inspection - do they still align with insignificant comparisons?
+
+model <- model %>% 
+  mutate(slope = case_when(id == "2018-02-19-FZH01" ~ 0.55,
+                                id == "2018-08-18-FZH01" ~ 1.07,
+                                id == "2016-07-22-FZH01" ~ 1,#for these two I think serious discrete issues - SVD
+                                id == "2016-07-08-FZH01" ~ 1, #for these two I think serious discrete issues - SVD
+                                TRUE ~ as.numeric(slope)))
+
+#I can't just use 1, but what do I do? These are important subsurface maxima and the bottle data are bad on these days.
+
+#2016-08-12 might also be an issue - quite low slope - bad chlorophyll data?
+```
+
+
+
+```{r}
+#Pulling out the insignificant casts for inspection
+fit_insig <- model %>% 
+  filter(p.value > 0.05) %>% 
+  unite(id, c(date, station), sep = "-", remove = F)
+
+#Creating a list of insignificant casts.
+f_insign_id <- fit_insig$id
+
+#Pulling out the specific casts using the above list.
+f_insign <- f_dm %>%
+  filter(id %in% f_insign_id)
+```
+
+
+
+```{r}
+#Profile plots showing profiles and discrete chlorophyll samples - best viewed large in saved version
+f_insign %>% 
+  ggplot() +
+  geom_line(aes(x = f_dm, y = pres),
+            orientation = "y") +
+  geom_point(aes(x = chl_dm, y = pres),
+             size = 6,
+             pch = 8,
+             stroke = 2) +
+  scale_y_reverse() +
+  ylim(101, 0) +
+  facet_wrap(~id, scales = "free_x") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+# ggsave(here("figures", "insig_test_fix2.png"), 
+#         width = 16, height = 16, dpi = 300)
+```
+
+
+```{r}
+#Scatter plots
+f_insign %>% 
+  drop_na() %>% 
+  ggplot() +
+  geom_point(aes(x = f_dm, y = chl_dm, color = as.factor(pres)),
+             size = 6) +
+  scale_color_npg() +
+  facet_wrap(~id, scales = "free") +
+  theme_bw() 
+
+# ggsave(here("figures", "insig_test_scatter_fix2.png"), 
+#         width = 16, height = 16, dpi = 300)
+
+
+#Seems like:
+```
+
+
+```{r}
+# this is a list of samples I manually/visually invetigated.
+#I need to go through the categories and see if they are up-to-date?
+
+# Adressed
+#2014-06-19 - 5m sample missed thin layer? Delete 5m sample? Check QC. Seems ok, just delete here.
+#2017-04-28 - 5m sample quite large overestimation... Just removing here.
+#2017-08-14 - 0 and 5m are showing funky trend.... removing 5m for now.
+#2017-09-21 - It's fine use it.
+#2018-07-15 - 5 and 10 definitely switched -  changed in portal
+#2018-09-11 - was fine and fixed.
+#2019-02-14 - removing 30m sample would help - QC issues?
+#2019-05-11 - Looks like 5m quenched - use others.
+#2021-07-04 - No 0m - should be according to portal. Cross check portal as SCM. QC issue at 10m or missed thin sCM. Delete and try again. Definitely a QC issue form 10m sample. QC on portal and replace here with SF-SUM. 
+#2018-02-19 - I would just use.
+
+#Not addressed, but can
+#2016-03-25 - seems like quenched past 10m, but ratio of 20 and 30 (or fit) should be ok?
+#2017-10-12 - Looks like quenching at 0 and 5m - could remove.
+#2020-01-14 - slope with surface inclusion good.
+
+#Not addressed, not sure what to do
+#2016-07-22 - potential QC issue with 5m sample? huge underestimation. Highly suspect of all of these data as done during the period with all the issues. I would QC all as suspect and figure out another way or just keep as is!
+#2018-09-11 - KC10 - surface is quenched and 10m is outlier - same slope as FZH? Need to be careful here as something funny is going on with the fzh01 correlation - I think pulled by an outlier.
+#2019-10-01 - quenching at 0 and 5m and bad 20 point - QC on portal - although such low concentrations could just be an outlier.
+
+#Think about for next step
+##2021-07-04 - Fluorometer must have started at 2m (need to consider this and include in my checks above), but this can all be fixed. Pressure starts at 3 - make sure to use fit to bottle sample for this cast as important.
+
+#2018-08-18 - I think 5 and 10 are switched. Just use same slope as KC10 from next day.
+```
+
+```{r}
+#Joining the slope correction information to the daily mean fluorescence data frame.
+f_slope_join <- f_dm %>% 
+  left_join(model) %>% 
+  mutate(f_slope = f_dm*slope)
+
+```
+
+```{r}
+#This pulls out profiles that had high fluorescence biomass, but comparatively lower discrete
+#Done to look at examples where I think the peak was missed by the bottle.
+# Combined approach - identify and filter profiles with missed peaks
+check_slope <- f_slope_join %>% 
+  mutate(f_slope = f_dm * slope) %>%
+  group_by(id) %>%
+  mutate(has_missed_peak = any(f_slope > 10 & chl_comb < 7, na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(has_missed_peak) %>%
+  select(-has_missed_peak)  # Remove helper column if not needed
+```
+
+```{r}
+#Plotting the profiles.
+check_slope %>% 
+  ggplot() +
+  geom_line(aes(x = f_dm, y = pres),
+            orientation = "y") +
+  geom_line(aes(x = f_dm*slope, y = pres),
+            orientation = "y",
+            color = "blue") +
+  geom_point(aes(x = chl_comb, y = pres),
+             size = 6,
+             pch = 8,
+             stroke = 2) +
+  scale_y_reverse() +
+  ylim(101, 0) +
+  facet_wrap(~id, scales = "free_x") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+# ggsave(here("figures", "check_slope_prof.png"),
+#         width = 16, height = 16, dpi = 300)
+```
+```{r}
+#Plotting the scatters
+check_slope %>% 
+  drop_na() %>% 
+  ggplot() +
+  geom_point(aes(x = f_dm, y = chl_dm, color = as.factor(pres)),
+             size = 6) +
+  scale_color_npg() +
+  facet_wrap(~id, scales = "free") +
+  theme_bw()
+
+# ggsave(here("figures", "check_slope_scatter.png"),
+#         width = 16, height = 16, dpi = 300)
+```
+
+```{r}
+#This had a flexible correction depth, but had some issues, so for now, reverting to 5m max
+
+#Script that I adapted and then had Claude streamline - basically takes NPQ affected profiles using a surface threshold, fits a leoss fit to the full profile and then replaces the quenching influenced portion with the loess fit.
+
+# Robust NPQ correction with full profile interpolation
+
+# # Step 1: Identify quenched profiles from discrete samples
+# quenched_profiles <- f_slope_join %>% 
+#   drop_na(chl_comb, pres) %>% 
+#   mutate(
+#     diff = f_slope - chl_comb
+#   ) %>%
+#   # Identify profiles with quenching in top 5m
+#   group_by(id) %>%
+#   summarise(
+#     is_quenched = any(diff <= -1 & pres <= 5, na.rm = TRUE),
+#     .groups = "drop"
+#   ) %>%
+#   filter(is_quenched) %>%
+#   pull(id)
+# 
+# # Step 2: Safer LOESS fitting with error handling
+# fit_loess_safe <- function(data, span = 0.5) {
+#   # Filter to only bottle data (non-NA chl_comb)
+#   bottle_data <- data %>% 
+#     filter(!is.na(chl_comb), !is.na(pres)) %>%
+#     arrange(pres)
+#   
+#   # Need at least 3 points and at least one shallow sample (≤10m)
+#   if(nrow(bottle_data) < 3) return(rep(NA_real_, nrow(data)))
+#   if(min(bottle_data$pres) > 10) return(rep(NA_real_, nrow(data)))
+#   
+#   # Check for sufficient depth range
+#   depth_range <- diff(range(bottle_data$pres))
+#   if(depth_range < 1) return(rep(NA_real_, nrow(data)))
+#   
+#   # Adjust span based on number of points
+#   n_points <- nrow(bottle_data)
+#   adjusted_span <- case_when(
+#     n_points <= 4 ~ 0.8,
+#     n_points <= 6 ~ 0.6,
+#     TRUE ~ span
+#   )
+#   
+#   # Fit LOESS model
+#   tryCatch({
+#     loess_model <- loess(chl_comb ~ pres, data = bottle_data, span = adjusted_span)
+#     
+#     # Predict within the range of observed data (no extrapolation)
+#     min_depth <- min(bottle_data$pres)
+#     max_depth <- max(bottle_data$pres)
+#     
+#     predicted <- ifelse(
+#       data$pres >= min_depth & data$pres <= max_depth & !is.na(data$pres),
+#       predict(loess_model, newdata = data.frame(pres = data$pres)),
+#       NA_real_
+#     )
+#     
+#     return(predicted)
+#   }, error = function(e) {
+#     return(rep(NA_real_, nrow(data)))
+#   })
+# }
+# 
+# # Step 3: Apply correction
+# f_slope_corrected <- f_slope_join %>% 
+#   group_by(id) %>%
+#   mutate(
+#     chl_loess = if_else(
+#       id %in% quenched_profiles,
+#       fit_loess_safe(cur_data()),
+#       NA_real_
+#     )
+#   ) %>%
+#   ungroup() %>%
+#   # Apply flexible NPQ correction
+#   mutate(
+#     diff_ratio = f_slope / chl_loess,
+#     # Option 1: Extend correction depth where LOESS is still lower than fluorescence
+#     quench_depth = case_when(
+#       !is.na(chl_loess) & diff_ratio < 0.8 ~ pres,
+#       TRUE ~ 0
+#     )
+#   ) %>%
+#   group_by(id) %>%
+#   mutate(
+#     max_quench_depth = max(quench_depth, na.rm = TRUE),
+#     # Apply correction with flexible depth limit
+#     f_npq = case_when(
+#       pres <= max(5, max_quench_depth) & !is.na(chl_loess) & diff_ratio < 0.8 ~ chl_loess,
+#       TRUE ~ f_slope
+#     ),
+#     npq_cor = pres <= max(5, max_quench_depth) & !is.na(chl_loess) & diff_ratio < 0.8
+#   ) %>%
+#   ungroup() %>%
+#   select(-quench_depth, -max_quench_depth)
+```
+
+
+```{r}
+# Robust NPQ correction with full profile interpolation
+# Step 1: Identify quenched profiles from discrete samples
+quenched_profiles <- f_slope_join %>% 
+  drop_na(chl_comb, pres) %>% 
+  mutate(
+    f_slope = f_dm * slope,
+    diff = f_slope - chl_comb
+  ) %>%
+  # Identify profiles with quenching in top 5m
+  group_by(id) %>%
+  summarise(
+    is_quenched = any(diff <= -1 & pres <= 5, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(is_quenched) %>%
+  pull(id)
+
+# Step 2: Safer LOESS fitting with error handling
+fit_loess_safe <- function(data, span = 0.5) {
+  # Filter to only bottle data (non-NA chl_comb)
+  bottle_data <- data %>% 
+    filter(!is.na(chl_comb), !is.na(pres)) %>%
+    arrange(pres)
+  
+  # Need at least 3 points and at least one shallow sample (≤10m)
+  if(nrow(bottle_data) < 3) return(rep(NA_real_, nrow(data)))
+  if(min(bottle_data$pres) > 10) return(rep(NA_real_, nrow(data)))
+  
+  # Check for sufficient depth range
+  depth_range <- diff(range(bottle_data$pres))
+  if(depth_range < 1) return(rep(NA_real_, nrow(data)))
+  
+  # Adjust span based on number points
+  n_points <- nrow(bottle_data)
+  adjusted_span <- case_when(
+    n_points <= 4 ~ 0.8,
+    n_points <= 6 ~ 0.6,
+    TRUE ~ span
+  )
+  
+  # Fit LOESS model
+  tryCatch({
+    loess_model <- loess(chl_comb ~ pres, data = bottle_data, span = adjusted_span)
+    
+    # Predict within the range of observed data (no extrapolation)
+    min_depth <- min(bottle_data$pres)
+    max_depth <- max(bottle_data$pres)
+    
+    predicted <- ifelse(
+      data$pres >= min_depth & data$pres <= max_depth & !is.na(data$pres),
+      predict(loess_model, newdata = data.frame(pres = data$pres)),
+      NA_real_
+    )
+    
+    return(predicted)
+  }, error = function(e) {
+    return(rep(NA_real_, nrow(data)))
+  })
+}
+
+# Step 3: Apply correction with proper depth limits
+f_slope_corrected <- f_slope_join %>% 
+  mutate(f_slope = f_dm * slope) %>%
+  group_by(id) %>%
+  mutate(
+    chl_loess = if_else(
+      id %in% quenched_profiles,
+      fit_loess_safe(cur_data()),
+      NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  # Apply NPQ correction only in shallow waters
+  mutate(
+    diff_ratio = f_slope / chl_loess,
+    
+    # Apply correction with strict depth limit
+    f_npq = case_when(
+      # Only correct in top 6m where we have good LOESS fit and clear quenching
+      pres <= 6 & !is.na(chl_loess) & diff_ratio < 0.8 ~ chl_loess,
+      TRUE ~ f_slope
+    ),
+    
+    # Flag which points were corrected
+    npq_cor = pres <= 6 & !is.na(chl_loess) & diff_ratio < 0.8
+  )
+```
+
+
+```{r}
+#Creating a long datasheet where I can compare the discrete chlorophyll to the three different corrections.
+correction_scatter <- f_slope_corrected %>% 
+  filter(!is.na(slope)) %>% 
+  filter(!is.na(chl_comb)) %>% 
+  # filter(!date == "2016-07-08") %>% 
+  # filter(!date == "2016-07-22") %>%
+  # filter(!(date == "2017-07-19" & station == "KC10" & pres == 1)) %>%
+  # filter(!(date == "2018-08-18")) %>%
+  select(pres, chl_comb, f_dm, f_slope, f_npq) %>% 
+  pivot_longer(c(f_dm:f_npq), names_to = "par", values_to = "val")
+
+# Why are the above removed and what happens when I don't remove them?
+#It doesn't seem to do anything - I think I can just remove this step - maybe I QC'd these?
+
+#Look into:
+#2023-07-18-KC10 - QC'd point on portal
+#2022-07-08 - Pretty confident all samples from this day are bad - QC
+#2022-07-22 - Pretty confident all samples from this day are bad - QC
+```
+
+
+
+```{r}
+#Setting the plotting order.
+correction_scatter$par2 = factor(correction_scatter$par, levels = c('f_dm','f_slope','f_npq'))
+
+#Creating facet labs for plotting.
+supp.labs <- c("Raw", "Slope Correct", "NPQ Correct")
+names(supp.labs) <- c("f_dm", "f_slope", "f_npq")
+
+f1 <-
+  correction_scatter %>% 
+  filter(pres < 101) %>% 
+  ggplot(aes(x = chl_comb, y = val)) +
+  geom_point(aes(color = as.factor(pres)), size = 4) +
+  geom_abline() +
+  geom_smooth(method = "lm", color = "black") +
+  ggpubr::stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")),
+                   p.accuracy = 0.001, size = 9, label.y.npc = 0.9) +
+  ggpubr::stat_regline_equation(size = 9, label.y.npc = 0.96) +
+  facet_wrap(~par2, labeller = labeller(par2 = supp.labs)) +
+  scale_color_npg() +
+  lims(x = c(0, 35),
+       y = c(0, 35)) +
+  labs(x = bquote(Chla ~"(mg" ~ m^-3*")"),
+       y = bquote(CTD[FLU]~"(mg" ~ m^-3*")"),
+       color = "Depth") +
+  theme_bw() +
+  theme(text = element_text(size = 33), #35
+        axis.text = element_text(color = "black"),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA))
+# ggsave(here("figures", "scatter_test_2_claude.png"),
+#         width = 16, height = 6, dpi = 300)
+```
+
+
+
+```{r}
+correction_histo <- f_slope_corrected %>% 
+  filter(!is.na(slope)) %>% 
+  filter(!is.na(chl_comb)) %>% 
+  # filter(!date == "2016-07-08") %>% 
+  # filter(!date == "2016-07-22") %>% 
+  # filter(!(date == "2017-07-19" & station == "KC10" & pres == 1)) %>%
+  # filter(!(date == "2018-08-18")) %>%
+  mutate(fc_rat_raw = f_dm/chl_comb,
+         fc_rat_slope = f_slope/chl_comb,
+         fc_rat_npq = f_npq/chl_comb) %>% 
+  select(pres, fc_rat_raw, fc_rat_slope, fc_rat_npq) %>% 
+  pivot_longer(c(fc_rat_raw, fc_rat_slope, fc_rat_npq),
+               names_to = "par", values_to = "val") %>% 
+  group_by(pres, par) %>% 
+  mutate(mean = mean(val)) %>% 
+  ungroup()
+```
+
+```{r}
+#Setting facet order
+correction_histo$par2 = factor(correction_histo$par,
+                            levels = c("fc_rat_raw",
+                                       "fc_rat_slope",
+                                       "fc_rat_npq"))
+#Setting facet names.
+supp.labs <- c("Raw", "Slope Correct", "NPQ Correct")
+names(supp.labs) <- c("fc_rat_raw",
+                      "fc_rat_slope",
+                      "fc_rat_npq")
+```
+
+```{r}
+#This is actually pretty misleading as there are quite a few above 3 and below 0 and these need to be investigated. I think it is largely where there are mismatches.
+
+f2 <- 
+correction_histo %>%
+  filter(pres < 31) %>% 
+  filter(val >= 0 & val <= 3) %>% 
+  # Calculate summary statistics
+  group_by(pres, par2) %>%
+  summarise(
+    mean_val = mean(val, na.rm = TRUE),
+    sd_val = sd(val, na.rm = TRUE),
+    .groups = "keep"
+  ) %>%
+  # Join back to original data
+  left_join(correction_histo %>% filter(pres < 31), by = c("pres", "par2")) %>%
+  ggplot(aes(x = val, color = as.factor(pres), fill = as.factor(pres))) +
+  geom_histogram(aes(y=..density..), binwidth = 0.25, alpha = 0.4) +
+  geom_density(size = 2, fill = "white", alpha = 0.1) +
+  geom_vline(xintercept = 1) +
+  # Add mean line
+  geom_vline(aes(xintercept = mean_val, color = as.factor(pres)),
+             size = 1.5, linetype = "dashed") +
+  # Add text annotation with mean ± SD
+  geom_text(aes(x = mean_val, y = Inf, 
+                label = paste0("μ = ", round(mean_val, 2), " ± ", round(sd_val, 2))),
+            vjust = 1.2, hjust = -0.1, size = 8, 
+            color = "black", angle = 90) +
+  xlim(-0.5, 3) +
+  labs(x = "Fluorescence:Chlorophyll",
+       y = "Density") +
+  facet_grid(pres~par2, labeller = labeller(par2 = supp.labs)) +
+  scale_color_npg() +
+  scale_fill_npg() +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 33),
+        axis.text = element_text(color = "black"),
+        strip.text.x.top = element_blank(),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA))
+```
+
+```{r}
+#Creating plot showing effectiveness of corrections
+fig <- f1 / f2 + plot_layout(heights = c(0.5, 1.1))
+
+#Saving plot
+ggsave(here("figures", "scatter_histo_test_claude.png"), fig,
+        width = 16, height = 18, dpi = 300)
+```
+
+```{r}
+check_ratio <- f_slope_corrected %>% 
+  filter(!is.na(slope)) %>% 
+  filter(!is.na(chl_comb)) %>% 
+  mutate(fc_rat_raw = f_dm/chl_comb,
+         fc_rat_slope = f_slope/chl_comb,
+         fc_rat_npq = f_npq/chl_comb) %>% 
+  filter(fc_rat_npq < 0 | fc_rat_npq > 3) %>% 
+  select(id, pres, chl_comb, f_dm, f_slope, f_npq, fc_rat_npq, slope, r2, p.value,
+         quenched, npq_cor) %>%
+  # Round all numeric columns to 2 decimal places
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+
+#Many are where I think there are mismatches
+#Others are low biomass differences.
+#2020-07-02 is very weird. I think there was an issue with my NPQ correction here. No - fluorescences was just much higher at the surface than the bottle.
+
+#Can be visualized below.
+```
+
+```{r}
+f_slope_corrected %>% 
+  filter(date == "2020-07-02") %>% 
+  ggplot() +
+  geom_line(aes(x = f_dm, y = pres),
+            orientation = "y",
+            color = "black",
+            size = 2) +
+  geom_line(aes(x = f_slope, y = pres),
+            orientation = "y",
+            color = "blue", size = 2) +
+ geom_line(aes(x = f_npq, y = pres),
+            orientation = "y",
+            color = "green", size = 2) +
+  geom_point(aes(x = chl_comb, y = pres),
+             size = 6,
+             pch = 8,
+             stroke = 2) +
+  scale_y_reverse() +
+  facet_wrap(~station) +
+  ylim(31, 0)
+
+test <- f_slope_join %>% 
+  filter(id == "2024-07-18-KC10")
+#2018-07-15
+#the KC10 sample was left on shelf fr 2.5 hours - has SVC. Problem is that the rest of the samples seem legitimate and they were also left on the counter.
+#I think if you shifted the FZH01 sample up a meter it would match perfectly - am going to change here, but not in portal. Should be done earlier so applied to the slope.
+
+#2020-07-02
+#Nothing obviously wrong with the sample -  just an outlier.
+
+#2024-07-18
+#I think a case could be made here that the 10m sample is actually missing the peak and the resulting slope is causing overestimation. The 9m is almost bang on with the chlorophyll concentration; however the transducer depth is 10.3m, and it's impossible to know what the 9m discrete concentration would have been.
+
+#For now I'm just going to leave all of this.
+```
+
+
+```{r}
+#Visual inspection of profiles that had quenching correction performed.
+
+f_slope_corrected %>% 
+  semi_join(
+    f_slope_corrected %>% filter(npq_cor == T) %>% distinct(id),
+    by = "id") %>% 
+  ggplot() +
+  geom_line(aes(x = f_dm, y = pres),
+            orientation = "y",
+            color = "black",
+            size = 2) +
+  geom_line(aes(x = f_slope, y = pres),
+            orientation = "y",
+            color = "blue", size = 2) +
+ geom_line(aes(x = f_npq, y = pres),
+            orientation = "y",
+            color = "green", size = 2) +
+  geom_point(aes(x = chl_comb, y = pres),
+             size = 6,
+             pch = 8,
+             stroke = 2) +
+  scale_y_reverse() +
+  ylim(31, 0) +
+  facet_wrap(~id, scales = "free_x") +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"))
+
+ggsave(here("figures", "check_npq_prof_2025-06-30_v2.png"),
+        width = 20, height = 24, dpi = 300)
+
+#2023-05-14 is quite interesting as greatly downscaling the raw profile - why?
+#2018-08-18 I think was one of the issue profiles from above - 5m very mismatched.
+##Above - I think 5 and 10 are switched. Just use same slope as KC10 from next day. 
+```
+```{r}
+# I pretty much fixed it except for 2016-02-27 and 2023-05-14 where I can't track down a change i made in my original script.
+
+#Honestly, Claude has been a big pain in the ass here. It was better how I had it with exception to being more verbose.
+```
+
+```{r}
+model %>% 
+  ggplot(aes(x = as.factor(ctdNum), y = slope)) +
+  geom_boxplot()
+```
+```{r}
+
+```
+
+
+
+
+```{r}
+#This plot shows all of the profiles that have either a slope or NPQ correction in comparison to all of the available profiles.
+
+#What do you do with the ones with no correction?
+
+f_slope_join %>% 
+  distinct(date, station, id, slope) %>% 
+  ggplot(aes(x = date)) +
+  geom_point(data = filter(f_slope_join, !is.na(slope)),
+             aes(y = as.factor("corrected")),
+             size = 3) + 
+  geom_point(data = filter(f_slope_join, is.na(slope)),
+             aes(y = as.factor("no-correction")),
+             color = "red",
+             size = 3) +
+  scale_x_date(expand = c(0, 0), date_breaks = "years", date_labels = "%Y") +
+  facet_wrap(~station, ncol = 1) +
+  theme_bw() +
+  theme(text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA))
+
+ggsave(here("figures", "correction_plot.png"), 
+        width = 16, height = 10, dpi = 300)
+```
+#Try using 5m depth ratio in comparison to full slope. 
+
+```{r}
+f_rat_5 <- f_slope_corrected %>% 
+  filter(!is.na(chl_comb)) %>% 
+  filter(!is.na(slope)) %>% 
+  filter(npq_cor == F) %>% 
+  filter(!date == "2016-07-08") %>% 
+  filter(!date == "2016-07-22") %>% 
+  filter(!(date == "2017-07-19" & station == "KC10" & pres == 1)) %>%
+  filter(!(date == "2018-08-18")) %>%
+  filter(pres == 5) %>% 
+  mutate(rat_5 = chl_comb/f_dm,
+         f_r5 = f_dm*rat_5,
+         diff_slope = rat_5 - slope) 
+
+```
+
+```{r}
+# s1 <- 
+  f_rat_5 %>% 
+  ggplot(aes(x = slope, y = rat_5)) +
+  geom_point(aes(color = chl_comb), size = 6) +
+  ggpubr::stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")),
+                   p.accuracy = 0.001, size = 9, label.y.npc = 0.9) +
+  ggpubr::stat_regline_equation(size = 9, label.y.npc = 0.96) +
+  geom_abline() +
+  geom_smooth(method = "lm", color = "black") +
+  scale_color_viridis_c(limits = c(0, 26), breaks = seq(0, 30, by = 5)) +
+  # scale_size_continuous(limits = c(0, 40), breaks = seq(0, 40, by = 10)) +
+  labs(x = bquote(Slope[LM]),
+       y = bquote(Fluor.["5m"]*":"*Chla["5m"]),
+       color = bquote(Chla ~"(mg" ~ m^-3*")"),
+       size = bquote(Chla ~"(mg" ~ m^-3*")")) +
+  lims(x = c(0, 3.5),
+       y = c(0, 3.5)) +
+  theme_bw() +
+  theme(text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        legend.position = "right",
+        legend.key.height = unit(1.8, "cm"),
+        legend.title = element_text(size = 30, angle = 270),
+        legend.title.align = 0.5,
+        legend.direction = "vertical") +
+    guides(color = guide_colourbar(title.position = "right"))
+
+           # size = guide_colourbar(title.position = "right"),
+           # color = guide_legend(), size = guide_legend())
+
+ggsave(here("figures", "scatter_slope_ratio.png"), 
+        width = 12, height = 8, dpi = 300)
+
+#So when rat_5 > slope_best, potentially a result of NPQ. 
+#Not sure if this will work.
+```
+```{r}
+# s2 <- 
+  f_rat_5 %>% 
+  ggplot(aes(x = f_slope, y = f_r5)) +
+  geom_point(aes(color = chl_comb), size = 6) +
+  ggpubr::stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")),
+                   p.accuracy = 0.001, size = 9, label.y.npc = 0.9) +
+  ggpubr::stat_regline_equation(size = 9, label.y.npc = 0.96) +
+  geom_abline() +
+  geom_smooth(method = "lm", color = "black") +
+  scale_color_viridis_c(limits = c(0, 26), breaks = seq(0, 30, by = 5)) +
+  # scale_size_continuous(limits = c(0, 40), breaks = seq(0, 40, by = 10)) +
+  labs(x = bquote(Fluor.[SLOPE-LM] ~ "(mg" ~ m^-3*")"),
+       y = bquote(Fluor.["F:C-5m"] ~ "(mg" ~ m^-3*")"),
+       color = bquote(Chla ~"(mg" ~ m^-3*")")) +
+  # lims(x = c(0, 3.5),
+  #      y = c(0, 3.5)) +
+  theme_bw() +
+  theme(text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        legend.position = "right",
+        legend.key.height = unit(1.8, "cm"),
+        legend.title = element_text(size = 30, angle = 270),
+        legend.title.align = 0.5,
+        legend.direction = "vertical") +
+    guides(color = guide_colourbar(title.position = "right"))
+
+           # size = guide_colourbar(title.position = "right"),
+           # color = guide_legend(), size = guide_legend())
+
+ggsave(here("figures", "scatter_slope_conc.png"), 
+        width = 12, height = 8, dpi = 300)
+
+#So when rat_5 > slope_best, potentially a result of NPQ. 
+#Not sure if this will work.
+```
+
+```{r}
+fig <- s1 / s2 + plot_layout(guides = "collect")
+
+
+
+ggsave(here("figures", "scatter_ratio_panel.png"), fig,
+        width = 9, height = 12, dpi = 300)
+```
+
+```{r}
+#Ok lets apply the 5m F:C ratio to profiles where a slope is not available.
+
+test <- f_slope_join %>% 
+  filter(!is.na(chl_comb)) %>% 
+  filter(is.na(slope_best)) %>% 
+  mutate(fc_rat = f_dm/chl_comb)
+```
+
+
+
+
+
+
+
+
+
+```{r}
+#Looking at profiles where the npq_correction was performed.
+cor_npq <- f_slope_join %>% 
+  filter(npq_cor == T) %>% 
+  distinct(id)
+
+#18 profiles
+cor_npq_id <- cor_npq$id
+
+#Filtering out full profiles where npq correction was performed. 
+cor_npq_prof <- f_slope_join %>% 
+  filter(id %in% cor_npq_id)
+```
+
+```{r}
+cor_npq_prof %>% 
+  ggplot() +
+  geom_line(aes(x = f_dm, y = pres),
+            orientation = "y",
+            color = "black",
+            size = 2) +
+  geom_line(aes(x = f_slope, y = pres),
+            orientation = "y",
+            color = "blue", size = 2) +
+ geom_line(aes(x = f_npq, y = pres),
+            orientation = "y",
+            color = "green", size = 2) +
+  geom_point(aes(x = chl_comb, y = pres),
+             size = 6,
+             pch = 8,
+             stroke = 2) +
+  scale_y_reverse() +
+  ylim(31, 0) +
+  facet_wrap(~id, scales = "free_x") +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"))
+
+ggsave(here("figures", "check_npq_prof.png"),
+        width = 20, height = 24, dpi = 300)
+
+#2023-05-14 is quite interesting as greatly downscaling the raw profile - why?
+#2018-08-18 I think was one of the issue profiles from above - 5m very mismatched.
+##Above - I think 5 and 10 are switched. Just use same slope as KC10 from next day. 
+```
+
+#So I guess the next step is to somehow "fix" the profiles with no or few chlorophyll samples.
+#Slope - Could either use sensor correlation, 5m ratio
+#NPQ ??? PAR?
+
+```{r}
+
+```
+
+

@@ -20,8 +20,7 @@ library(patchwork)    # For combining plots (if needed later)
 # Data Import ----
 
 # QC'd buoy fluorometer data
-b <- read.csv(here("outputs", "qc_buoy_2025-09-08.csv"))
-b_test <- read.csv(here("outputs", "qc_buoy_2025-09-12.csv"))
+b <- read.csv(here("outputs", "qc_buoy_2025-09-12_bug_test.csv"))
 
 # Hourly buoy temperature and salinity
 b_ts <- read.csv(here("files", "ts_2025-09-08.csv"))
@@ -38,31 +37,6 @@ pk_25 <- read_csv(here("files", "par_koeye_2025_2025-09-11.csv"))
 #Downloading discrete chlorophyll samples - This could be done using the API
 cd <- read_csv(here("files", "chl_kc10_fzh01_2025-09-08.csv"))
 ```
-
-```{r}
-#Added 2021 and now 2022 prediction is off - something with my QC script is making a date during the bloom (2022-03-07) have no data and then the join with wind and PAR is missing that day and no longer exceeding 6 day threshold. Why is my QC script having an issue and also, this highlights an issue with my code - need to ensure no data gaps!
-
-b_test1 <- b %>% 
-  filter(year == 2022) %>% 
-  select(date_corr, fl_med_day) %>% 
-  distinct()
-
-b_test2 <- b_test %>% 
-  filter(year == 2022) %>% 
-  select(date_corr, fl_comp = fl_med_day) %>% 
-  distinct()
-
-test_join <- b_test1 %>% 
-  left_join(b_test2)
-
-check <- b %>% 
-  filter(date_corr == "2022-03-07")
-
-check2 <- b_test %>% 
-  filter(date_corr == "2022-03-07")
-```
-
-
 
 ```{r}
 # Data Processing ----
@@ -137,7 +111,7 @@ b2 <- b %>%
     month = month(date),
     yday = yday(date)
   ) %>%
-  filter(year %in% c(2022, 2023, 2024, 2025)) %>% 
+  filter(year %in% c(2021, 2022, 2023, 2024, 2025)) %>% 
   mutate(group = as.character(group))
 
 # Handle 2024 data gap with linear interpolation
@@ -386,7 +360,7 @@ plot_data_full <- w2_wide %>%
   full_join(p2, by = c("year", "date")) %>%
   mutate(date2 = as.Date(yday, origin = "2024-01-01")) %>%
   filter(date2 != as.Date("2024-12-31")) %>%
-  filter(year %in% c(2022, 2023, 2024, 2025)) %>%
+  filter(year %in% c(2021, 2022, 2023, 2024, 2025)) %>%
   # Set fluorescence to NA for 2025 gap period
   mutate(
     fl_med_day = ifelse(
@@ -437,10 +411,10 @@ print(historical_blooms %>%
 
 # Year annotations for plot
 year_annotations <- data.frame(
-  year = c(2022, 2023, 2024, 2025),
+  year = c(2021,2022, 2023, 2024, 2025),
   date2 = as.Date("2024-01-15"),
   fl_med_day = 18,
-  label = c("2022", "2023", "2024", "2025")
+  label = c("2021", "2022", "2023", "2024", "2025")
 )
 
 # Create main analysis plot
@@ -492,6 +466,83 @@ spring_bloom_plot <- plot_data %>%
 # Display plot
 print(spring_bloom_plot)
 ```
+```{r}
+p2 %>% 
+  mutate(year = year(date),
+         month = month(date),
+         yday = yday(date)) %>% 
+  filter(year %in% c(2022, 2023, 2024)) %>% 
+  filter(month %in% c(2, 3)) %>% 
+  ggplot(aes(x = as.factor(month), y = dm, color = as.factor(year))) +
+  geom_boxplot()
+
+w2_wide %>% 
+  mutate(year = year(date),
+         month = month(date),
+         yday = yday(date)) %>% 
+  filter(year %in% c(2022, 2023, 2024)) %>% 
+  filter(month %in% c(2, 3)) %>% 
+  ggplot(aes(x = as.factor(month), y = ws, color = as.factor(year))) +
+  geom_boxplot()
+```
+
+
+
+```{r}
+p2 %>% 
+  mutate(year = year(date),
+         month = month(date),
+         yday = yday(date)) %>% 
+  filter(year %in% c(2024)) %>% 
+  filter(month < 4 & month > 1) %>% 
+  ggplot(aes(x = date, y = dm, color = as.factor(year))) +
+  geom_line(size = 2) +
+  geom_point(pch = 21, fill = "white", size = 3) +
+  geom_hline(yintercept = 200) +
+  geom_vline(xintercept = as.Date("2024-03-14"))
+```
+
+```{r}
+p2 %>% 
+  mutate(year = year(date),
+         month = month(date),
+         yday = yday(date)) %>% 
+  filter(year %in% c(2022)) %>% 
+  filter(month < 4 & month > 1) %>% 
+  ggplot(aes(x = date, y = dm, color = as.factor(year))) +
+  geom_line(size = 2) +
+  geom_point(pch = 21, fill = "white", size = 3) +
+  geom_hline(yintercept = 200) +
+  geom_vline(xintercept = as.Date("2022-03-04"))
+```
+
+```{r}
+p2 %>% 
+  mutate(year = year(date),
+         month = month(date),
+         yday = yday(date)) %>% 
+  filter(year %in% c(2023)) %>% 
+  filter(month < 4 & month > 1) %>% 
+  ggplot(aes(x = date, y = dm, color = as.factor(year))) +
+  geom_line(size = 2) +
+  geom_point(pch = 21, fill = "white", size = 3) +
+  geom_hline(yintercept = 200) +
+  geom_vline(xintercept = as.Date("2023-03-25"))
+
+w2_wide %>% 
+  mutate(year = year(date),
+         month = month(date),
+         yday = yday(date)) %>% 
+  filter(year %in% c(2023)) %>% 
+  filter(month < 4 & month > 1) %>% 
+  ggplot(aes(x = date, y = ws^3, color = as.factor(year))) +
+  geom_line(size = 2) +
+  geom_point(pch = 21, fill = "white", size = 3) +
+  # geom_hline(yintercept = 200) +
+  geom_vline(xintercept = as.Date("2023-03-25"))
+```
+
+
 
 ```{r}
 # Save plot
@@ -1048,4 +1099,227 @@ c_join %>%
   geom_line() +
   facet_wrap(~pres, ncol = 1, scales = "free_y")
 ```
+
+```{r}
+# Wind Stress Calculation Functions
+# Calculate wind stress components from wind speed and direction
+
+# Main function to calculate wind stress components
+calculate_wind_stress <- function(wind_speed, wind_direction, 
+                                air_density = 1.225, drag_coeff = NULL,
+                                wind_speed_height = 10) {
+  
+  # Input validation
+  if(length(wind_speed) != length(wind_direction)) {
+    stop("Wind speed and direction vectors must be same length")
+  }
+  
+  # Calculate drag coefficient if not provided
+  if(is.null(drag_coeff)) {
+    drag_coeff <- calculate_drag_coefficient(wind_speed)
+  }
+  
+  # Convert wind direction to radians (meteorological to mathematical convention)
+  # Meteorological: direction wind is coming FROM (0° = North)
+  # Mathematical: direction wind is going TO (0° = East)
+  wind_dir_math_rad <- (270 - wind_direction) * pi / 180
+  
+  # Calculate wind stress magnitude (N/m²)
+  wind_stress_magnitude <- air_density * drag_coeff * wind_speed^2
+  
+  # Calculate wind stress components
+  # Eastward (u) and Northward (v) components
+  wind_stress_u <- wind_stress_magnitude * cos(wind_dir_math_rad)  # Eastward
+  wind_stress_v <- wind_stress_magnitude * sin(wind_dir_math_rad)  # Northward
+  
+  # Southward component is negative of northward
+  wind_stress_south <- -wind_stress_v
+  
+  # Create output dataframe
+  result <- data.frame(
+    wind_speed = wind_speed,
+    wind_direction = wind_direction,
+    drag_coefficient = drag_coeff,
+    wind_stress_magnitude = wind_stress_magnitude,
+    wind_stress_u_east = wind_stress_u,
+    wind_stress_v_north = wind_stress_v,
+    wind_stress_south = wind_stress_south,
+    wind_stress_west = -wind_stress_u
+  )
+  
+  return(result)
+}
+
+# Calculate drag coefficient based on wind speed
+calculate_drag_coefficient <- function(wind_speed) {
+  
+  # Large and Pond (1981) formulation - commonly used
+  # Modified for different wind speed ranges
+  
+  drag_coeff <- case_when(
+    wind_speed < 1 ~ 0.00114,  # Very light winds
+    wind_speed <= 11 ~ 0.00114,  # Light to moderate winds
+    wind_speed <= 25 ~ 0.00049 + 0.000065 * wind_speed,  # Strong winds
+    TRUE ~ 0.00211  # Very strong winds (>25 m/s)
+  )
+  
+  return(drag_coeff)
+}
+
+# Alternative drag coefficient formulations
+calculate_drag_coefficient_smith <- function(wind_speed) {
+  # Smith (1988) formulation
+  0.00061 + 0.000063 * wind_speed
+}
+
+calculate_drag_coefficient_yelland <- function(wind_speed) {
+  # Yelland and Taylor (1996) formulation
+  0.0005 + 0.000071 * wind_speed
+}
+
+# Function specifically for oceanographic applications
+calculate_oceanographic_wind_stress <- function(data, 
+                                              wind_speed_col = "wind_speed",
+                                              wind_dir_col = "wind_direction",
+                                              method = "large_pond") {
+  
+  # Extract wind data
+  wind_speed <- data[[wind_speed_col]]
+  wind_direction <- data[[wind_dir_col]]
+  
+  # Choose drag coefficient method
+  if(method == "large_pond") {
+    drag_coeff <- calculate_drag_coefficient(wind_speed)
+  } else if(method == "smith") {
+    drag_coeff <- calculate_drag_coefficient_smith(wind_speed)
+  } else if(method == "yelland") {
+    drag_coeff <- calculate_drag_coefficient_yelland(wind_speed)
+  } else {
+    stop("Method must be 'large_pond', 'smith', or 'yelland'")
+  }
+  
+  # Calculate wind stress
+  stress_results <- calculate_wind_stress(wind_speed, wind_direction, drag_coeff = drag_coeff)
+  
+  # Add to original data
+  result_data <- data %>%
+    bind_cols(stress_results %>% select(-wind_speed, -wind_direction))
+  
+  return(result_data)
+}
+
+# Function to calculate wind stress curl (for upwelling analysis)
+calculate_wind_stress_curl <- function(data, lat_col = "latitude", lon_col = "longitude") {
+  
+  # This requires spatial gradients - simplified version for time series
+  # For full curl calculation, you need spatial wind stress fields
+  
+  data %>%
+    arrange(date) %>%
+    mutate(
+      # Temporal changes in wind stress (proxy for spatial curl)
+      d_stress_south_dt = c(NA, diff(wind_stress_south)),
+      d_stress_east_dt = c(NA, diff(wind_stress_u_east)),
+      # Simple curl approximation (requires proper spatial data for accuracy)
+      curl_proxy = d_stress_east_dt - d_stress_south_dt
+    )
+}
+
+# Upwelling index calculation
+calculate_upwelling_index <- function(wind_stress_south, coastline_angle = 0) {
+  
+  # Upwelling index based on southward wind stress
+  # Positive values indicate upwelling-favorable conditions
+  # coastline_angle: angle of coastline from north (degrees)
+  
+  # Rotate wind stress to coast-normal coordinates if needed
+  angle_rad <- coastline_angle * pi / 180
+  
+  # For a north-south coastline, southward wind stress drives upwelling
+  upwelling_index <- wind_stress_south * cos(angle_rad)
+  
+  return(upwelling_index)
+}
+
+# Example usage function
+example_wind_stress_analysis <- function() {
+  
+  # Create example data
+  example_data <- data.frame(
+    date = seq(as.Date("2024-01-01"), as.Date("2024-12-31"), by = "day"),
+    wind_speed = abs(rnorm(365, mean = 8, sd = 3)),  # m/s
+    wind_direction = runif(365, 0, 360)  # degrees
+  )
+  
+  # Calculate wind stress
+  wind_stress_data <- calculate_oceanographic_wind_stress(example_data)
+  
+  # Add upwelling index
+  wind_stress_data <- wind_stress_data %>%
+    mutate(
+      upwelling_index = calculate_upwelling_index(wind_stress_south),
+      month = month(date)
+    )
+  
+  # Summary statistics
+  monthly_summary <- wind_stress_data %>%
+    group_by(month) %>%
+    summarise(
+      mean_wind_speed = mean(wind_speed, na.rm = TRUE),
+      mean_stress_south = mean(wind_stress_south, na.rm = TRUE),
+      mean_upwelling_index = mean(upwelling_index, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  cat("Monthly Wind Stress Summary:\n")
+  print(monthly_summary)
+  
+  return(wind_stress_data)
+}
+
+# Validation function to check calculations
+validate_wind_stress <- function(wind_speed, wind_direction) {
+  
+  # Test with known values
+  test_cases <- data.frame(
+    wind_speed = c(10, 15, 20),  # m/s
+    wind_direction = c(180, 270, 0),  # degrees (S, W, N)
+    expected_south = c("positive", "zero", "negative")
+  )
+  
+  results <- calculate_wind_stress(test_cases$wind_speed, test_cases$wind_direction)
+  
+  cat("Validation Results:\n")
+  cat("Wind from South (180°) -> Southward stress should be positive:", 
+      results$wind_stress_south[1] > 0, "\n")
+  cat("Wind from West (270°) -> Southward stress should be ~zero:", 
+      abs(results$wind_stress_south[2]) < 0.001, "\n")
+  cat("Wind from North (0°) -> Southward stress should be negative:", 
+      results$wind_stress_south[3] < 0, "\n")
+  
+  return(results)
+}
+```
+
+```{r}
+# Apply to your wind data
+your_data_with_stress <- calculate_oceanographic_wind_stress(
+  w2_wide, 
+  wind_speed_col = "ws",  # adjust to your column name
+  wind_dir_col = "wd"     # adjust to your column name
+)
+
+# Focus on southward component for upwelling analysis
+upwelling_favorable <- your_data_with_stress %>%
+  filter(wind_stress_south > 0.1)  # Strong southward stress
+```
+
+```{r}
+your_data_with_stress %>% 
+  mutate(year = year(date)) %>% 
+  filter(year == 2024) %>% 
+  ggplot(aes(x = date, y = wind_stress_v_north)) +
+  geom_line() 
+```
+
 
