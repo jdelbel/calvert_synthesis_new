@@ -147,7 +147,97 @@ ggsave(here("figures", "bloom_timing_kc10_.png"),
 
 ```
 
+```{r}
+sb_timing %>%
+  ggplot(aes(x = yday, y = as.factor(year), size = tchla, fill = tchla)) +
+  # Add shaded background for moored data years (2021 onwards)
+  annotate("rect", 
+           xmin = -Inf, xmax = Inf, 
+           ymin = which(sort(unique(sb_timing$year)) == 2022) - 0.5, 
+           ymax = Inf,
+           fill = "grey90", alpha = 0.5) +
+  geom_point(pch = 21, color = "black", stroke = 2) +
+  geom_vline(xintercept = 98, size = 1, linetype = "dashed") +
+  # Add vertical text label on right side (moved up)
+  annotate("text", 
+           x = 143, 
+           y = which(sort(unique(sb_timing$year)) == 2022) + 1.5,
+           label = "Daily Moored Data", 
+           angle = 270, 
+           size = 10) +
+  # scale_size_continuous(range = c(1, 25),
+  #                       limits = c(4, 25),
+  #                       breaks = scales::pretty_breaks(5)) +
+  scale_size_continuous(range = c(1.5, 28),  # Increased upper limit
+                      limits = c(4, 25),
+                      breaks = scales::pretty_breaks(5)) +
+  scale_fill_distiller(direction = -1,
+                       palette = "RdYlBu",
+                       limits = c(4, 25),
+                       breaks = scales::pretty_breaks(5)) +
+  guides(fill = guide_legend(), size = guide_legend()) +
+  coord_cartesian(xlim = c(40, 150)) +
+  ggtitle("Spring Bloom\nTiming and Magnitude") +
+  labs(x = "YDAY",
+       y = "Year",
+       fill = expression(atop("Chla", paste("(mg m"^-3, ")"))),
+       size = expression(atop("Chla", paste("(mg m"^-3, ")")))) +
+  theme_bw() +
+  theme(text = element_text(size = 40),
+        axis.title.y = element_blank(),
+        axis.text = element_text(colour = "black"),
+        legend.position = "right",
+        strip.background = element_blank())
 
+ggsave(here("figures", "bloom_timing_kc10_2.png"),
+       width = 9, height = 14, dpi = 300)
+```
+
+```{r}
+sb_timing %>%
+  ggplot(aes(x = yday, y = as.factor(year), size = tchla, fill = tchla)) +
+  # Add shaded background for moored data years (2021 onwards)
+  annotate("rect", 
+           xmin = -Inf, xmax = Inf, 
+           ymin = which(sort(unique(sb_timing$year)) == 2022) - 0.5, 
+           ymax = Inf,
+           fill = "grey90", alpha = 0.5) +
+  geom_point(pch = 21, color = "black", stroke = 2) +
+  geom_vline(xintercept = 98, size = 1, linetype = "dashed") +
+  # Add vertical text label on right side (moved up)
+  annotate("text", 
+           x = 143, 
+           y = which(sort(unique(sb_timing$year)) == 2022) + 1.5,
+           label = "Daily Buoy Data", 
+           angle = 270, 
+           size = 10) +
+  # scale_size_continuous(range = c(1, 25),
+  #                       limits = c(4, 25),
+  #                       breaks = scales::pretty_breaks(5)) +
+  scale_size_continuous(range = c(1.5, 28),  # Increased upper limit
+                      limits = c(4, 25),
+                      breaks = scales::pretty_breaks(5)) +
+  scale_fill_distiller(direction = -1,
+                       palette = "RdYlBu",
+                       limits = c(4, 25),
+                       breaks = scales::pretty_breaks(5)) +
+  guides(fill = guide_legend(), size = guide_legend()) +
+  coord_cartesian(xlim = c(40, 150)) +
+  # ggtitle("Spring Bloom\nTiming and Magnitude") +
+  labs(x = "YDAY",
+       y = "Year",
+       fill = expression(atop("Chla", paste("(mg m"^-3, ")"))),
+       size = expression(atop("Chla", paste("(mg m"^-3, ")")))) +
+  theme_bw() +
+  theme(text = element_text(size = 40),
+        axis.title.y = element_blank(),
+        axis.text = element_text(colour = "black"),
+        legend.position = "right",
+        strip.background = element_blank())
+
+ggsave(here("figures", "bloom_timing_kc10_no-title.png"),
+       width = 9, height = 14, dpi = 300)
+```
 
 
 
