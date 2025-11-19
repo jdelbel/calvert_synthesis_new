@@ -489,7 +489,7 @@ f_fit <- f_dm %>%
 # Separate into multi-sample (>=3) and few-sample (1-2) casts
 #Notes on these outlier removals are in excel sheet
 f_fit_multi <- f_fit %>%
-  filter(!is.na(chl_comb) & !is.na(f_dm)) %>%
+  filter(!is.na(chl_comb) & !is.na(f_corrected)) %>%
   group_by(date, station, ctdNum) %>%
   filter(n() >= 3) %>%  # Only keep casts with 3+ samples for cast-specific fits
   ungroup() %>%
@@ -502,7 +502,7 @@ f_fit_multi <- f_fit %>%
   filter(!(id == "2017-09-21-FZH01-1907467" & pres == 10))
   
 f_fit_few <- f_fit %>%
-  filter(!is.na(chl_comb) & !is.na(f_dm)) %>%
+  filter(!is.na(chl_comb) & !is.na(f_corrected)) %>%
   group_by(date, station, ctdNum) %>%
   filter(n() < 3) %>%   # Casts with 1-2 samples
   ungroup()
@@ -530,7 +530,7 @@ model <- f_fit_multi %>%
     
     # Fit model WITHOUT surface (if possible)
     if (can_fit_no_surf) {
-      model_no_surf <- lm(chl_comb ~ f_dm, data = data_no_surf)
+      model_no_surf <- lm(chl_comb ~ f_corrected, data = data_no_surf)
       intercept_no_surf <- round(coef(model_no_surf)[1], 2)
       slope_no_surf <- round(coef(model_no_surf)[2], 2)
       r2_no_surf <- round(summary(model_no_surf)$adj.r.squared, 2)
@@ -541,7 +541,7 @@ model <- f_fit_multi %>%
     
     # Fit model WITH surface (if possible)
     if (can_fit_with_surf) {
-      model_with_surf <- lm(chl_comb ~ f_dm, data = data_with_surf)
+      model_with_surf <- lm(chl_comb ~ f_corrected, data = data_with_surf)
       intercept_with_surf <- round(coef(model_with_surf)[1], 2)
       slope_with_surf <- round(coef(model_with_surf)[2], 2)
       r2_with_surf <- round(summary(model_with_surf)$adj.r.squared, 2)
@@ -612,7 +612,7 @@ f_fit_with_model <- f_fit_multi %>%
                              quenched,
                              nobs),
             by = "id") %>%
-  filter(!is.na(chl_comb) & !is.na(f_dm))
+  filter(!is.na(chl_comb) & !is.na(f_corrected))
 ```
 
 ```{r}
@@ -635,7 +635,7 @@ sensor_medians <- f_fit_with_model %>%
 f_fit_with_model <- f_fit_with_model %>%
   left_join(sensor_medians, by = "ctdNum")
 
-ggplot(f_fit_with_model, aes(x = f_dm, y = chl_comb)) +
+ggplot(f_fit_with_model, aes(x = f_corrected, y = chl_comb)) +
   geom_abline(slope = 1, intercept = 0, 
               linetype = "dashed", color = "gray40", linewidth = 0.6) +
   geom_abline(aes(slope = median_slope, intercept = median_intercept),
@@ -660,7 +660,7 @@ ggplot(f_fit_with_model, aes(x = f_dm, y = chl_comb)) +
   )
 
 # Save with better dimensions
-ggsave(here("figures", "ctd_fluorescence_calibration_by_sensor_all.png"),
+ggsave(here("figures", "ctd_fluorescence_calibration_by_sensor_all_dark.png"),
        width = 10,
        height = 6.5,
        dpi = 300,
@@ -683,7 +683,7 @@ fit_stats <- f_fit_av %>%
   filter(use_surface | pres != 1) %>%
   group_by(ctdNum) %>%
   summarise(
-    model = list(lm(chl_comb ~ f_dm)),
+    model = list(lm(chl_comb ~ f_corrected)),
     .groups = 'drop'
   ) %>%
   mutate(
@@ -699,7 +699,7 @@ fit_stats <- f_fit_av %>%
 
 f_fit_av %>% 
   filter(use_surface | pres != 1) %>%
-  ggplot(aes(x = f_dm, y = chl_comb)) +
+  ggplot(aes(x = f_corrected, y = chl_comb)) +
   geom_abline(slope = 1, intercept = 0, 
               linetype = "dashed", color = "gray40", linewidth = 0.8) +
   geom_smooth(aes(group = id), method = "lm", se = TRUE, 
@@ -744,31 +744,31 @@ fit_stats <- f_fit_av %>%
   group_by(ctdNum) %>%
   summarise(
     # Overall model
-    model = list(lm(chl_comb ~ f_dm)),
+    model = list(lm(chl_comb ~ f_corrected)),
     
     # Low range model for sensor 80217 only
     slope_low = if(first(ctdNum) == "80217") {
-      coef(lm(chl_comb ~ f_dm, data = pick(everything()) %>% filter(chl_comb < 1)))[2]
+      coef(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% filter(chl_comb < 1)))[2]
     } else {
       NA_real_
     },
     intercept_low = if(first(ctdNum) == "80217") {
-      coef(lm(chl_comb ~ f_dm, data = pick(everything()) %>% filter(chl_comb < 1)))[1]
+      coef(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% filter(chl_comb < 1)))[1]
     } else {
       NA_real_
     },
     r2_low = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_dm, data = pick(everything()) %>% filter(chl_comb < 1)))$r.squared
+      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% filter(chl_comb < 1)))$r.squared
     } else {
       NA_real_
     },
     adj_r2_low = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_dm, data = pick(everything()) %>% filter(chl_comb < 1)))$adj.r.squared
+      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% filter(chl_comb < 1)))$adj.r.squared
     } else {
       NA_real_
     },
     p_value_low = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_dm, data = pick(everything()) %>% filter(chl_comb < 1)))$coefficients[2, 4]
+      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% filter(chl_comb < 1)))$coefficients[2, 4]
     } else {
       NA_real_
     },
@@ -803,7 +803,7 @@ fit_stats <- f_fit_av %>%
 # Create plot with additional regression line for low values in 80217
 f_fit_av %>% 
   filter(use_surface | pres != 1) %>%
-  ggplot(aes(x = f_dm, y = chl_comb)) +
+  ggplot(aes(x = f_corrected, y = chl_comb)) +
   geom_abline(slope = 1, intercept = 0, 
               linetype = "dashed", color = "gray40", linewidth = 0.8) +
   # Add low range regression line for sensor 80217 (full span)
@@ -849,10 +849,10 @@ ggsave(here("figures", "fluorescence_calibration_by_sensor_low_80217.png"),
 # Calculate overall fit statistics for each sensor
 fit_stats_lb <- f_fit_av %>% 
   filter(use_surface | pres != 1) %>%
-  filter(f_dm <= 1) %>%
+  filter(f_corrected <= 1) %>%
   group_by(ctdNum) %>%
   summarise(
-    model = list(lm(chl_comb ~ f_dm)),
+    model = list(lm(chl_comb ~ f_corrected)),
     .groups = 'drop'
   ) %>%
   mutate(
@@ -868,8 +868,8 @@ fit_stats_lb <- f_fit_av %>%
 
 f_fit_av %>% 
   filter(use_surface | pres != 1) %>%
-  filter(f_dm <= 1) %>% 
-  ggplot(aes(x = f_dm, y = chl_comb)) +
+  filter(f_corrected <= 1) %>% 
+  ggplot(aes(x = f_corrected, y = chl_comb)) +
   geom_abline(slope = 1, intercept = 0, 
               linetype = "dashed", color = "gray40", linewidth = 0.8) +
   geom_smooth(aes(group = id), method = "lm", se = TRUE, 
@@ -918,13 +918,13 @@ plot_cast_detailed <- function(cast_id) {
   # Check if ctdNum is included in cast_id (e.g., "2024-05-15-QU39-670")
   if (length(parts) == 5) {
     cast_ctd <- parts[5]
-    profile_data <- f_dm %>%
+    profile_data <- f_dm %>%  # Changed from f_corrected
       filter(date == cast_date, station == cast_station, ctdNum == cast_ctd)
     cast_data <- f_fit_multi %>%
       filter(date == cast_date, station == cast_station, ctdNum == cast_ctd)
   } else {
     # Original behavior - get all data for that date/station
-    profile_data <- f_dm %>%
+    profile_data <- f_dm %>%  # Changed from f_corrected
       filter(date == cast_date, station == cast_station)
     cast_data <- f_fit_multi %>%
       filter(date == cast_date, station == cast_station)
@@ -952,12 +952,12 @@ plot_cast_detailed <- function(cast_id) {
   
   # Fit model (potentially excluding surface)
   if (use_surface) {
-    fit_data <- cast_data %>% filter(!is.na(chl_comb), !is.na(f_dm))
+    fit_data <- cast_data %>% filter(!is.na(chl_comb), !is.na(f_corrected))
   } else {
-    fit_data <- cast_data %>% filter(!is.na(chl_comb), !is.na(f_dm), pres != 1)
+    fit_data <- cast_data %>% filter(!is.na(chl_comb), !is.na(f_corrected), pres != 1)
   }
   
-  cast_model <- lm(chl_comb ~ f_dm, data = fit_data)
+  cast_model <- lm(chl_comb ~ f_corrected, data = fit_data)
   cast_slope <- coef(cast_model)[2]
   cast_intercept <- coef(cast_model)[1]
   r2 <- summary(cast_model)$r.squared
@@ -975,9 +975,9 @@ plot_cast_detailed <- function(cast_id) {
   profile_plot <- profile_data %>%
     filter(pres < 50) %>%
     ggplot(aes(y = pres)) +
-    geom_ribbon(aes(xmin = f_lower, xmax = f_upper), 
+    geom_ribbon(aes(xmin = f_lower - offset, xmax = f_upper - offset),  # Apply offset to ribbons
                 fill = "#2E86AB", alpha = 0.3) +
-    geom_line(aes(x = f_dm, color = "CTD Fluorescence"), 
+    geom_line(aes(x = f_corrected, color = "CTD Fluorescence"), 
               linewidth = 1, orientation = "y") +
     geom_point(data = cast_data %>% filter(pres < 50),
                aes(x = chl_comb, color = "Discrete Samples"), 
@@ -1000,22 +1000,22 @@ plot_cast_detailed <- function(cast_id) {
     labs(title = "A) Fluorescence Profile")
   
   # Calculate axis limits for scatter
-  axis_min <- min(c(cast_data$f_dm, cast_data$chl_comb), na.rm = TRUE)
-  axis_max <- max(c(cast_data$f_dm, cast_data$chl_comb), na.rm = TRUE)
+  axis_min <- min(c(cast_data$f_corrected, cast_data$chl_comb), na.rm = TRUE)
+  axis_max <- max(c(cast_data$f_corrected, cast_data$chl_comb), na.rm = TRUE)
   buffer <- (axis_max - axis_min) * 0.05
   axis_limits <- c(max(0, axis_min - buffer), axis_max + buffer)
   
   # SCATTER PLOT - only discrete matches
   scatter_plot <- cast_data %>%
-    filter(!is.na(chl_comb), !is.na(f_dm)) %>%
-    ggplot(aes(x = f_dm, y = chl_comb, color = as.factor(pres))) +
+    filter(!is.na(chl_comb), !is.na(f_corrected)) %>%
+    ggplot(aes(x = f_corrected, y = chl_comb, color = as.factor(pres))) +
     geom_abline(intercept = 0, slope = 1, 
                 linetype = "dashed", color = "gray50", linewidth = 0.8) +
     geom_abline(slope = sensor_med$median_slope, 
                 intercept = sensor_med$median_intercept,
                 color = "blue", linewidth = 1.2, linetype = "solid") +
     geom_smooth(data = fit_data,
-                aes(x = f_dm, y = chl_comb),
+                aes(x = f_corrected, y = chl_comb),
                 method = "lm", se = TRUE,
                 color = "red", fill = "red",
                 linewidth = 1, alpha = 0.2,
@@ -1104,9 +1104,10 @@ model_few <- f_fit_few %>%
 ```
 
 ```{r}
+
 # First, calculate sensor-level fits and get statistics
 sensor_fit_stats_few <- f_fit_few %>%
-  filter(!is.na(chl_comb) & !is.na(f_dm)) %>%
+  filter(!is.na(chl_comb) & !is.na(f_corrected)) %>%
   filter(!id %in% c("2013-05-29-KC10-18032",
                     "2013-07-19-KC10-18032",
                     "2014-05-19-FZH01-18066",
@@ -1117,7 +1118,7 @@ sensor_fit_stats_few <- f_fit_few %>%
                     )) %>% 
   group_by(ctdNum) %>%
   summarise({
-    model_sensor <- lm(chl_comb ~ f_dm, data = cur_data())
+    model_sensor <- lm(chl_comb ~ f_corrected, data = cur_data())
     data.frame(
       slope = round(coef(model_sensor)[2], 3),
       intercept = round(coef(model_sensor)[1], 3),
@@ -1137,7 +1138,7 @@ f_fit_few %>%
                     "2014-06-09-FZH01-18066",
                     "2014-06-19-FZH01-18066"
                     )) %>%
-  ggplot(aes(x = f_dm, y = chl_comb)) +
+  ggplot(aes(x = f_corrected, y = chl_comb)) +
   geom_point(alpha = 0.6, size = 2) +
   geom_smooth(method = "lm", se = TRUE, color = "blue", linewidth = 1) +
   geom_text(
@@ -1185,35 +1186,35 @@ fit_stats <- f_fit_combined %>%
   group_by(ctdNum) %>%
   summarise(
     # Overall model (all data)
-    model = list(lm(chl_comb ~ f_dm)),
+    model = list(lm(chl_comb ~ f_corrected)),
     
     # Separate fit excluding the two special casts (sensor 80217 only)
     slope_excl = if(first(ctdNum) == "80217") {
-      coef(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
+      coef(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
                 filter(!id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))[2]
     } else {
       NA_real_
     },
     intercept_excl = if(first(ctdNum) == "80217") {
-      coef(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
+      coef(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
                 filter(!id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))[1]
     } else {
       NA_real_
     },
     r2_excl = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
+      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
                    filter(!id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))$r.squared
     } else {
       NA_real_
     },
     adj_r2_excl = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
+      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
                    filter(!id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))$adj.r.squared
     } else {
       NA_real_
     },
     p_value_excl = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
+      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
                    filter(!id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))$coefficients[2, 4]
     } else {
       NA_real_
@@ -1226,31 +1227,31 @@ fit_stats <- f_fit_combined %>%
     
     # Separate fit for ONLY the two special casts combined (sensor 80217 only)
     slope_april = if(first(ctdNum) == "80217") {
-      coef(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
+      coef(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
                 filter(id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))[2]
     } else {
       NA_real_
     },
     intercept_april = if(first(ctdNum) == "80217") {
-      coef(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
+      coef(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
                 filter(id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))[1]
     } else {
       NA_real_
     },
     r2_april = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
+      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
                    filter(id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))$r.squared
     } else {
       NA_real_
     },
     adj_r2_april = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
+      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
                    filter(id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))$adj.r.squared
     } else {
       NA_real_
     },
     p_value_april = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
+      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
                    filter(id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))$coefficients[2, 4]
     } else {
       NA_real_
@@ -1286,7 +1287,7 @@ fit_stats <- f_fit_combined %>%
 
 # Create plot with both data types
 f_fit_combined %>% 
-  ggplot(aes(x = f_dm, y = chl_comb)) +
+  ggplot(aes(x = f_corrected, y = chl_comb)) +
   geom_abline(slope = 1, intercept = 0, 
               linetype = "dashed", color = "gray40", linewidth = 0.8) +
   # Add regression line excluding April casts (sensor 80217)
@@ -1337,7 +1338,7 @@ f_fit_combined %>%
     aspect.ratio = 1
   )
 
-ggsave(here("figures", "fluorescence_calibration_by_sensor_with_single.png"),
+ggsave(here("figures", "fluorescence_calibration_by_sensor_with_single_dark.png"),
        width = 12, height = 10, dpi = 300)
 ```
 ```{r}
@@ -1426,7 +1427,7 @@ f_dm_calibrated <- f_dm %>%
   ) %>%
   # Apply the calibration
   mutate(
-    f_calibrated = slope * f_dm 
+    f_calibrated = slope * f_corrected 
   ) %>%
   # Clean up temporary columns
   select(-is_april_cast, -is_excl_april)
