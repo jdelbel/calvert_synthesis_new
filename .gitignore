@@ -6,7 +6,11 @@ files_big
 files
 outputs
 figures
+materials
 *.html
 *.png
 *.jpg
 *.csv
+*.pptx
+*.docx
+*.pdf

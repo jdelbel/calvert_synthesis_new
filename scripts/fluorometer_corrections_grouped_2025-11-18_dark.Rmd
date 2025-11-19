@@ -59,7 +59,9 @@ f <- f %>%
          year,
          pres = `Pressure (dbar)`,
          flu = `Fluorometry Chlorophyll (ug/L)`,
-         flu_flag = `Fluorometry Chlorophyll flag`)
+         flu_flag = `Fluorometry Chlorophyll flag`,
+         par = `PAR (umol m-2 s-1)`,
+         turb = `Turbidity (FTU)`)
 ```
 
 ```{r}
@@ -1065,7 +1067,7 @@ plot_cast_detailed <- function(cast_id) {
 
 ```{r}
 # Usage
-plot_cast_detailed("2021-09-05-KC10")
+plot_cast_detailed("2024-04-12-KC10-211567")
 
 # plot_cast_detailed("2016-08-12-FZH01-18066")
 # plot_cast_detailed("2016-08-12-FZH01-1907467")
@@ -1390,7 +1392,7 @@ if(any(fit_stats$ctdNum == "80217")) {
 }
 
 # Save to CSV
-write_csv(calibration_stats, here("outputs", "ctd_fluorescence_calibrations_2025-11-18.csv"))
+write_csv(calibration_stats, here("outputs", "ctd_fluorescence_calibrations_stats_2025-11-18.csv"))
 ```
 
 ```{r}
@@ -1431,13 +1433,200 @@ f_dm_calibrated <- f_dm %>%
   ) %>%
   # Clean up temporary columns
   select(-is_april_cast, -is_excl_april)
+
+# Save to CSV
+write_csv(f_dm_calibrated, here("outputs", "ctd_offset_slope_corrected_fluorescence__2025-11-19.csv"))
 ```
 
+```{r}
+f_dm_calibrated %>% 
+  filter(pres == 5) %>% 
+  ggplot(aes(x = date, y = f_calibrated, color = station)) +
+  geom_line() +
+  geom_point()
+```
 
+```{r}
+#Use discrete fit on saturated profiles and add them to the time-series as the two identified are important.
+```
 
+```{r}
+#How do I incorporate quenching?
 
+#Use data with bottle and Fl to develop paradigm - what shapes are quenched vs what are not.
+#Tool to flip through this subset of data and decide if loess fit is appropriate.
+#Hypothesis is that SCM generally are not quenched, but more mixed profiles are.
+#could either develop correction or go back and identify likely quenched profiles.
 
+#I will inevitably need to go through and visualize and classify all profiles.
+```
 
+```{r}
+# Robust NPQ correction with full profile interpolation
+# Step 1: Identify quenched profiles from discrete samples
+quenched_profiles <- f_dm_calibrated %>% 
+  drop_na(chl_comb, pres) %>% 
+  mutate(
+    diff = f_calibrated - chl_comb
+  ) %>%
+  # Identify profiles with quenching in top 5m
+  group_by(id) %>%
+  summarise(
+    is_quenched = any(diff <= -1 & pres <= 5, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(is_quenched) %>%
+  pull(id)
+
+# Step 2: Safer LOESS fitting with error handling
+fit_loess_safe <- function(data, span = 0.5) {
+  # Filter to only bottle data (non-NA chl_comb)
+  bottle_data <- data %>% 
+    filter(!is.na(chl_comb), !is.na(pres)) %>%
+    arrange(pres)
+  
+  # Need at least 3 points and at least one shallow sample (≤10m)
+  if(nrow(bottle_data) < 3) return(rep(NA_real_, nrow(data)))
+  if(min(bottle_data$pres) > 10) return(rep(NA_real_, nrow(data)))
+  
+  # Check for sufficient depth range
+  depth_range <- diff(range(bottle_data$pres))
+  if(depth_range < 1) return(rep(NA_real_, nrow(data)))
+  
+  # Adjust span based on number points
+  n_points <- nrow(bottle_data)
+  adjusted_span <- case_when(
+    n_points <= 4 ~ 0.8,
+    n_points <= 6 ~ 0.6,
+    TRUE ~ span
+  )
+  
+  # Fit LOESS model
+  tryCatch({
+    loess_model <- loess(chl_comb ~ pres, data = bottle_data, span = adjusted_span)
+    
+    # Predict within the range of observed data (no extrapolation)
+    min_depth <- min(bottle_data$pres)
+    max_depth <- max(bottle_data$pres)
+    
+    predicted <- ifelse(
+      data$pres >= min_depth & data$pres <= max_depth & !is.na(data$pres),
+      predict(loess_model, newdata = data.frame(pres = data$pres)),
+      NA_real_
+    )
+    
+    return(predicted)
+  }, error = function(e) {
+    return(rep(NA_real_, nrow(data)))
+  })
+}
+
+# Step 3: Apply correction with proper depth limits
+f_dm_calibrated2 <- f_dm_calibrated %>% 
+  group_by(id) %>%
+  mutate(
+    chl_loess = if_else(
+      id %in% quenched_profiles,
+      fit_loess_safe(cur_data()),
+      NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  # Apply NPQ correction only in shallow waters
+  mutate(
+    diff_ratio = f_calibrated / chl_loess,
+    
+    # Apply correction with strict depth limit
+    f_npq = case_when(
+      # Only correct in top 6m where we have good LOESS fit and clear quenching
+      pres <= 6 & !is.na(chl_loess) & diff_ratio < 0.8 ~ chl_loess,
+      TRUE ~ f_calibrated
+    ),
+    
+    # Flag which points were corrected
+    npq_cor = pres <= 6 & !is.na(chl_loess) & diff_ratio < 0.8
+  )
+```
+
+```{r}
+test <- f_dm_calibrated2 %>% 
+  filter(npq_cor == T) %>% 
+  distinct(id)
+
+test2 <- f_dm_calibrated2 %>% 
+  filter(npq_cor == F) %>% 
+  distinct(id)
+```
+
+```{r}
+f_dm_calibrated2 %>% 
+  filter(pres < 50) %>%
+  filter(id %in% c("2016-09-23-FZH01-18066")) %>% 
+  ggplot(aes(y = pres)) +
+  geom_line(aes(x = f_dm, color = "CTD Fluorescence"), 
+            linewidth = 1, orientation = "y") +
+  geom_line(aes(x = f_calibrated, color = "CTD Fluorescence"), 
+            linewidth = 1, orientation = "y", color = "green") +
+  geom_line(aes(x = f_npq, color = "CTD Fluorescence"), 
+            linewidth = 1, orientation = "y", color = "red") +
+  geom_point(aes(x = chl_comb, color = "Discrete Samples"),
+               size = 3, shape = 16) +
+    scale_y_reverse(name = "Pressure (dbar)") +
+    scale_x_continuous(name = "Chlorophyll (µg/L)") +
+    scale_color_manual(
+      name = "",
+      values = c("CTD Fluorescence" = "#2E86AB", 
+                 "Discrete Samples" = "#A23B72"),
+      breaks = c("CTD Fluorescence", "Discrete Samples")
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      legend.position = "top",
+      legend.text = element_text(size = 12),
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(face = "bold", size = 14)
+    ) 
+```
+```{r}
+#profiles to revisit
+#2015-05-01-KC10-18032
+#Fit to discrete instead?
+#2016-03-25-FZH01-18066 
+#definitely needed, but maybe deeper.
+#2016-09-23-FZH01-18066
+#not necessarily bad, but highlights issue with correction.
+#2017-08-14-KC10-1907467
+#I think something wrong with discrete 
+#2018-09-11-FZH01-18066
+#Large overestimation due to no 5m - so just extrapolates?
+#2019-06-10-KC10-18066
+#Not sure on this one - how did this get through QC?
+#2020-08-07-KC10-18032
+#Does this need more? deeper depth?
+#2022-05-05-KC10-18032
+#Needs deeper depth? Or CTD issue?
+#2022-07-28-KC10-18032
+#Doesn't need - does it do backward correct? Causing overestimate.
+#2024-04-12-KC10-211567
+#Should this be fit to the discrete? 
+#2024-05-12-KC10-18032
+#Go deeper?
+#2025-05-02-KC10-211567
+#Doesn't need
+```
+
+```{r}
+#Really good example of where needed.
+#2019-05-11-KC10-18066
+#2021-09-05-KC10-18032 
+#2016-03-25-FZH01-18066 
+```
+
+```{r}
+test3 <- f %>% 
+  filter(pres < 50) %>%
+  filter(date %in% c("2022-05-05"))
+```
 
 
 
