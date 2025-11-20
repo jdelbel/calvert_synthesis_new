@@ -26,11 +26,14 @@ library(ggsci)
 library(gsw)
 library(rsoi)
 library(ggpubr)
+library(akima)
+library(metR)
 ```
 
 ```{r}
 #Corrected CTD fluorescence data
-ctd_fl <- read_csv(here("outputs", "qc_quench_kc10_fzh01_2025-09-08.csv"))
+ctd_fl <- read_csv(here("outputs",
+                        "ctd_offset_slope_corrected_fluorescence_2025-11-19.csv"))
 
 ctd <- read_csv(here("files", "ctd_kc10_fzh01_2025-08-09.csv"))
 
@@ -51,6 +54,7 @@ fw <- read_csv(here("files", "Daily_flow_long_2014_2024_v2025_04_03.csv"))
 mei_data <- download_mei()
 
 ```
+
 ```{r}
 fw_tot <- fw %>% 
   filter(Watershed_group == "Q_Total") %>% 
@@ -145,12 +149,12 @@ interp <- as.data.frame(sp.interp) %>%
   mutate(date = as.Date(date),
          station = "KC10",
          year = year(date),
-         f_npq = round(f_npq, 2)) %>% 
-  select(date, station, year, pres, f_npq)
+         f_corrected = round(f_npq, 2)) %>% 
+  select(date, station, year, pres, f_corrected)
 
 ctd_fl <- ctd_fl %>% 
   mutate(year = year(date)) %>% 
-  select(date, station, year, pres, f_npq)
+  select(date, station, year, pres, f_corrected)
 
 ctd_fl <- rbind(ctd_fl, interp)
 ```
@@ -161,9 +165,6 @@ ctd_fl_phys <- ctd_fl %>%
 ```
 
 ```{r}
-library(akima)
-library(metR)
-
 # Option 3: Viridis-inspired but with dark blue start
 fluor_palette_v3 <- colorRampPalette(c(
   "#08306b",  # Deep navy blue
@@ -191,30 +192,28 @@ create_fluor_breaks <- function(max_val = 50, bloom_threshold = 5) {
 ctd_fl_plot <- ctd_fl_phys %>%
   mutate(year = year(date),
          month = month(date)) %>% 
-  filter(pres < 31 & year >= 2016) %>% 
+  filter(pres < 31) %>% 
   group_by(year, month, pres) %>% 
-  summarise(f_npq = median(f_npq), .groups = "drop",
+  summarise(f_corrected = median(f_corrected), .groups = "drop",
             temp = median(temp_daily),
             sal = median(sal_daily),
             sigma_theta = median(sigma_theta_daily)) %>%
   mutate(day = 15) %>% 
   unite(date, c(year, month, day), sep = "-") %>% 
   mutate(date = date(date)) %>% 
-  filter(date > "2016-02-01")
+  drop_na()
 ```
 
 
 
 ```{r}
-library(akima)
-
 # Create regular grid for interpolation
 date_seq <- seq(min(ctd_fl_plot$date), max(ctd_fl_plot$date), length.out = 300)
 pres_seq <- seq(0, 30, length.out = 200)
 
 # Interpolate fluorescence to regular grid
 ctd_interp <- with(ctd_fl_plot, 
-                   interp(x = as.numeric(date), y = pres, z = f_npq,
+                   interp(x = as.numeric(date), y = pres, z = f_corrected,
                           xo = as.numeric(date_seq), yo = pres_seq))
 
 # Interpolate temperature
@@ -247,7 +246,6 @@ interp_df <- expand.grid(date = date_seq, pres = pres_seq) %>%
 # Calculate integrated fluorescence (0-30m) by month
 ctd_integrated <- ctd_fl %>%
   filter(pres <= 30) %>%  # 0-30m depth
-  filter(date > "2016-02-01") %>% 
   mutate(
     year_month = floor_date(date, "month"),
     year = year(date),
@@ -257,7 +255,7 @@ ctd_integrated <- ctd_fl %>%
   # Integrate using trapezoidal rule (approximate)
   arrange(pres) %>%
   summarise(
-    integrated_fl = sum(f_npq * c(diff(pres), 0), na.rm = TRUE),  # Simple integration
+    integrated_fl = sum(f_corrected * c(diff(pres), 0), na.rm = TRUE),  # Simple integration
     .groups = 'drop'
   ) %>%
   # Calculate monthly climatology and anomalies
@@ -413,7 +411,7 @@ combined_plot <- p1 / p2   # Top panel twice as tall
 
 print(combined_plot)
 
-ggsave(here("figures", "panel_kc10_interp_int.png"), combined_plot,
+ggsave(here("figures", "panel_kc10_interp_int_f_no_npq.png"), combined_plot,
        width = 16, height = 8)
 ```
 
@@ -576,21 +574,17 @@ test <- ctd_integrated %>%
   ungroup()
 
 test %>% 
-  filter(year > 2016 & year < 2024) %>% 
+  filter(year < 2024) %>% 
   ggplot(aes(x = int_anom_year, y = mei_year, fill = as.factor(year))) +
   geom_point(pch = 21, size = 3)
 
 test %>% 
-  filter(year > 2016 & year < 2024) %>% 
+  filter(year < 2024) %>% 
   ggplot(aes(x = int_anom_year, y = mei_year, fill = as.factor(year))) +
   geom_point(pch = 21, size = 3)
 ```
 
 ```{r}
-library(tidyverse)
-library(patchwork)
-library(ggpubr)
-
 # Annual data
 annual_data <- ctd_integrated %>% 
   left_join(mei_data, by = c("year", "month")) %>% 
@@ -601,7 +595,7 @@ annual_data <- ctd_integrated %>%
     mei_annual = mean(MEI, na.rm = TRUE),
     .groups = 'drop'
   ) %>% 
-  filter(year > 2016 & year < 2024) 
+  filter(year < 2024) 
 
 # Calculate correlations for custom labels
 cor_fl <- cor.test(annual_data$integrated_fl, annual_data$mei_annual)
@@ -672,7 +666,7 @@ p3 <- annual_data %>%
     midpoint = mean(annual_data$integrated_fl),
     name = "Fluorescence\n(mg m⁻²·m)"
   ) +
-  scale_x_continuous(breaks = 2017:2023) +
+  scale_x_continuous(breaks = 2012:2023) +
   labs(x = NULL,
        y = "Integrated Fluorescence\n(mg m⁻²·m)",
        title = "Annual Integrated Fluorescence") +
@@ -694,7 +688,7 @@ p4 <- annual_data %>%
     midpoint = 0,
     name = "MEI\n(ENSO phase)"
   ) +
-  scale_x_continuous(breaks = 2017:2023) +
+  scale_x_continuous(breaks = 2012:2023) +
   labs(x = "Year",
        y = "Annual MEI",
        title = "Annual Multivariate ENSO Index") +
@@ -716,7 +710,7 @@ combined_plot <- (p1 | p2) / p3 / p4 +
 combined_plot
 
 # Save at high resolution
-ggsave(here("figures","fluorescence_mei_analysis.png"), combined_plot,
+ggsave(here("figures","fluorescence_mei_analysis_no_quench.png"), combined_plot,
        width = 14, height = 12, 
        dpi = 300)
 ```
@@ -728,9 +722,9 @@ library(metR)  # for geom_text_contour
 library(here)
 
 # Define common x-axis elements for 2017-2023 period
-common_x_breaks <- seq(as.Date("2017-01-01"), as.Date("2024-01-01"), by = "1 year")
+common_x_breaks <- seq(as.Date("2012-01-01"), as.Date("2024-01-01"), by = "1 year")
 common_x_labels <- format(common_x_breaks, "%Y")
-common_x_limits <- c(as.Date("2017-01-01"), as.Date("2023-12-31"))
+common_x_limits <- c(as.Date("2012-01-01"), as.Date("2023-12-31"))
 
 # Define color palette for fluorescence
 colors_v3 <- c("#08519c", "#3182bd", "#6baed6", "#9ecae1", 
@@ -822,7 +816,7 @@ mei_plot_data <- mei_data %>%
     ),
     Phase = factor(Phase, levels = c("El Niño", "Neutral", "La Niña"))
   ) %>%
-  filter(plot_date >= as.Date("2017-01-01") & 
+  filter(plot_date >= as.Date("2012-01-01") & 
          plot_date <= as.Date("2023-12-31"))
 
 p3 <- ggplot(mei_plot_data, aes(x = plot_date, y = MEI)) +
@@ -859,7 +853,7 @@ combined_plot <- p1 / p2 / p3 +
 print(combined_plot)
 
 # Save
-ggsave(here("figures", "panel_kc10_interp_int_mei.png"), 
+ggsave(here("figures", "panel_kc10_interp_int_mei_no_quench.png"), 
        combined_plot,
        width = 16, 
        height = 12,
@@ -872,9 +866,9 @@ library(metR)  # for geom_text_contour
 library(here)
 
 # Define common x-axis elements for 2017-2023 period
-common_x_breaks <- seq(as.Date("2017-01-01"), as.Date("2024-01-01"), by = "1 year")
+common_x_breaks <- seq(as.Date("2012-01-01"), as.Date("2024-01-01"), by = "1 year")
 common_x_labels <- format(common_x_breaks, "%Y")
-common_x_limits <- c(as.Date("2017-01-01"), as.Date("2023-12-31"))
+common_x_limits <- c(as.Date("2012-01-01"), as.Date("2023-12-31"))
 
 # Define color palette for fluorescence
 colors_v3 <- c("#08519c", "#3182bd", "#6baed6", "#9ecae1", 
@@ -1008,7 +1002,7 @@ mei_plot_data <- mei_data %>%
     ),
     Phase = factor(Phase, levels = c("El Niño", "Neutral", "La Niña"))
   ) %>%
-  filter(plot_date >= as.Date("2017-01-01") & 
+  filter(plot_date >= as.Date("2012-01-01") & 
          plot_date <= as.Date("2023-12-31"))
 
 p4 <- ggplot(mei_plot_data, aes(x = plot_date, y = MEI)) +
@@ -1045,7 +1039,7 @@ combined_plot <- p1 / p2 / p3 / p4 +
 print(combined_plot)
 
 # Save
-ggsave(here("figures", "panel_kc10_interp_int_fw-total_mei.png"), 
+ggsave(here("figures", "panel_kc10_interp_int_fw-total_mei_no_quench.png"), 
        combined_plot,
        width = 16, 
        height = 14,
@@ -1064,11 +1058,12 @@ annual_discharge <- fw_tot %>%
     Q_annual = mean(Q, na.rm = TRUE),
     .groups = 'drop'
   ) %>%
-  filter(year > 2016 & year < 2024)
+  filter(year > 2012 & year < 2024)
 
 # Join with existing annual data
 annual_data_full <- annual_data %>%
-  left_join(annual_discharge, by = "year")
+  left_join(annual_discharge, by = "year") %>% 
+  filter(!year == 2022)
 
 # Calculate correlations
 cor_mei_q <- cor.test(annual_data_full$mei_annual, annual_data_full$Q_annual)
@@ -1112,7 +1107,8 @@ p1 <- annual_data_full %>%
   theme(legend.position = "none")
 
 # Plot 2: Fluorescence anomaly vs Discharge
-p2 <- annual_data_full %>% 
+p2 <- annual_data_full %>%
+  filter(!year == 2022) %>% 
   ggplot(aes(x = Q_annual, y = integrated_anom)) +
   geom_smooth(method = "lm", se = TRUE, color = "gray40", 
               linewidth = 0.8, alpha = 0.3) +
@@ -1142,7 +1138,7 @@ discharge_plot <- (p1 | p2) +
 discharge_plot
 
 # Save
-ggsave(here("figures", "discharge_relationships.png"), 
+ggsave(here("figures", "discharge_relationships_no_quench.png"), 
        discharge_plot,
        width = 14, 
        height = 6, 
@@ -1175,7 +1171,7 @@ seasonal_data <- ctd_integrated %>%
     mei_seasonal = mean(MEI, na.rm = TRUE),
     .groups = 'drop'
   ) %>%
-  filter(year > 2016 & year < 2024)
+  filter(year > 2012 & year < 2024)
 
 # Focus on growing season (e.g., Spring-Summer)
 growing_season <- seasonal_data %>%

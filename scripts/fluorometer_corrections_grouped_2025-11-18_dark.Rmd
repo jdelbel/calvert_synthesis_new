@@ -31,6 +31,7 @@ flags <- read_csv(here("outputs","fluorescence_QC_flags_20251103.csv"))
 #Downloading chlorophyll data for joining
 c <- read_csv(here("files", "2025-11-03_HakaiData_chlorophyll.csv"))
 
+#Downloading HPLC data for comparison with chlorophyll.
 hplc <- read.csv(here("files", "2025-11-18_HakaiData_hplc.csv"))
 
 # Downloading my fit flagging sheet
@@ -103,11 +104,258 @@ num_dup <- f %>%
 ```
 
 ```{r}
+# Calculate dark offsets from deep water (>100m)
+dark_offsets <- f %>%
+  filter(pres > 100) %>%
+  group_by(date, station, ctdNum) %>%
+  mutate(n = n()) %>% 
+  ungroup() %>% 
+  filter(n >= 10) %>% 
+  group_by(date, station, ctdNum) %>%
+  slice_min(flu, n = 10) %>% 
+  summarise(
+    dark_offset = median(flu, na.rm = TRUE),
+    dark_offset_sd = sd(flu, na.rm = TRUE),
+    max_depth = max(pres)
+  ) %>%
+  ungroup()
+
+#Joining dark offsets into the fluorescence profiles
+f <- f %>% 
+  left_join(dark_offsets)
+
+# Looking at early time-series casts that did not go deep enough to derive a deep dark offset - can shallower data be used?
+shallow_dark <- f %>% 
+  filter(is.na(dark_offset)) %>%
+  filter(pres > 10) %>% 
+  group_by(castpk, date, station, ctdNum) %>% 
+  slice_min(flu, n = 10) %>% 
+  summarise(max_depth = max(pres),
+            shallow_offset = median(flu),
+            shallow_offset_sd = sd(flu),
+            .groups = "drop")
+```
+
+```{r}
+#Plotting only the deep (>100m) dark offsets.
+dark_offsets %>% 
+  ggplot(aes(x = date, y = dark_offset, color = as.factor(ctdNum))) +
+  geom_errorbar(aes(ymin = dark_offset - dark_offset_sd, 
+                    ymax = dark_offset + dark_offset_sd),
+                width = 0, alpha = 0.4) +
+  geom_point(size = 2) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.01)) +
+  scale_color_brewer(palette = "Dark2", name = "CTD Sensor") +
+  labs(
+    x = "Date",
+    y = expression(paste("Dark offset (mg ", m^{-3}, ")")),
+    title = "Fluorometer dark offsets from deep water (>100 m)"
+  ) +
+  facet_grid(ctdNum ~ ., scales = "free_y") +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "grey90"),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 28, color = "black"),
+    axis.title.x = element_blank()
+  )
+
+ggsave(here("figures", "dark_offsets.png"), 
+       width = 14,
+       height = 8,
+       dpi = 300)
+```
+
+```{r}
+#Plotting the dark offsets with the shallow casts
+dark_offsets %>% 
+  ggplot(aes(x = date, y = dark_offset, color = as.factor(ctdNum))) +
+  # Deep offsets
+  geom_errorbar(aes(ymin = dark_offset - dark_offset_sd, 
+                    ymax = dark_offset + dark_offset_sd),
+                width = 0, alpha = 0.4) +
+  geom_point(size = 3) +
+  # Shallow offsets
+  geom_errorbar(data = shallow_dark,
+                aes(y = shallow_offset,
+                    ymin = shallow_offset - shallow_offset_sd, 
+                    ymax = shallow_offset + shallow_offset_sd),
+                width = 0, alpha = 0.4) +
+  geom_point(data = shallow_dark,
+             aes(y = shallow_offset),
+             size = 3, shape = 21, fill = "white", stroke = 1.2) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.01)) +
+  scale_color_brewer(palette = "Dark2", name = "CTD Sensor") +
+  labs(
+    x = "Date",
+    y = expression(paste("Dark offset (mg ", m^{-3}, ")")),
+    title = "Fluorometer dark offsets\nDeep (>100 m, filled) vs shallow (>10 m, open)"
+  ) +
+  facet_grid(ctdNum ~ ., scales = "free_y") +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "grey90"),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 28, color = "black"),
+    axis.title.x = element_blank()
+  )
+
+ggsave(here("figures", "dark_offsets_shallow.png"), 
+       width = 14,
+       height = 8,
+       dpi = 300)
+```
+
+```{r}
+#Investigate the few profiles where there are high offsets
+#80217 > 1
+
+# Identify high offset profiles for this sensor
+check_dark_80217 <- dark_offsets %>% 
+  filter(ctdNum == "80217", dark_offset > 1)
+
+# Filter data for context profiles
+context_profiles <- f %>% 
+  filter(date <= "2014-10-16", ctdNum == 80217)
+
+depth_limit <- max(context_profiles$pres, na.rm = TRUE)
+
+# Main plot: all profiles for context
+p1 <- context_profiles %>% 
+  ggplot(aes(x = flu, y = pres, color = as.factor(date))) +
+  geom_line(orientation = "y", linewidth = 0.8) +
+  scale_y_reverse(limits = c(depth_limit, 0)) +
+  scale_color_viridis_d(option = "turbo", name = "Date") +
+  labs(
+    x = expression(paste("Fluorescence (mg ", m^{-3}, ")")),
+    y = "Pressure (dbar)",
+    title = "CTD 80217 profiles"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    text = element_text(size = 28, color = "black"),
+  ) +
+  guides(color = guide_legend(nrow = 2))
+
+# Highlight plot: the high offset profile
+p2 <- context_profiles %>% 
+  filter(date == "2014-10-16", station == "FZH01") %>% 
+  ggplot(aes(x = flu, y = pres)) +
+  geom_line(orientation = "y", linewidth = 1, color = "#D55E00") +
+  scale_y_reverse(limits = c(depth_limit, 0)) +
+  labs(
+    x = expression(paste("Fluorescence (mg ", m^{-3}, ")")),
+    y = NULL,
+    title = "2014-10-16 FZH01"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    text = element_text(size = 28, color = "black"),
+  )
+
+# Combine plots
+library(patchwork)
+p1 + p2 + plot_layout(widths = c(1, 1))
+
+ggsave(here("figures", "dark_offset_check_80217.png"),
+       width = 12,
+       height = 10,
+       dpi = 300)
+```
+
+```{r}
+# investigating high dark offset profiles for 18066
+check_dark_18066 <- dark_offsets %>% 
+  filter(ctdNum == "18066", 
+         date >= "2014-03-26",
+         date <= "2014-04-21")
+
+# Get dates with high offsets
+high_offset_dates <- check_dark_18066 %>% 
+  filter(dark_offset > 0.08) %>% 
+  pull(date)
+
+# Filter data for context profiles
+context_profiles <- f %>% 
+  filter(ctdNum == 18066,
+         date >= "2014-03-26",
+         date <= "2014-04-21")
+
+# Get shared depth limit
+depth_limit <- max(context_profiles$pres, na.rm = TRUE)
+
+# Main plot: all profiles for context
+p1 <- context_profiles %>% 
+  ggplot(aes(x = flu, y = pres, color = as.factor(castpk))) +
+  geom_line(orientation = "y", linewidth = 0.8) +
+  scale_y_reverse(limits = c(depth_limit, 0)) +
+  scale_color_viridis_d(option = "turbo", name = "Date") +
+  labs(
+    x = expression(paste("Fluorescence (mg ", m^{-3}, ")")),
+    y = "Pressure (dbar)",
+    title = "CTD 18066 profiles"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 8)
+  ) +
+  guides(color = guide_legend(nrow = 2))
+
+# Highlight plot: high offset profiles
+p2 <- context_profiles %>% 
+  filter(date %in% high_offset_dates) %>% 
+  ggplot(aes(x = flu, y = pres, color = as.factor(castpk))) +
+  geom_line(orientation = "y", linewidth = 1) +
+  scale_y_reverse(limits = c(depth_limit, 0)) +
+  scale_color_brewer(palette = "Dark2", name = "Date") +
+  labs(
+    x = expression(paste("Fluorescence (mg ", m^{-3}, ")")),
+    y = NULL,
+    title = "Dark offset > 0.08"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    legend.position = "bottom"
+  )
+
+# Combine plots
+library(patchwork)
+p1 + p2 + plot_layout(widths = c(1, 1))
+
+ggsave(here("figures", "dark_offset_check_18066.png"),
+       width = 12, height = 10, dpi = 300)
+```
+
+```{r}
+#Fill early time-series shallow casts with closes deep dark offset - should be ok as sensors this is being done to are relatively stable and show low variability. Could introduce error.
+f <- f %>% 
+  mutate(dark_offset_filled = is.na(dark_offset)) %>% 
+  arrange(ctdNum, date) %>% 
+  group_by(ctdNum) %>% 
+  fill(dark_offset, dark_offset_sd, .direction = "downup") %>% 
+  ungroup()
+
+f_offset <- f %>% 
+  mutate(f_offset = pmax(flu - dark_offset, 0))
+```
+
+```{r}
 #For now, I think best to just do a daily mean on fluorescence profiles, but this needs evaluation
-f_dm <- f %>% 
+f_dm <- f_offset %>% 
   group_by(date, station, pres, ctdNum) %>% 
-  summarise(f_dm = mean(flu),
-            f_sd = sd(flu),
+  summarise(f_dm = mean(f_offset),
+            f_sd = sd(f_offset),
             n_prof = n()) %>% 
   ungroup() %>% 
   mutate(f_dm = round(f_dm, 2),
@@ -115,13 +363,18 @@ f_dm <- f %>%
          f_upper = f_dm + f_sd) %>% 
   unite(id, c(date, station, ctdNum), sep = "-", remove = F)
 ```
-
-
 ```{r}
 # Calculate dark offsets from deep water (>100m)
 dark_offsets <- f_dm %>%
   filter(pres > 100) %>%
   group_by(date, station, ctdNum, id) %>%
+  mutate(n = n()) %>% 
+  ungroup() %>% 
+  filter(n >= 10) %>% 
+  group_by(date, station, ctdNum, id) %>%
+  slice_min(n = 10)
+  
+  
   arrange(f_dm) %>%
   slice_head(n = 10) %>%  # Take 10 minimum values
   summarise(
@@ -208,6 +461,9 @@ ggsave(here("figures", "dark_offset_lookup.png"),
        plot = p_offsets,
        width = 10, height = 6, dpi = 300, bg = "white")
 ```
+
+
+
 
 ```{r}
 #Working with the discrete chlorophyll dataset
@@ -1435,7 +1691,7 @@ f_dm_calibrated <- f_dm %>%
   select(-is_april_cast, -is_excl_april)
 
 # Save to CSV
-write_csv(f_dm_calibrated, here("outputs", "ctd_offset_slope_corrected_fluorescence__2025-11-19.csv"))
+write_csv(f_dm_calibrated, here("outputs", "ctd_offset_slope_corrected_fluorescence_2025-11-19.csv"))
 ```
 
 ```{r}
