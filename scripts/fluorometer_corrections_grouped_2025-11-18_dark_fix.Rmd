@@ -22,6 +22,164 @@ library(rioja) # add fits to discrete data
 ```
 
 ```{r}
+#Functions
+# Function to create combined profile + scatter plot for any cast
+plot_cast_detailed <- function(cast_id) {
+  # Parse date, station, and optionally ctdNum from cast_id
+  parts <- strsplit(cast_id, "-")[[1]]
+  cast_date <- as.Date(paste(parts[1:3], collapse = "-"))
+  cast_station <- parts[4]
+  
+  # Check if ctdNum is included in cast_id (e.g., "2024-05-15-QU39-670")
+  if (length(parts) == 5) {
+    cast_ctd <- parts[5]
+    profile_data <- f_dm %>%  # Changed from f_dm
+      filter(date == cast_date, station == cast_station, ctdNum == cast_ctd)
+    cast_data <- f_fit_multi %>%
+      filter(date == cast_date, station == cast_station, ctdNum == cast_ctd)
+  } else {
+    # Original behavior - get all data for that date/station
+    profile_data <- f_dm %>%  # Changed from f_dm
+      filter(date == cast_date, station == cast_station)
+    cast_data <- f_fit_multi %>%
+      filter(date == cast_date, station == cast_station)
+  }
+  
+  if (nrow(profile_data) == 0) {
+    stop(paste("No profile data found for cast:", cast_id))
+  }
+  
+  # Get sensor info
+  sensor <- profile_data$ctdNum[1]
+  sensor_med <- sensor_medians %>% filter(ctdNum == sensor)
+  
+  # Get cast info - match on full ID including ctdNum
+  cast_info <- model %>% 
+    filter(id == cast_id)
+  
+  # Handle missing cast_info - default to using surface
+  if (nrow(cast_info) == 0) {
+    warning(paste("Cast", cast_id, "not found in model_flagged. Using surface by default."))
+    use_surface <- TRUE
+  } else {
+    use_surface <- cast_info$use_surface[1]
+  }
+  
+  # Fit model (potentially excluding surface)
+  if (use_surface) {
+    fit_data <- cast_data %>% filter(!is.na(chl_comb), !is.na(f_dm))
+  } else {
+    fit_data <- cast_data %>% filter(!is.na(chl_comb), !is.na(f_dm), pres != 1)
+  }
+  
+  cast_model <- lm(chl_comb ~ f_dm, data = fit_data)
+  cast_slope <- coef(cast_model)[2]
+  cast_intercept <- coef(cast_model)[1]
+  r2 <- summary(cast_model)$r.squared
+  p_val <- summary(cast_model)$coefficients[2, 4]
+  
+  # Equation text
+  eq_label <- sprintf(
+    "Cast: y = %.2fx + %.2f\nMedian: y = %.2fx + %.2f\nR² = %.2f, p = %.4f",
+    cast_slope, cast_intercept,
+    sensor_med$median_slope, sensor_med$median_intercept,
+    r2, p_val
+  )
+  
+  # PROFILE PLOT - using full CTD profile
+  profile_plot <- profile_data %>%
+    filter(pres < 50) %>%
+    ggplot(aes(y = pres)) +
+    geom_ribbon(aes(xmin = f_lower - f_dm, xmax = f_upper - f_dm),  # Apply offset to ribbons
+                fill = "#2E86AB", alpha = 0.3) +
+    geom_line(aes(x = f_dm, color = "CTD Fluorescence"), 
+              linewidth = 1, orientation = "y") +
+    geom_point(data = cast_data %>% filter(pres < 50),
+               aes(x = chl_comb, color = "Discrete Samples"), 
+               size = 3, shape = 16) +
+    scale_y_reverse(name = "Pressure (dbar)") +
+    scale_x_continuous(name = "Chlorophyll (µg/L)") +
+    scale_color_manual(
+      name = "",
+      values = c("CTD Fluorescence" = "#2E86AB", 
+                 "Discrete Samples" = "#A23B72"),
+      breaks = c("CTD Fluorescence", "Discrete Samples")
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      legend.position = "top",
+      legend.text = element_text(size = 12),
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(face = "bold", size = 14)
+    ) +
+    labs(title = "A) Fluorescence Profile")
+  
+  # Calculate axis limits for scatter
+  axis_min <- min(c(cast_data$f_dm, cast_data$chl_comb), na.rm = TRUE)
+  axis_max <- max(c(cast_data$f_dm, cast_data$chl_comb), na.rm = TRUE)
+  buffer <- (axis_max - axis_min) * 0.05
+  axis_limits <- c(max(0, axis_min - buffer), axis_max + buffer)
+  
+  # SCATTER PLOT - only discrete matches
+  scatter_plot <- cast_data %>%
+    filter(!is.na(chl_comb), !is.na(f_dm)) %>%
+    ggplot(aes(x = f_dm, y = chl_comb, color = as.factor(pres))) +
+    geom_abline(intercept = 0, slope = 1, 
+                linetype = "dashed", color = "gray50", linewidth = 0.8) +
+    geom_abline(slope = sensor_med$median_slope, 
+                intercept = sensor_med$median_intercept,
+                color = "blue", linewidth = 1.2, linetype = "solid") +
+    geom_smooth(data = fit_data,
+                aes(x = f_dm, y = chl_comb),
+                method = "lm", se = TRUE,
+                color = "red", fill = "red",
+                linewidth = 1, alpha = 0.2,
+                inherit.aes = FALSE) +
+    geom_point(size = 3) +
+    scale_color_brewer(
+      name = "Pressure\n(dbar)",
+      palette = "Set2"
+    ) +
+    scale_x_continuous(name = "CTD Fluorescence (µg/L)", 
+                       limits = axis_limits) +
+    scale_y_continuous(name = "Discrete Chlorophyll (µg/L)", 
+                       limits = axis_limits) +
+    coord_fixed(ratio = 1) +
+    theme_bw(base_size = 14) +
+    theme(
+      legend.position = "right",
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(face = "bold", size = 14)
+    ) +
+    labs(
+      title = "B) CTD vs Discrete Chlorophyll",
+      subtitle = paste0(
+        "Red = cast fit | Blue = sensor median | Dashed = 1:1",
+        ifelse(!use_surface, " | Surface excluded", "")
+      )
+    ) +
+    annotate("text", 
+             x = axis_limits[1], 
+             y = axis_limits[2], 
+             label = eq_label,
+             hjust = -0.05, 
+             vjust = 1.1,
+             size = 3.5,
+             fontface = "italic")
+  
+  # COMBINE PLOTS
+  combined_plot <- profile_plot + scatter_plot +
+    plot_annotation(
+      title = paste0("Cast: ", cast_id, " | Sensor: ", sensor),
+      theme = theme(plot.title = element_text(size = 16, face = "bold"))
+    )
+  
+  return(combined_plot)
+}
+```
+
+
+```{r}
 #Downloading baseline corrected chlorophyll fluorescence profiles
 f <- read_csv(here("files", "8_binAvg-1762199720021.csv"))
 
@@ -638,7 +796,7 @@ f_fit <- f_dm %>%
 # Separate into multi-sample (>=3) and few-sample (1-2) casts
 #Notes on these outlier removals are in excel sheet
 f_fit_multi <- f_fit %>%
-  filter(!is.na(chl_comb) & !is.na(f_corrected)) %>%
+  filter(!is.na(chl_comb) & !is.na(f_dm)) %>%
   group_by(date, station, ctdNum) %>%
   filter(n() >= 3) %>%  # Only keep casts with 3+ samples for cast-specific fits
   ungroup() %>%
@@ -651,7 +809,7 @@ f_fit_multi <- f_fit %>%
   filter(!(id == "2017-09-21-FZH01-1907467" & pres == 10))
   
 f_fit_few <- f_fit %>%
-  filter(!is.na(chl_comb) & !is.na(f_corrected)) %>%
+  filter(!is.na(chl_comb) & !is.na(f_dm)) %>%
   group_by(date, station, ctdNum) %>%
   filter(n() < 3) %>%   # Casts with 1-2 samples
   ungroup()
@@ -679,7 +837,7 @@ model <- f_fit_multi %>%
     
     # Fit model WITHOUT surface (if possible)
     if (can_fit_no_surf) {
-      model_no_surf <- lm(chl_comb ~ f_corrected, data = data_no_surf)
+      model_no_surf <- lm(chl_comb ~ f_dm, data = data_no_surf)
       intercept_no_surf <- round(coef(model_no_surf)[1], 2)
       slope_no_surf <- round(coef(model_no_surf)[2], 2)
       r2_no_surf <- round(summary(model_no_surf)$adj.r.squared, 2)
@@ -690,7 +848,7 @@ model <- f_fit_multi %>%
     
     # Fit model WITH surface (if possible)
     if (can_fit_with_surf) {
-      model_with_surf <- lm(chl_comb ~ f_corrected, data = data_with_surf)
+      model_with_surf <- lm(chl_comb ~ f_dm, data = data_with_surf)
       intercept_with_surf <- round(coef(model_with_surf)[1], 2)
       slope_with_surf <- round(coef(model_with_surf)[2], 2)
       r2_with_surf <- round(summary(model_with_surf)$adj.r.squared, 2)
@@ -761,7 +919,7 @@ f_fit_with_model <- f_fit_multi %>%
                              quenched,
                              nobs),
             by = "id") %>%
-  filter(!is.na(chl_comb) & !is.na(f_corrected))
+  filter(!is.na(chl_comb) & !is.na(f_dm))
 ```
 
 ```{r}
@@ -784,7 +942,7 @@ sensor_medians <- f_fit_with_model %>%
 f_fit_with_model <- f_fit_with_model %>%
   left_join(sensor_medians, by = "ctdNum")
 
-ggplot(f_fit_with_model, aes(x = f_corrected, y = chl_comb)) +
+ggplot(f_fit_with_model, aes(x = f_dm, y = chl_comb)) +
   geom_abline(slope = 1, intercept = 0, 
               linetype = "dashed", color = "gray40", linewidth = 0.6) +
   geom_abline(aes(slope = median_slope, intercept = median_intercept),
@@ -832,7 +990,7 @@ fit_stats <- f_fit_av %>%
   filter(use_surface | pres != 1) %>%
   group_by(ctdNum) %>%
   summarise(
-    model = list(lm(chl_comb ~ f_corrected)),
+    model = list(lm(chl_comb ~ f_dm)),
     .groups = 'drop'
   ) %>%
   mutate(
@@ -848,7 +1006,7 @@ fit_stats <- f_fit_av %>%
 
 f_fit_av %>% 
   filter(use_surface | pres != 1) %>%
-  ggplot(aes(x = f_corrected, y = chl_comb)) +
+  ggplot(aes(x = f_dm, y = chl_comb)) +
   geom_abline(slope = 1, intercept = 0, 
               linetype = "dashed", color = "gray40", linewidth = 0.8) +
   geom_smooth(aes(group = id), method = "lm", se = TRUE, 
@@ -882,349 +1040,130 @@ f_fit_av %>%
     aspect.ratio = 1
   )
 
-ggsave(here("figures", "fluorescence_calibration_by_sensor.png"),
+ggsave(here("figures", "fluorescence_calibration_by_sensor_dark.png"),
        width = 12, height = 10, dpi = 300)
 ```
 
 ```{r}
-# Calculate fit statistics with dual regression for sensor 80217
-fit_stats <- f_fit_av %>% 
-  filter(use_surface | pres != 1) %>%
-  group_by(ctdNum) %>%
-  summarise(
-    # Overall model
-    model = list(lm(chl_comb ~ f_corrected)),
-    
-    # Low range model for sensor 80217 only
-    slope_low = if(first(ctdNum) == "80217") {
-      coef(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% filter(chl_comb < 1)))[2]
-    } else {
-      NA_real_
-    },
-    intercept_low = if(first(ctdNum) == "80217") {
-      coef(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% filter(chl_comb < 1)))[1]
-    } else {
-      NA_real_
-    },
-    r2_low = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% filter(chl_comb < 1)))$r.squared
-    } else {
-      NA_real_
-    },
-    adj_r2_low = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% filter(chl_comb < 1)))$adj.r.squared
-    } else {
-      NA_real_
-    },
-    p_value_low = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% filter(chl_comb < 1)))$coefficients[2, 4]
-    } else {
-      NA_real_
-    },
-    n_low = if(first(ctdNum) == "80217") {
-      sum(chl_comb < 1, na.rm = TRUE)
-    } else {
-      NA_integer_
-    },
-    
-    .groups = 'drop'
-  ) %>%
-  mutate(
-    # Overall fit statistics
-    slope = map_dbl(model, ~coef(.x)[2]),
-    intercept = map_dbl(model, ~coef(.x)[1]),
-    r2 = map_dbl(model, ~summary(.x)$r.squared),
-    adj_r2 = map_dbl(model, ~summary(.x)$adj.r.squared),
-    p_value = map_dbl(model, ~summary(.x)$coefficients[2, 4]),
-    n = map_int(model, ~length(.x$residuals)),
-    
-    # Create labels
-    label = if_else(
-      ctdNum == "80217",
-      sprintf("All data:\ny = %.2fx + %.2f\nR² = %.3f (adj. %.3f)\np < %.4f, n = %d\n\n< 1 mg m⁻³:\ny = %.2fx + %.2f\nR² = %.3f (adj. %.3f)\np < %.4f, n = %d",
-              slope, intercept, r2, adj_r2, p_value, n,
-              slope_low, intercept_low, r2_low, adj_r2_low, p_value_low, n_low),
-      sprintf("y = %.2fx + %.2f\nR² = %.3f (adj. %.3f)\np < %.4f\nn = %d",
-              slope, intercept, r2, adj_r2, p_value, n)
-    )
-  )
-
-# Create plot with additional regression line for low values in 80217
 f_fit_av %>% 
-  filter(use_surface | pres != 1) %>%
-  ggplot(aes(x = f_corrected, y = chl_comb)) +
-  geom_abline(slope = 1, intercept = 0, 
-              linetype = "dashed", color = "gray40", linewidth = 0.8) +
-  # Add low range regression line for sensor 80217 (full span)
-  geom_abline(data = fit_stats %>% filter(ctdNum == "80217"),
-              aes(slope = slope_low, intercept = intercept_low),
-              color = "darkred", linewidth = 1.5, alpha = 0.8) +
-  geom_smooth(aes(group = id), method = "lm", se = TRUE, 
-              linewidth = 0.5, alpha = 0.3, color = "steelblue") +
-  geom_smooth(method = "lm", se = TRUE, 
-              linewidth = 1.5, alpha = 0.3, color = "black") +
-  geom_point(size = 3, alpha = 0.6) +
-  geom_text(data = fit_stats,
-            aes(x = Inf, y = -Inf, label = label),
-            hjust = 1.05, vjust = -0.1,
-            size = 3.5, fontface = "italic",
-            inherit.aes = FALSE) +
-  facet_wrap(~ctdNum, scales = "free",
-             labeller = labeller(ctdNum = ~paste("Sensor", .))) +
+  select(id, date, station, ctdNum, slope) %>% 
+  distinct() %>% 
+  mutate(month = month(date, label = TRUE)) %>% 
+  ggplot(aes(x = month, y = slope, fill = as.factor(ctdNum))) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(aes(color = as.factor(ctdNum)), 
+              width = 0.15, size = 2, alpha = 0.6) +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_color_brewer(palette = "Dark2") +
   labs(
-    x = "CTD Fluorescence (f_dm)",
-    y = expression(paste("Discrete Chlorophyll (mg m"^-3, ")")),
-    title = "CTD Fluorescence Calibrations by Sensor",
-    subtitle = "Each blue line represents one cast's linear regression; black line shows overall fit; dashed line shows 1:1\nFor sensor 80217: dark red line shows fit for data < 1 mg m⁻³"
+    x = "Month",
+    y = "Calibration slope",
+    title = "Seasonal patterns in fluorometer calibration slopes"
   ) +
-  theme_bw(base_size = 16) +
+  facet_grid(ctdNum ~ ., scales = "free_y") +
+  theme_bw() +
   theme(
     legend.position = "none",
+    strip.background = element_rect(fill = "grey90"),
     panel.grid.minor = element_blank(),
-    strip.background = element_rect(fill = "gray90"),
-    strip.text = element_text(size = 14, face = "bold"),
-    plot.title = element_text(size = 18, face = "bold"),
-    plot.subtitle = element_text(size = 12),
-    axis.title = element_text(size = 14),
-    axis.text = element_text(size = 12),
-    aspect.ratio = 1
+    axis.text.x = element_text(angle = 0),
+    text = element_text(size = 28, color = "black")
   )
 
-ggsave(here("figures", "fluorescence_calibration_by_sensor_low_80217.png"),
-       width = 12, height = 10, dpi = 300)
+ggsave(here("figures", "slope_seasonality.png"), width = 12, height = 10, dpi = 300)
 ```
 
 ```{r}
-# Calculate overall fit statistics for each sensor
-fit_stats_lb <- f_fit_av %>% 
-  filter(use_surface | pres != 1) %>%
-  filter(f_corrected <= 1) %>%
-  group_by(ctdNum) %>%
-  summarise(
-    model = list(lm(chl_comb ~ f_corrected)),
-    .groups = 'drop'
-  ) %>%
-  mutate(
-    slope = map_dbl(model, ~coef(.x)[2]),
-    intercept = map_dbl(model, ~coef(.x)[1]),
-    r2 = map_dbl(model, ~summary(.x)$r.squared),
-    adj_r2 = map_dbl(model, ~summary(.x)$adj.r.squared),
-    p_value = map_dbl(model, ~summary(.x)$coefficients[2, 4]),
-    n = map_int(model, ~length(.x$residuals)),
-    label = sprintf("y = %.2fx + %.2f\nR² = %.3f (adj. %.3f)\np < %.4f\nn = %d",
-                    slope, intercept, r2, adj_r2, p_value, n)
-  )
-
 f_fit_av %>% 
-  filter(use_surface | pres != 1) %>%
-  filter(f_corrected <= 1) %>% 
-  ggplot(aes(x = f_corrected, y = chl_comb)) +
-  geom_abline(slope = 1, intercept = 0, 
-              linetype = "dashed", color = "gray40", linewidth = 0.8) +
-  geom_smooth(aes(group = id), method = "lm", se = TRUE, 
-              linewidth = 0.5, alpha = 0.3, color = "steelblue") +
-  geom_smooth(method = "lm", se = TRUE, 
-              linewidth = 1.5, alpha = 0.3, color = "black") +
-  geom_point(size = 3, alpha = 0.6) +
-  geom_text(data = fit_stats_lb,
-            aes(x = -Inf, y = Inf, label = label),
-            hjust = -0.05, vjust = 1.1,
-            size = 4.5, fontface = "italic",
-            inherit.aes = FALSE) +
-  facet_wrap(~ctdNum, scales = "free",
-             labeller = labeller(ctdNum = ~paste("Sensor", .))) +
+  select(id, date, station, ctdNum, slope, f_dm) %>% 
+  group_by(id, date, station, ctdNum, slope) %>% 
+  summarise(max_f_dm = max(f_dm, na.rm = TRUE), .groups = "drop") %>% 
+  mutate(biomass_cat = case_when(
+    max_f_dm < 1 ~ "Low (<1)",
+    max_f_dm >= 1 & max_f_dm <= 4 ~ "Moderate (1-4)",
+    max_f_dm > 4 ~ "High (>4)"
+  ),
+  biomass_cat = factor(biomass_cat, levels = c("Low (<1)", "Moderate (1-4)", "High (>4)"))) %>% 
+  ggplot(aes(x = biomass_cat, y = slope, fill = biomass_cat)) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 2, alpha = 0.6) +
+  scale_fill_brewer(palette = "YlGn", direction = 1) +
   labs(
-    x = "CTD Fluorescence (f_dm)",
-    y = expression(paste("Discrete Chlorophyll (mg m"^-3, ")")),
-    title = "CTD Fluorescence Calibrations by Sensor",
-    subtitle = "Each blue line represents one cast's linear regression; black line shows overall fit; dashed line shows 1:1"
+    x = expression(paste("Maximum profile fluorescence (mg ", m^{-3}, ")")),
+    y = "Calibration slope",
   ) +
-  theme_bw(base_size = 16) +
+  facet_grid(ctdNum ~ ., scales = "free_y") +
+  theme_bw() +
   theme(
     legend.position = "none",
+    strip.background = element_rect(fill = "grey90"),
     panel.grid.minor = element_blank(),
-    strip.background = element_rect(fill = "gray90"),
-    strip.text = element_text(size = 14, face = "bold"),
-    plot.title = element_text(size = 18, face = "bold"),
-    plot.subtitle = element_text(size = 14),
-    axis.title = element_text(size = 14),
-    axis.text = element_text(size = 12),
-    aspect.ratio = 1
+    text = element_text(size = 28, color = "black")
   )
 
-ggsave(here("figures", "fluorescence_calibration_by_sensor_lb.png"),
-       width = 12, height = 10, dpi = 300)
+ggsave(here("figures", "slope_by_biomass.png"), width = 8, height = 10, dpi = 300)
 ```
 
 ```{r}
-# Function to create combined profile + scatter plot for any cast
-plot_cast_detailed <- function(cast_id) {
-  # Parse date, station, and optionally ctdNum from cast_id
-  parts <- strsplit(cast_id, "-")[[1]]
-  cast_date <- as.Date(paste(parts[1:3], collapse = "-"))
-  cast_station <- parts[4]
-  
-  # Check if ctdNum is included in cast_id (e.g., "2024-05-15-QU39-670")
-  if (length(parts) == 5) {
-    cast_ctd <- parts[5]
-    profile_data <- f_dm %>%  # Changed from f_corrected
-      filter(date == cast_date, station == cast_station, ctdNum == cast_ctd)
-    cast_data <- f_fit_multi %>%
-      filter(date == cast_date, station == cast_station, ctdNum == cast_ctd)
-  } else {
-    # Original behavior - get all data for that date/station
-    profile_data <- f_dm %>%  # Changed from f_corrected
-      filter(date == cast_date, station == cast_station)
-    cast_data <- f_fit_multi %>%
-      filter(date == cast_date, station == cast_station)
-  }
-  
-  if (nrow(profile_data) == 0) {
-    stop(paste("No profile data found for cast:", cast_id))
-  }
-  
-  # Get sensor info
-  sensor <- profile_data$ctdNum[1]
-  sensor_med <- sensor_medians %>% filter(ctdNum == sensor)
-  
-  # Get cast info - match on full ID including ctdNum
-  cast_info <- model %>% 
-    filter(id == cast_id)
-  
-  # Handle missing cast_info - default to using surface
-  if (nrow(cast_info) == 0) {
-    warning(paste("Cast", cast_id, "not found in model_flagged. Using surface by default."))
-    use_surface <- TRUE
-  } else {
-    use_surface <- cast_info$use_surface[1]
-  }
-  
-  # Fit model (potentially excluding surface)
-  if (use_surface) {
-    fit_data <- cast_data %>% filter(!is.na(chl_comb), !is.na(f_corrected))
-  } else {
-    fit_data <- cast_data %>% filter(!is.na(chl_comb), !is.na(f_corrected), pres != 1)
-  }
-  
-  cast_model <- lm(chl_comb ~ f_corrected, data = fit_data)
-  cast_slope <- coef(cast_model)[2]
-  cast_intercept <- coef(cast_model)[1]
-  r2 <- summary(cast_model)$r.squared
-  p_val <- summary(cast_model)$coefficients[2, 4]
-  
-  # Equation text
-  eq_label <- sprintf(
-    "Cast: y = %.2fx + %.2f\nMedian: y = %.2fx + %.2f\nR² = %.2f, p = %.4f",
-    cast_slope, cast_intercept,
-    sensor_med$median_slope, sensor_med$median_intercept,
-    r2, p_val
+f_fit_av %>% 
+  select(id, date, station, ctdNum, slope, f_dm) %>% 
+  group_by(id, date, station, ctdNum, slope) %>% 
+  summarise(max_f_dm = max(f_dm, na.rm = TRUE), .groups = "drop") %>% 
+  mutate(slope_cat = case_when(
+    slope < 1 ~ "Slope < 1\n(Overestimate)",
+    slope >= 1 ~ "Slope ≥ 1\n(Underestimate)"
+  ),
+  slope_cat = factor(slope_cat, levels = c("Slope < 1\n(Overestimate)", "Slope ≥ 1\n(Underestimate)"))) %>% 
+  ggplot(aes(x = slope_cat, y = max_f_dm, fill = slope_cat)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 2, alpha = 0.6) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    x = "Calibration slope category",
+    y = expression(paste("Maximum profile fluorescence (mg ", m^{-3}, ")")),
+  ) +
+  facet_grid(ctdNum ~ .) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "grey90"),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 28, color = "black")
   )
-  
-  # PROFILE PLOT - using full CTD profile
-  profile_plot <- profile_data %>%
-    filter(pres < 50) %>%
-    ggplot(aes(y = pres)) +
-    geom_ribbon(aes(xmin = f_lower - offset, xmax = f_upper - offset),  # Apply offset to ribbons
-                fill = "#2E86AB", alpha = 0.3) +
-    geom_line(aes(x = f_corrected, color = "CTD Fluorescence"), 
-              linewidth = 1, orientation = "y") +
-    geom_point(data = cast_data %>% filter(pres < 50),
-               aes(x = chl_comb, color = "Discrete Samples"), 
-               size = 3, shape = 16) +
-    scale_y_reverse(name = "Pressure (dbar)") +
-    scale_x_continuous(name = "Chlorophyll (µg/L)") +
-    scale_color_manual(
-      name = "",
-      values = c("CTD Fluorescence" = "#2E86AB", 
-                 "Discrete Samples" = "#A23B72"),
-      breaks = c("CTD Fluorescence", "Discrete Samples")
-    ) +
-    theme_bw(base_size = 14) +
-    theme(
-      legend.position = "top",
-      legend.text = element_text(size = 12),
-      panel.grid.minor = element_blank(),
-      plot.title = element_text(face = "bold", size = 14)
-    ) +
-    labs(title = "A) Fluorescence Profile")
-  
-  # Calculate axis limits for scatter
-  axis_min <- min(c(cast_data$f_corrected, cast_data$chl_comb), na.rm = TRUE)
-  axis_max <- max(c(cast_data$f_corrected, cast_data$chl_comb), na.rm = TRUE)
-  buffer <- (axis_max - axis_min) * 0.05
-  axis_limits <- c(max(0, axis_min - buffer), axis_max + buffer)
-  
-  # SCATTER PLOT - only discrete matches
-  scatter_plot <- cast_data %>%
-    filter(!is.na(chl_comb), !is.na(f_corrected)) %>%
-    ggplot(aes(x = f_corrected, y = chl_comb, color = as.factor(pres))) +
-    geom_abline(intercept = 0, slope = 1, 
-                linetype = "dashed", color = "gray50", linewidth = 0.8) +
-    geom_abline(slope = sensor_med$median_slope, 
-                intercept = sensor_med$median_intercept,
-                color = "blue", linewidth = 1.2, linetype = "solid") +
-    geom_smooth(data = fit_data,
-                aes(x = f_corrected, y = chl_comb),
-                method = "lm", se = TRUE,
-                color = "red", fill = "red",
-                linewidth = 1, alpha = 0.2,
-                inherit.aes = FALSE) +
-    geom_point(size = 3) +
-    scale_color_brewer(
-      name = "Pressure\n(dbar)",
-      palette = "Set2"
-    ) +
-    scale_x_continuous(name = "CTD Fluorescence (µg/L)", 
-                       limits = axis_limits) +
-    scale_y_continuous(name = "Discrete Chlorophyll (µg/L)", 
-                       limits = axis_limits) +
-    coord_fixed(ratio = 1) +
-    theme_bw(base_size = 14) +
-    theme(
-      legend.position = "right",
-      panel.grid.minor = element_blank(),
-      plot.title = element_text(face = "bold", size = 14)
-    ) +
-    labs(
-      title = "B) CTD vs Discrete Chlorophyll",
-      subtitle = paste0(
-        "Red = cast fit | Blue = sensor median | Dashed = 1:1",
-        ifelse(!use_surface, " | Surface excluded", "")
-      )
-    ) +
-    annotate("text", 
-             x = axis_limits[1], 
-             y = axis_limits[2], 
-             label = eq_label,
-             hjust = -0.05, 
-             vjust = 1.1,
-             size = 3.5,
-             fontface = "italic")
-  
-  # COMBINE PLOTS
-  combined_plot <- profile_plot + scatter_plot +
-    plot_annotation(
-      title = paste0("Cast: ", cast_id, " | Sensor: ", sensor),
-      theme = theme(plot.title = element_text(size = 16, face = "bold"))
-    )
-  
-  return(combined_plot)
-}
+
+ggsave(here("figures", "biomass_by_slope.png"), width = 8, height = 10, dpi = 300)
 ```
 
 ```{r}
-# Usage
-plot_cast_detailed("2024-04-12-KC10-211567")
+f_fit_av %>% 
+  select(id, date, station, ctdNum, slope) %>% 
+  distinct() %>% 
+  ggplot(aes(x = date, y = slope, color = as.factor(ctdNum))) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  geom_line(alpha = 0.5, size = 2) +
+  geom_point(size = 3) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  scale_color_brewer(palette = "Dark2", name = "CTD Sensor") +
+  labs(
+    x = "Date",
+    y = "Calibration slope",
+    title = "Fluorometer calibration slopes over time"
+  ) +
+  facet_grid(ctdNum ~ ., scales = "free_y") +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "grey90"),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 28, color = "black")
+  )
 
-# plot_cast_detailed("2016-08-12-FZH01-18066")
-# plot_cast_detailed("2016-08-12-FZH01-1907467")
-
-# plot_cast_detailed("2017-08-31-FZH01-18066")
-# plot_cast_detailed("2017-08-31-FZH01-1907467")
-
-# ggsave(here("figures", "qc-2021-04-10-KC10-80217-issue.png"),
-#        width = 12, height = 10, dpi = 300)
+ggsave(here("figures", "slope_timeseries.png"), width = 14, height = 10, dpi = 300)
 ```
+
+
 
 
 ```{r}
@@ -1256,7 +1195,7 @@ model_few <- f_fit_few %>%
 
 # First, calculate sensor-level fits and get statistics
 sensor_fit_stats_few <- f_fit_few %>%
-  filter(!is.na(chl_comb) & !is.na(f_corrected)) %>%
+  filter(!is.na(chl_comb) & !is.na(f_dm)) %>%
   filter(!id %in% c("2013-05-29-KC10-18032",
                     "2013-07-19-KC10-18032",
                     "2014-05-19-FZH01-18066",
@@ -1267,7 +1206,7 @@ sensor_fit_stats_few <- f_fit_few %>%
                     )) %>% 
   group_by(ctdNum) %>%
   summarise({
-    model_sensor <- lm(chl_comb ~ f_corrected, data = cur_data())
+    model_sensor <- lm(chl_comb ~ f_dm, data = cur_data())
     data.frame(
       slope = round(coef(model_sensor)[2], 3),
       intercept = round(coef(model_sensor)[1], 3),
@@ -1287,7 +1226,7 @@ f_fit_few %>%
                     "2014-06-09-FZH01-18066",
                     "2014-06-19-FZH01-18066"
                     )) %>%
-  ggplot(aes(x = f_corrected, y = chl_comb)) +
+  ggplot(aes(x = f_dm, y = chl_comb)) +
   geom_point(alpha = 0.6, size = 2) +
   geom_smooth(method = "lm", se = TRUE, color = "blue", linewidth = 1) +
   geom_text(
@@ -1335,35 +1274,35 @@ fit_stats <- f_fit_combined %>%
   group_by(ctdNum) %>%
   summarise(
     # Overall model (all data)
-    model = list(lm(chl_comb ~ f_corrected)),
+    model = list(lm(chl_comb ~ f_dm)),
     
     # Separate fit excluding the two special casts (sensor 80217 only)
     slope_excl = if(first(ctdNum) == "80217") {
-      coef(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
+      coef(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
                 filter(!id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))[2]
     } else {
       NA_real_
     },
     intercept_excl = if(first(ctdNum) == "80217") {
-      coef(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
+      coef(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
                 filter(!id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))[1]
     } else {
       NA_real_
     },
     r2_excl = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
+      summary(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
                    filter(!id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))$r.squared
     } else {
       NA_real_
     },
     adj_r2_excl = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
+      summary(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
                    filter(!id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))$adj.r.squared
     } else {
       NA_real_
     },
     p_value_excl = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
+      summary(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
                    filter(!id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))$coefficients[2, 4]
     } else {
       NA_real_
@@ -1376,31 +1315,31 @@ fit_stats <- f_fit_combined %>%
     
     # Separate fit for ONLY the two special casts combined (sensor 80217 only)
     slope_april = if(first(ctdNum) == "80217") {
-      coef(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
+      coef(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
                 filter(id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))[2]
     } else {
       NA_real_
     },
     intercept_april = if(first(ctdNum) == "80217") {
-      coef(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
+      coef(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
                 filter(id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))[1]
     } else {
       NA_real_
     },
     r2_april = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
+      summary(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
                    filter(id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))$r.squared
     } else {
       NA_real_
     },
     adj_r2_april = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
+      summary(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
                    filter(id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))$adj.r.squared
     } else {
       NA_real_
     },
     p_value_april = if(first(ctdNum) == "80217") {
-      summary(lm(chl_comb ~ f_corrected, data = pick(everything()) %>% 
+      summary(lm(chl_comb ~ f_dm, data = pick(everything()) %>% 
                    filter(id %in% c("2020-04-30-KC10-80217", "2021-04-10-KC10-80217"))))$coefficients[2, 4]
     } else {
       NA_real_
@@ -1436,7 +1375,7 @@ fit_stats <- f_fit_combined %>%
 
 # Create plot with both data types
 f_fit_combined %>% 
-  ggplot(aes(x = f_corrected, y = chl_comb)) +
+  ggplot(aes(x = f_dm, y = chl_comb)) +
   geom_abline(slope = 1, intercept = 0, 
               linetype = "dashed", color = "gray40", linewidth = 0.8) +
   # Add regression line excluding April casts (sensor 80217)
@@ -1490,6 +1429,81 @@ f_fit_combined %>%
 ggsave(here("figures", "fluorescence_calibration_by_sensor_with_single_dark.png"),
        width = 12, height = 10, dpi = 300)
 ```
+```{r}
+# Filter combined data to low biomass profiles
+f_fit_low <- f_fit_combined %>% 
+  group_by(id) %>% 
+  filter(max(f_dm, na.rm = TRUE) <= 1) %>% 
+  ungroup()
+
+# Calculate fit statistics for low biomass only
+fit_stats_low <- f_fit_low %>% 
+  group_by(ctdNum) %>%
+  summarise(
+    model = list(lm(chl_comb ~ f_dm)),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    slope = map_dbl(model, ~coef(.x)[2]),
+    intercept = map_dbl(model, ~coef(.x)[1]),
+    r2 = map_dbl(model, ~summary(.x)$r.squared),
+    adj_r2 = map_dbl(model, ~summary(.x)$adj.r.squared),
+    p_value = map_dbl(model, ~summary(.x)$coefficients[2, 4]),
+    n = map_int(model, ~length(.x$residuals)),
+    label = sprintf("y = %.2fx + %.2f\nR² = %.3f (adj. %.3f)\np < %.4f\nn = %d",
+                    slope, intercept, r2, adj_r2, p_value, n)
+  )
+
+# Create plot
+f_fit_low %>% 
+  ggplot(aes(x = f_dm, y = chl_comb)) +
+  geom_abline(slope = 1, intercept = 0, 
+              linetype = "dashed", color = "gray40", linewidth = 0.8) +
+  geom_smooth(data = ~filter(., data_type == "multiple_depths"),
+              aes(group = id), method = "lm", se = TRUE, 
+              linewidth = 0.5, alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, 
+              linewidth = 1.5, alpha = 0.3, color = "black") +
+  geom_point(aes(color = data_type), size = 3, alpha = 0.6) +
+  scale_color_manual(
+    values = c("multiple_depths" = "gray30", "single_depth" = "orange"),
+    labels = c("multiple_depths" = "Multiple depths", "single_depth" = "Single depth"),
+    name = "Data type"
+  ) +
+  geom_text(data = fit_stats_low,
+            aes(x = Inf, y = -Inf, label = label),
+            hjust = 1.05, vjust = -0.1,
+            size = 3, fontface = "italic",
+            inherit.aes = FALSE) +
+  facet_wrap(~ctdNum, scales = "free",
+             labeller = labeller(ctdNum = ~paste("Sensor", .))) +
+  labs(
+    x = "CTD Fluorescence (f_dm)",
+    y = expression(paste("Discrete Chlorophyll (mg m"^-3, ")")),
+    title = "CTD Fluorescence Calibrations by Sensor (Low Biomass)",
+    subtitle = expression(paste("Profiles where max f_dm ≤ 1 mg m"^-3, 
+                                 "; blue = individual casts, black = overall fit, dashed = 1:1"))
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(size = 14, face = "bold"),
+    plot.title = element_text(size = 18, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    aspect.ratio = 1
+  )
+
+ggsave(here("figures", "fluorescence_calibration_by_sensor_low_biomass.png"),
+       width = 12, height = 10, dpi = 300)
+```
+
+
+
+
 ```{r}
 # Create calibration statistics datasheet
 calibration_stats <- fit_stats %>%
@@ -1576,21 +1590,13 @@ f_dm_calibrated <- f_dm %>%
   ) %>%
   # Apply the calibration
   mutate(
-    f_calibrated = slope * f_corrected 
+    f_calibrated = slope * f_dm 
   ) %>%
   # Clean up temporary columns
   select(-is_april_cast, -is_excl_april)
 
 # Save to CSV
 write_csv(f_dm_calibrated, here("outputs", "ctd_offset_slope_corrected_fluorescence_2025-11-19.csv"))
-```
-
-```{r}
-f_dm_calibrated %>% 
-  filter(pres == 5) %>% 
-  ggplot(aes(x = date, y = f_calibrated, color = station)) +
-  geom_line() +
-  geom_point()
 ```
 
 ```{r}
