@@ -90,8 +90,10 @@ plot_cast_detailed <- function(cast_id) {
   profile_plot <- profile_data %>%
     filter(pres < 50) %>%
     ggplot(aes(y = pres)) +
-    geom_ribbon(aes(xmin = f_lower - f_dm, xmax = f_upper - f_dm),  # Apply offset to ribbons
-                fill = "#2E86AB", alpha = 0.3) +
+    # geom_ribbon(aes(xmin = f_lower - f_dm, xmax = f_upper + f_dm),  # Apply offset to ribbons
+    #             fill = "#2E86AB", alpha = 0.3) +
+    geom_ribbon(aes(xmin = f_lower, xmax = f_upper),  # SD bounds
+            fill = "#2E86AB", alpha = 0.3) +
     geom_line(aes(x = f_dm, color = "CTD Fluorescence"), 
               linewidth = 1, orientation = "y") +
     geom_point(data = cast_data %>% filter(pres < 50),
@@ -193,7 +195,7 @@ c <- read_csv(here("files", "2025-11-03_HakaiData_chlorophyll.csv"))
 hplc <- read.csv(here("files", "2025-11-18_HakaiData_hplc.csv"))
 
 # Downloading my fit flagging sheet
-fit_flag <- read_csv(here("outputs", "ctd_discrete_flags2.csv"))
+fit_flag <- read_csv(here("outputs", "ctd_discrete_flags3.csv"))
 
 buoy <- read.csv(here("outputs", "qc_buoy_2025-09-12.csv"))
 
@@ -800,6 +802,7 @@ f_fit_multi <- f_fit %>%
   group_by(date, station, ctdNum) %>%
   filter(n() >= 3) %>%  # Only keep casts with 3+ samples for cast-specific fits
   ungroup() %>%
+  filter(!(id == "2023-08-16-KC10-211567" & pres == 1)) %>%
   filter(!(id == "2023-03-18-KC10-18032" & pres == 30)) %>% 
   filter(!(id == "2014-06-19-KC10-18066" & pres == 5)) %>% 
   filter(!(id == "2017-08-31-KC10-18066" & pres == 1)) %>% 
@@ -980,6 +983,11 @@ fit_flag_clean <- fit_flag %>%
   unite(id, c(id, ctdNum), sep = "-", remove = F) %>% 
   select(id,
          slope_flag = flag)
+
+fit_flag_quench <- fit_flag %>% 
+  unite(id, c(id, ctdNum), sep = "-", remove = F) %>%
+  select(id, quenched) %>% 
+  filter(quenched == "y")
 
 f_fit_av <- f_fit_with_model %>% 
   left_join(fit_flag_clean) %>% 
@@ -1500,7 +1508,26 @@ f_fit_low %>%
 ggsave(here("figures", "fluorescence_calibration_by_sensor_low_biomass.png"),
        width = 12, height = 10, dpi = 300)
 ```
+```{r}
+# Usage
+plot_cast_detailed("2017-10-12-KC10-1907467")
 
+# plot_cast_detailed("2016-08-12-FZH01-18066")
+# plot_cast_detailed("2016-08-12-FZH01-1907467")
+
+# plot_cast_detailed("2017-08-31-FZH01-18066")
+# plot_cast_detailed("2017-08-31-FZH01-1907467")
+
+# ggsave(here("figures", "qc-2021-04-10-KC10-80217-issue.png"),
+#        width = 12, height = 10, dpi = 300)
+```
+
+```{r}
+f_offset %>% 
+  filter(date == "2018-02-19" & station == "FZH01") %>% 
+  ggplot(aes(x = f_offset, y = pres*-1, color = as.factor(castpk))) +
+  geom_line(orientation = "y")
+```
 
 
 
@@ -1714,9 +1741,9 @@ test2 <- f_dm_calibrated2 %>%
 ```{r}
 f_dm_calibrated2 %>% 
   filter(pres < 50) %>%
-  filter(id %in% c("2016-09-23-FZH01-18066")) %>% 
+  filter(id %in% c("2021-04-10-KC10-80217")) %>% 
   ggplot(aes(y = pres)) +
-  geom_line(aes(x = f_dm, color = "CTD Fluorescence"), 
+  geom_line(aes(x = f_dm*0.65, color = "CTD Fluorescence"), 
             linewidth = 1, orientation = "y") +
   geom_line(aes(x = f_calibrated, color = "CTD Fluorescence"), 
             linewidth = 1, orientation = "y", color = "green") +
@@ -1740,6 +1767,8 @@ f_dm_calibrated2 %>%
       plot.title = element_text(face = "bold", size = 14)
     ) 
 ```
+
+
 ```{r}
 #profiles to revisit
 #2015-05-01-KC10-18032

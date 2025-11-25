@@ -1,0 +1,300 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(here)
+library(patchwork)
+library(readxl)
+library(gsw)
+library(zoo)
+library(broom)
+library(RColorBrewer)
+```
+
+```{r}
+#Upload the full 5m chemtax timeseries - processing in same way as manuscript
+chem <- read_csv(here("files", "chemtax_single_2025-11-21.csv"))
+```
+
+```{r}
+#Working with chemtax data to make it easy to plot
+
+#Making the date column a date format
+chem <- chem %>% 
+  mutate(date = lubridate::mdy(Date)) %>% 
+  select(date,
+         station = Station,
+         depth,
+         cyan = Cyanobacteria,
+         hapt = Hapto, 
+         GA = `Prasinophytes-3`,
+         cryp = Cryptophytes,
+         dino = `Dinoflagellates-1`,
+         dict = Dictyo,
+         raph = Raphido,
+         diat = `Diatoms-1`
+         )
+
+#Pivoting to long/tidy for plotting in ggplot
+chem_c_long <- chem %>% 
+  pivot_longer(c(cyan:diat), names_to = "group", values_to = "contribution")
+
+#Calculating TChla for each sample
+chem_c_tchla <- chem_c_long %>% 
+  group_by(date, station, depth, group) %>% 
+  summarise(contribution = mean(contribution)) %>% 
+  ungroup() %>% 
+  group_by(date, station, depth) %>% 
+  mutate(tchla = sum(contribution)) %>% 
+  ungroup() %>% 
+  mutate(month = lubridate::month(date),
+         year = lubridate::year(date),
+    month_surv = case_when(date == "2020-11-27" ~ 12,
+                                date == "2022-07-28" ~ 8,
+                                date == "2020-04-30" ~ 5,
+                                TRUE ~ as.numeric (month))) %>% 
+  mutate(month_mid = 15) %>% 
+  unite(month_date, c("year", "month_surv", "month_mid"), sep = "-") %>% 
+  mutate(month_date = lubridate::ymd(month_date))
+
+#Good to move forward
+```
+
+```{r}
+#Setting plotting order phytoplankton groups
+
+#Order phytoplankton groups roughly from smallest to largest - create order list
+order_chem <- c("cyan",
+                "hapt",
+                "GA",
+                "cryp",
+                "dino",
+                "dict",
+                "raph",
+                "diat")
+
+#Chemtax full data - Specify order of phyto groups for figures
+chem_c_tchla <- arrange(mutate(chem_c_tchla,
+                                group = factor(group,
+                                levels = order_chem)))
+```
+
+```{r}
+#Set Color palette for plotting. Currently based on QU39 manuscript. Brewer has some good ones for R style.
+# Alternative version with more distinct colors (no similar reds)
+npg_distinct_colors <- c(
+  "#E64B35",  # Red
+  "#4DBBD5",  # Light blue  
+  "#00A087",  # Teal
+  "#3C5488",  # Dark blue
+  "#F39B7F",  # Orange
+  "#8491B4",  # Purple
+  "#91D1C2",  # Light teal
+  "#FFC107",  # Golden yellow (replacing second red)
+  "#7E6148",  # Brown
+  "#B09C85"   # Light brown
+)
+
+scale_fill_npg_distinct <- function(...) {
+  ggplot2::scale_fill_manual(values = npg_distinct_colors, ...)
+}
+
+scale_color_npg_distinct <- function(...) {
+  ggplot2::scale_color_manual(values = npg_distinct_colors, ...)
+}
+```
+
+```{r}
+# Define cutoff dates
+cutoff_2020 <- as.Date("2020-02-11")
+cutoff_2024 <- as.Date("2024-01-01")
+
+# Split data into three periods
+data_area_early <- chem_c_tchla %>% filter(date < cutoff_2020)
+data_bar_2020 <- chem_c_tchla %>% filter(date == cutoff_2020)
+data_area_mid <- chem_c_tchla %>% filter(date > cutoff_2020 & date < cutoff_2024)
+data_bars_late <- chem_c_tchla %>% filter(date >= cutoff_2024)
+
+ggplot() +
+  # Area plot for pre-2020-02-11
+  geom_area(data = data_area_early,
+            aes(x = date, y = contribution, fill = fct_rev(group)),
+            position = "stack", alpha = 0.9) +
+  # Single bar for 2020-02-11
+  geom_bar(data = data_bar_2020,
+           aes(x = date, y = contribution, fill = fct_rev(group)),
+           position = "stack", stat = "identity", width = 20) +
+  # Area plot for mid period
+  geom_area(data = data_area_mid,
+            aes(x = date, y = contribution, fill = fct_rev(group)),
+            position = "stack", alpha = 0.9) +
+  # Bar plot for 2024-2025
+  geom_bar(data = data_bars_late,
+           aes(x = date, y = contribution, fill = fct_rev(group)),
+           position = "stack", stat = "identity", width = 20) +
+  facet_grid(station ~ .) +
+  scale_fill_npg_distinct() +
+  scale_x_date(limits = as.Date(c("2016-01-01", "2025-12-31")),
+               expand = c(0, 0),
+               date_breaks = "1 year", date_labels = "%Y") +
+  labs(
+    y = expression(paste("Phytoplankton biomass (mg ", m^{-3}, ")")),
+    title = "Phytoplankton community composition"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    legend.key.height = unit(0.6, "cm"),
+    legend.key.width = unit(0.8, "cm"),
+    legend.title = element_blank(),
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.title.x = element_blank(),
+    text = element_text(size = 28, color = "black")
+  )
+
+ggsave(here("figures", "phytoplankton_community_composition.png"), 
+       width = 16, height = 8, dpi = 300)
+```
+
+```{r}
+# Add TChla as a group in long format
+chem_c_tchla_with_total <- chem_c_tchla %>%
+  bind_rows(
+    chem_c_tchla %>%
+      distinct(date, station, depth, tchla) %>%
+      mutate(group = "TChla",
+             contribution = tchla)
+  )
+
+# Find dates where both stations were sampled
+shared_dates <- chem_c_tchla_with_total %>%
+  filter(station %in% c("KC10", "FZH01")) %>%
+  group_by(date) %>%
+  filter(n_distinct(station) == 2) %>%
+  ungroup() %>%
+  pull(date) %>%
+  unique()
+
+# Prepare data for comparison - wide format
+compare_data <- chem_c_tchla_with_total %>%
+  filter(date %in% shared_dates, station %in% c("KC10", "FZH01")) %>%
+  group_by(date, station, group) %>%
+  summarise(
+    contribution = sum(contribution, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = station,
+    values_from = contribution,
+    names_sep = "_"
+  )
+
+# Calculate relative contribution (excluding TChla)
+compare_data_rel <- compare_data %>%
+  filter(group != "TChla") %>%
+  group_by(date) %>%
+  mutate(
+    rel_FZH01 = FZH01 / sum(FZH01, na.rm = TRUE),
+    rel_KC10 = KC10 / sum(KC10, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# Function to get regression stats
+get_stats <- function(x, y) {
+  model <- lm(y ~ x)
+  r2 <- summary(model)$r.squared
+  slope <- coef(model)[2]
+  intercept <- coef(model)[1]
+  p_val <- summary(model)$coefficients[2, 4]
+  n <- sum(!is.na(x) & !is.na(y))
+  sprintf("y = %.2fx + %.2f\nR² = %.3f, p = %.4f\nn = %d", slope, intercept, r2, p_val, n)
+}
+
+# Stats for absolute
+stats_abs <- compare_data %>%
+  group_by(group) %>%
+  summarise(
+    label = get_stats(FZH01, KC10),
+    .groups = "drop"
+  )
+
+# Stats for relative
+stats_rel <- compare_data_rel %>%
+  group_by(group) %>%
+  summarise(
+    label = get_stats(rel_FZH01, rel_KC10),
+    .groups = "drop"
+  )
+
+# Panel 1: Absolute contribution (includes TChla)
+p1 <- compare_data %>%
+  ggplot(aes(x = FZH01, y = KC10, color = group)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.2, linewidth = 0.8) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_text(data = stats_abs,
+            aes(x = Inf, y = -Inf, label = label),
+            hjust = 1.05, vjust = -0.1,
+            size = 4, fontface = "italic",
+            show.legend = FALSE) +
+  facet_wrap(~ group, scales = "free") +
+  scale_color_npg_distinct() +
+  labs(
+    x = expression(paste("FZH01 (mg ", m^{-3}, ")")),
+    y = expression(paste("KC10 (mg ", m^{-3}, ")")),
+    title = "Absolute contribution by group"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 28, color = "black")
+  )
+
+# Panel 2: Relative contribution (excludes TChla)
+p2 <- compare_data_rel %>%
+  ggplot(aes(x = rel_FZH01, y = rel_KC10, color = group)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.2, linewidth = 0.8) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_text(data = stats_rel,
+            aes(x = Inf, y = -Inf, label = label),
+            hjust = 1.05, vjust = -0.1,
+            size = 4, fontface = "italic",
+            show.legend = FALSE) +
+  facet_wrap(~ group, scales = "free") +
+  scale_color_npg_distinct() +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = "FZH01 relative contribution",
+    y = "KC10 relative contribution",
+    title = "Relative contribution by group"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 28, color = "black")
+  )
+
+# Combine
+p1 / p2
+
+ggsave(here("figures", "station_comparison_by_group.png"), 
+       width = 14, height = 18, dpi = 300)
+```
+
+
+
+
