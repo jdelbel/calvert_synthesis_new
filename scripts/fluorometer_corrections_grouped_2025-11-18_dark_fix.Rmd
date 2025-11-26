@@ -195,11 +195,11 @@ c <- read_csv(here("files", "2025-11-03_HakaiData_chlorophyll.csv"))
 hplc <- read.csv(here("files", "2025-11-18_HakaiData_hplc.csv"))
 
 # Downloading my fit flagging sheet
-fit_flag <- read_csv(here("outputs", "ctd_discrete_flags3.csv"))
+fit_flag <- read_csv(here("outputs", "ctd_discrete_flags5.csv"))
 
 buoy <- read.csv(here("outputs", "qc_buoy_2025-09-12.csv"))
 
-
+quench_fit <- read.csv(here("outputs", "quench_correction_fits.csv"))
 ```
 
 ```{r}
@@ -226,6 +226,9 @@ f <- f %>%
 ```
 
 ```{r}
+f_saturate <- f %>% 
+  filter(date %in% c("2022-03-09", "2022-09-09"))
+
 #Removing bad or suspect profiles, but leaving shallow casts.
 f <- f %>% 
   left_join(flags) %>% 
@@ -1510,7 +1513,7 @@ ggsave(here("figures", "fluorescence_calibration_by_sensor_low_biomass.png"),
 ```
 ```{r}
 # Usage
-plot_cast_detailed("2017-10-12-KC10-1907467")
+plot_cast_detailed("2014-06-19-KC10-18066")
 
 # plot_cast_detailed("2016-08-12-FZH01-18066")
 # plot_cast_detailed("2016-08-12-FZH01-1907467")
@@ -1642,6 +1645,389 @@ write_csv(f_dm_calibrated, here("outputs", "ctd_offset_slope_corrected_fluoresce
 ```
 
 ```{r}
+plot_npq_correction <- function(profile_id, data = f_dm_calibrated, max_depth = 50,
+                                transition_threshold = 0.1, span = 0.75) {
+  
+  # Filter data for this profile
+  profile_data <- data %>% 
+    filter(id == profile_id)
+  
+  # Fit to all discrete samples (including deep)
+  discrete_data <- profile_data %>% 
+    filter(!is.na(chl_comb))
+  
+  # Create fitted profile using loess
+  if(nrow(discrete_data) >= 3) {
+    loess_fit <- loess(chl_comb ~ pres, 
+                       data = discrete_data, 
+                       span = span)
+    
+    # Predict at all pressure levels
+    profile_data$chl_fitted_raw <- predict(loess_fit, newdata = profile_data)
+    
+    # Calculate difference between loess fit and slope-corrected
+    profile_data <- profile_data %>%
+      mutate(
+        diff = abs(chl_fitted_raw - f_calibrated),
+        # Find transition depth (first depth where difference < threshold)
+        transition_depth = {
+          trans_idx <- which(diff < transition_threshold & pres > 5)  # Only look below 5m
+          if(length(trans_idx) > 0) min(pres[trans_idx]) else max(pres)
+        }
+      ) %>%
+      mutate(
+        # Use loess above transition, slope-corrected below
+        chl_fitted = if_else(pres < transition_depth, 
+                             chl_fitted_raw, 
+                             f_calibrated)
+      )
+    
+    transition_depth_value <- unique(profile_data$transition_depth)
+    
+  } else {
+    profile_data$chl_fitted <- NA
+    transition_depth_value <- NA
+  }
+  
+  # Calculate 0-30m integrated values (trapezoidal integration)
+  integration_data <- profile_data %>%
+    filter(pres <= 30, pres >= 0) %>%
+    arrange(pres)
+  
+  if(nrow(integration_data) > 1) {
+    # Trapezoidal integration
+    integrate_trap <- function(x, y) {
+      sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2, na.rm = TRUE)
+    }
+    
+    int_slope <- integrate_trap(integration_data$pres, integration_data$f_calibrated)
+    int_hybrid <- integrate_trap(integration_data$pres, integration_data$chl_fitted)
+    
+    # Create annotation text
+    annotation_text <- data.frame(
+      x = c(max(profile_data$f_calibrated, na.rm = TRUE) * 0.95,
+            max(profile_data$f_calibrated, na.rm = TRUE) * 0.95),
+      y = c(28, 32),
+      label = c(
+        paste0("Slope: ", round(int_slope, 1), " mg/m²"),
+        paste0("Hybrid: ", round(int_hybrid, 1), " mg/m²")
+      ),
+      color = c("Slope-Corrected", "Hybrid Correction")
+    )
+  } else {
+    annotation_text <- NULL
+  }
+  
+  # Create the plot
+  p <- profile_data %>%
+    filter(pres < max_depth) %>%
+    ggplot(aes(y = pres)) +
+    geom_line(aes(x = f_dm, color = "Raw CTD Fluorescence"), 
+              linewidth = 1, orientation = "y") +
+    geom_line(aes(x = f_calibrated, color = "Slope-Corrected"), 
+              linewidth = 1, orientation = "y") +
+    geom_line(aes(x = chl_fitted, color = "Hybrid Correction"), 
+              linewidth = 1.2, orientation = "y") +
+    geom_point(data = profile_data %>% filter(pres < max_depth, !is.na(chl_comb)),
+               aes(x = chl_comb, color = "Discrete Samples"), 
+               size = 3, shape = 16) +
+    scale_y_reverse(name = "Pressure (dbar)") +
+    scale_x_continuous(name = "Chlorophyll (µg/L)") +
+    scale_color_manual(
+      name = "",
+      values = c("Raw CTD Fluorescence" = "#2E86AB",
+                 "Slope-Corrected" = "#F18F01",
+                 "Hybrid Correction" = "#6A4C93",
+                 "Discrete Samples" = "#A23B72"),
+      breaks = c("Raw CTD Fluorescence", "Slope-Corrected", 
+                 "Hybrid Correction", "Discrete Samples")
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      legend.position = "top",
+      legend.text = element_text(size = 10),
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(face = "bold", size = 14)
+    ) +
+    labs(title = paste("NPQ-Affected Profile:", profile_id),
+         subtitle = if(!is.na(transition_depth_value)) {
+           paste("Transition depth:", round(transition_depth_value, 1), "dbar | Span:", span)
+         } else NULL)
+  
+  # Add color-coded integrated values if available
+  if(!is.null(annotation_text)) {
+    p <- p + geom_text(data = annotation_text,
+                       aes(x = x, y = y, label = label, color = color),
+                       hjust = 1, size = 3.5, fontface = "bold",
+                       show.legend = FALSE)
+  }
+  
+  return(p)
+}
+```
+
+
+```{r}
+# Use it
+plot_npq_correction("2021-04-10-KC10-80217",
+                    span = 0.3,
+                    transition_threshold = 1)
+
+# # Or create plots for all NPQ-affected profiles
+# npq_ids <- unique(f_dm_calibrated$id)  # Your identified NPQ profiles
+# 
+# plots_list <- lapply(npq_ids, plot_npq_correction)
+# 
+# # View them individually or arrange
+# library(patchwork)
+# wrap_plots(plots_list, ncol = 2)
+
+ggsave(here("figures", "quench_correct_examples-2021-04-10-KC10-80217.png"),
+       width = 7,
+       height = 10)
+```
+
+```{r}
+# Function to apply NPQ correction to a single profile
+apply_npq_correction <- function(profile_id, threshold, span, data = f_dm_calibrated) {
+  
+  # Filter data for this profile
+  profile_data <- data %>% 
+    filter(id == profile_id)
+  
+  # Fit to all discrete samples
+  discrete_data <- profile_data %>% 
+    filter(!is.na(chl_comb))
+  
+  # Create fitted profile using loess
+  if(nrow(discrete_data) >= 3) {
+    loess_fit <- loess(chl_comb ~ pres, 
+                       data = discrete_data, 
+                       span = span)
+    
+    # Predict at all pressure levels
+    profile_data$chl_fitted_raw <- predict(loess_fit, newdata = profile_data)
+    
+    # Calculate difference between loess fit and slope-corrected
+    profile_data <- profile_data %>%
+      mutate(
+        diff = abs(chl_fitted_raw - f_calibrated),
+        # Find transition depth
+        transition_depth = {
+          trans_idx <- which(diff < threshold & pres > 5)
+          if(length(trans_idx) > 0) min(pres[trans_idx]) else max(pres)
+        }
+      ) %>%
+      mutate(
+        # Hybrid: loess above transition, slope-corrected below
+        f_calibrated_npq = if_else(pres < transition_depth, 
+                                    chl_fitted_raw, 
+                                    f_calibrated)
+      )
+    
+    # Return only the columns needed for updating
+    return(profile_data %>% select(id, pres, f_calibrated_npq))
+    
+  } else {
+    # If not enough discrete samples, return original
+    return(profile_data %>% 
+           mutate(f_calibrated_npq = f_calibrated) %>%
+           select(id, pres, f_calibrated_npq))
+  }
+}
+
+# Apply corrections to all profiles flagged as "AV"
+npq_profiles <- quench_fit %>% 
+  filter(quench_cor_flag == "AV")
+
+# Apply corrections using pmap
+corrected_profiles <- npq_profiles %>%
+  pmap_dfr(function(id, threshold, span, ...) {
+    apply_npq_correction(id, threshold, span, data = f_dm_calibrated)
+  })
+
+# Add NPQ-corrected column to f_dm_calibrated
+f_dm_calibrated <- f_dm_calibrated %>%
+  left_join(corrected_profiles, by = c("id", "pres")) %>%
+  mutate(
+    # Create new column with NPQ correction applied where flagged
+    f_final = if_else(!is.na(f_calibrated_npq), 
+                      f_calibrated_npq, 
+                      f_calibrated)
+  ) %>%
+  select(-f_calibrated_npq)  # Remove temporary column
+
+# Verify the updates
+f_dm_calibrated %>%
+  filter(id %in% npq_profiles$id) %>%
+  group_by(id) %>%
+  summarise(
+    n_points = n(),
+    mean_f_calibrated = mean(f_calibrated, na.rm = TRUE),
+    mean_f_final = mean(f_final, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+#Wrangling the September 2022 discrete chlorophyll fluorescence profile
+c_interp <- c_join %>% 
+  filter(date %in% c("2022-03-09", "2022-09-09")) %>% 
+  select(date, pres, chla = chl_comb) %>% 
+  mutate(pres = case_when(pres == 0 ~ 1,
+                          TRUE ~ as.numeric(pres)))
+
+#Converting discrete chlorophyll profiles to wide format.
+c_interp_wide <- c_interp %>% 
+  pivot_wider(names_from = "date", values_from = "chla")
+
+#Performing the interpolation.
+
+# Select chlorophyll data and depths
+spec <- c_interp_wide %>%
+  select(`2022-03-09`, `2022-09-09`)
+
+depth <- c_interp_wide$pres
+
+# Interpolate to 1m intervals covering full depth range
+x.new <- seq(1, max(depth), by = 1)  # Goes to 325m now
+sp.interp <- interp.dataset(y = spec, x = depth, xout = x.new,
+                           method = "loess", span = 0.3)
+
+# Create interpolated dataframe
+interp <- as.data.frame(sp.interp) %>% 
+  mutate(pres = x.new) %>% 
+  pivot_longer(cols = 1:2, names_to = "date", values_to = "f_npq") %>% 
+  mutate(date = as.Date(date),
+         station = "KC10",
+         year = year(date),
+         f_interpolated = round(f_npq, 2)) %>% 
+  select(date, station, year, pres, f_interpolated)
+
+f_saturate2 <- f_saturate %>%  
+  select(date, station, ctdNum, year, pres, flu) %>% 
+  left_join(interp) %>% 
+  left_join(c_interp)
+```
+
+```{r}
+plot_saturate_profiles <- function(data = f_saturate2, max_depth = 50) {
+  
+  p <- data %>%
+    filter(pres < max_depth) %>%
+    ggplot(aes(y = pres)) +
+    geom_line(aes(x = flu, color = "Raw Fluorescence"), 
+              linewidth = 1, orientation = "y") +
+    geom_line(aes(x = f_interpolated, color = "Interpolated"), 
+              linewidth = 1, orientation = "y") +
+    geom_point(data = data %>% filter(pres < max_depth, !is.na(chla)),
+               aes(x = chla, color = "Discrete Samples"), 
+               size = 3, shape = 16) +
+    scale_y_reverse(name = "Pressure (dbar)") +
+    scale_x_continuous(name = "Chlorophyll (µg/L)") +
+    scale_color_manual(
+      name = "",
+      values = c("Raw Fluorescence" = "#2E86AB",
+                 "Interpolated" = "#F18F01",
+                 "Discrete Samples" = "#A23B72"),
+      breaks = c("Raw Fluorescence", "Interpolated", "Discrete Samples")
+    ) +
+    facet_wrap(~ date, scales = "free_x") +
+    theme_bw(base_size = 14) +
+    theme(
+      legend.position = "top",
+      legend.text = element_text(size = 10),
+      panel.grid.minor = element_blank(),
+      strip.background = element_rect(fill = "grey90"),
+      strip.text = element_text(face = "bold", size = 11)
+    ) +
+    labs(title = "Fluorescence Profiles by Date")
+  
+  return(p)
+}
+
+# Use it
+plot_saturate_profiles()
+
+ggsave(here("figures", "sensor_issues_2022.png"),
+       width = 7,
+       height = 8)
+```
+
+```{r}
+# Assuming f_saturate2 contains your corrected profiles
+# and you want to use f_interpolated as the corrected fluorescence values
+
+# Prepare the corrected data to match f_dm_calibrated structure
+corrected_data <- f_saturate2 %>%
+  mutate(
+    # Create the id column to match f_dm_calibrated format
+    id = paste(date, station, ctdNum, sep = "-"),  # Adjust if you need ctdNum too
+    # Use f_interpolated as the final corrected value
+    f_final = f_interpolated
+  ) %>%
+  select(id, date, station, year, pres, f_final)  # Keep relevant columns
+
+# Remove old versions of these profiles from f_dm_calibrated (if they exist)
+profiles_to_replace <- unique(corrected_data$id)
+
+f_dm_calibrated <- f_dm_calibrated %>%
+  filter(!id %in% profiles_to_replace)
+
+# Add the corrected profiles back in
+# You'll need to match the column structure - adapt based on your actual columns
+f_dm_calibrated <- bind_rows(
+  f_dm_calibrated,
+  corrected_data %>%
+    # Add any other columns from f_dm_calibrated that are missing
+    mutate(
+      f_dm = NA,  # Add these if needed in your structure
+      f_calibrated = f_final,
+      # Add other columns as needed
+    )
+) %>%
+  arrange(date, station, pres)
+
+# Verify the addition
+f_dm_calibrated %>%
+  filter(id %in% profiles_to_replace) %>%
+  group_by(id) %>%
+  summarise(
+    n_points = n(),
+    mean_f_final = mean(f_final, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+f_dm_calibrated %>% 
+  filter(id == "2022-03-09-KC10-18032") %>% 
+  filter(pres <= 50) %>% 
+  ggplot(aes(y = pres*-1)) +
+  geom_line(aes(x = f_calibrated), orientation = "y", color = "black") + 
+  geom_line(aes(x = f_final), orientation = "y", color = "blue")
+```
+
+```{r}
+write.csv(f_dm_calibrated, here("outputs", "flu_qc_2025-11-25.csv"))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
 # Robust NPQ correction with full profile interpolation
 # Step 1: Identify quenched profiles from discrete samples
 quenched_profiles <- f_dm_calibrated %>% 
@@ -1741,7 +2127,7 @@ test2 <- f_dm_calibrated2 %>%
 ```{r}
 f_dm_calibrated2 %>% 
   filter(pres < 50) %>%
-  filter(id %in% c("2021-04-10-KC10-80217")) %>% 
+  filter(id %in% c("2015-05-01-KC10-18032")) %>% 
   ggplot(aes(y = pres)) +
   geom_line(aes(x = f_dm*0.65, color = "CTD Fluorescence"), 
             linewidth = 1, orientation = "y") +

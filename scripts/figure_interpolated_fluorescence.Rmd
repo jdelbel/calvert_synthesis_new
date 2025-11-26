@@ -33,15 +33,15 @@ library(metR)
 ```{r}
 #Corrected CTD fluorescence data
 ctd_fl <- read_csv(here("outputs",
-                        "ctd_offset_slope_corrected_fluorescence_2025-11-19.csv"))
+                        "flu_qc_2025-11-25.csv"))
 
 ctd <- read_csv(here("files", "ctd_kc10_fzh01_2025-08-09.csv"))
 
-#cm = chlorophylly march 
-cm <- read_csv(here("files", "chl_2022-03-09.csv")) 
-
-#cs = chlorophyll september
-cs <- read_csv(here("files", "chl_2022-09-09.csv")) 
+# #cm = chlorophylly march 
+# cm <- read_csv(here("files", "chl_2022-03-09.csv")) 
+# 
+# #cs = chlorophyll september
+# cs <- read_csv(here("files", "chl_2022-09-09.csv")) 
 
 #Downloading discrete chlorophyll samples - This could be done using the API
 cd <- read_csv(here("files", "chl_kc10_fzh01_2025-09-08.csv"))
@@ -106,62 +106,12 @@ daily_ctd <- ctd_calc %>%
 ```
 
 ```{r}
-#There were two saturated CTD casts in 2022 and here, I am prepping to iterpolate from discrete sample profiles - this is OK here as they are mixed conditions lacking strong peaks.
-
-#Wrangling the March 2022 discrete chlorophyll fluorescence profile
-cm <- cm %>% 
-  filter(filter_type == "Bulk GF/F") %>% 
-  select(date, pres = line_out_depth, chla) %>% 
-  mutate(pres = case_when(pres == 0 ~ 1,
-                          TRUE ~ as.numeric(pres)))
-
-#Wrangling the September 2022 discrete chlorophyll fluorescence profile
-cs <- cs %>% 
-  filter(filter_type == "Bulk GF/F") %>% 
-  select(date, pres = line_out_depth, chla) %>% 
-  mutate(pres = case_when(pres == 0 ~ 1,
-                          TRUE ~ as.numeric(pres)))
-
-#Combining the MArch and September discrete chlorophyll profile
-c_interp <- rbind(cm, cs)
-
-#Converting discrete chlorophyll profiles to wide format.
-c_interp <- c_interp %>% 
-  pivot_wider(names_from = "date", values_from = "chla")
-
-#Performing the interpolation.
-
-# Select chlorophyll data and depths
-spec <- c_interp %>%
-  select(`2022-03-09`, `2022-09-09`)
-
-depth <- c_interp$pres
-
-# Interpolate to 1m intervals covering full depth range
-x.new <- seq(1, max(depth), by = 1)  # Goes to 325m now
-sp.interp <- interp.dataset(y = spec, x = depth, xout = x.new,
-                           method = "loess", span = 0.8)
-
-# Create interpolated dataframe
-interp <- as.data.frame(sp.interp) %>% 
-  mutate(pres = x.new) %>% 
-  pivot_longer(cols = 1:2, names_to = "date", values_to = "f_npq") %>% 
-  mutate(date = as.Date(date),
-         station = "KC10",
-         year = year(date),
-         f_corrected = round(f_npq, 2)) %>% 
-  select(date, station, year, pres, f_corrected)
-
-ctd_fl <- ctd_fl %>% 
-  mutate(year = year(date)) %>% 
-  select(date, station, year, pres, f_corrected)
-
-ctd_fl <- rbind(ctd_fl, interp)
-```
-
-```{r}
 ctd_fl_phys <- ctd_fl %>% 
   left_join(daily_ctd)
+
+ctd_fl_phys <- ctd_fl_phys %>% 
+  select(-f_calibrated) %>% 
+  rename(f_corrected = f_final)
 ```
 
 ```{r}
@@ -255,7 +205,7 @@ ctd_integrated <- ctd_fl %>%
   # Integrate using trapezoidal rule (approximate)
   arrange(pres) %>%
   summarise(
-    integrated_fl = sum(f_corrected * c(diff(pres), 0), na.rm = TRUE),  # Simple integration
+    integrated_fl = sum(f_final * c(diff(pres), 0), na.rm = TRUE),  # Simple integration
     .groups = 'drop'
   ) %>%
   # Calculate monthly climatology and anomalies
@@ -411,9 +361,231 @@ combined_plot <- p1 / p2   # Top panel twice as tall
 
 print(combined_plot)
 
-ggsave(here("figures", "panel_kc10_interp_int_f_no_npq.png"), combined_plot,
+ggsave(here("figures", "panel_kc10_interp_2025-11-25.png"), combined_plot,
        width = 16, height = 8)
 ```
+```{r}
+# Calculate integrated fluorescence (0-30m) by station, date, and cast
+ctd_integrated_by_cast <- ctd_fl %>%
+  filter(pres <= 30) %>%  # 0-30m depth
+  group_by(date, station, id) %>%
+  # Integrate using trapezoidal rule for each cast
+  arrange(pres) %>%
+  summarise(
+    integrated_fl = sum(f_final * c(diff(pres), 0), na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Calculate daily average by station
+ctd_integrated_by_station <- ctd_integrated_by_cast %>%
+  group_by(date, station) %>%
+  summarise(
+    integrated_fl = mean(integrated_fl, na.rm = TRUE),
+    n_casts = n(),
+    .groups = 'drop'
+  )
+
+# Find matching dates between KC10 and FZH01
+matching_dates <- ctd_integrated_by_station %>%
+  group_by(date) %>%
+  filter(n_distinct(station) == 2,  # Both stations present
+         all(c("KC10", "FZH01") %in% station)) %>%  # Specifically KC10 and FZH01
+  ungroup()
+
+# Pivot to wide format for comparison
+comparison_data <- matching_dates %>%
+  select(date, station, integrated_fl) %>%
+  pivot_wider(names_from = station, 
+              values_from = integrated_fl,
+              names_prefix = "integrated_")
+
+# Create scatter plot
+ggplot(comparison_data, aes(x = integrated_KC10, y = integrated_FZH01)) +
+  geom_point(size = 3, alpha = 0.7, color = "#2E86AB") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_smooth(method = "lm", se = TRUE, color = "#A23B72", fill = "#A23B72", alpha = 0.2) +
+  labs(
+    x = "KC10 Integrated Fluorescence (0-30m, mg/m²)",
+    y = "FZH01 Integrated Fluorescence (0-30m, mg/m²)",
+    title = "Comparison of Integrated Fluorescence: KC10 vs FZH01",
+    subtitle = paste("n =", nrow(comparison_data), "matching dates (daily averages)")
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+# Calculate correlation statistics
+cor_test <- cor.test(comparison_data$integrated_KC10, 
+                     comparison_data$integrated_FZH01)
+
+cat("\nCorrelation statistics:\n")
+cat("r =", round(cor_test$estimate, 3), "\n")
+cat("p-value =", format.pval(cor_test$p.value, digits = 3), "\n")
+```
+
+```{r}
+# Calculate correlation and linear model statistics
+cor_test <- cor.test(comparison_data$integrated_KC10, 
+                     comparison_data$integrated_FZH01)
+lm_fit <- lm(integrated_FZH01 ~ integrated_KC10, data = comparison_data)
+lm_summary <- summary(lm_fit)
+
+# Create annotation text
+stats_text <- paste0(
+  "r = ", round(cor_test$estimate, 3), "\n",
+  "p = ", format.pval(cor_test$p.value, digits = 3), "\n",
+  "R² = ", round(lm_summary$r.squared, 3), "\n",
+  "slope = ", round(coef(lm_fit)[2], 3), "\n",
+  "n = ", nrow(comparison_data)
+)
+
+# Get axis limits for equal scaling
+axis_limits <- c(
+  min(c(comparison_data$integrated_KC10, comparison_data$integrated_FZH01), na.rm = TRUE),
+  max(c(comparison_data$integrated_KC10, comparison_data$integrated_FZH01), na.rm = TRUE)
+)
+
+# Create scatter plot
+ggplot(comparison_data, aes(x = integrated_KC10, y = integrated_FZH01)) +
+  geom_point(size = 3, alpha = 0.7, color = "#2E86AB") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "#A23B72", fill = "#A23B72", alpha = 0.2) +
+  annotate("text",
+           x = axis_limits[1] + (axis_limits[2] - axis_limits[1]) * 0.05,
+           y = axis_limits[2] - (axis_limits[2] - axis_limits[1]) * 0.05,
+           label = stats_text,
+           hjust = 0, vjust = 1, size = 4, fontface = "bold") +
+  coord_fixed(ratio = 1, xlim = axis_limits, ylim = axis_limits) +
+  labs(
+    x = "KC10 Integrated Fluorescence (0-30m, mg/m²)",
+    y = "FZH01 Integrated Fluorescence (0-30m, mg/m²)",
+    title = "Comparison of Integrated Fluorescence: KC10 vs FZH01",
+    subtitle = "Daily averages on matching dates",
+    caption = "Dashed line = 1:1 relationship"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold"),
+    aspect.ratio = 1
+  )
+
+ggsave(here("figures", "integrated_comparison_station.png"),
+       width = 9,
+       height = 6)
+```
+```{r}
+# Using scale_x_log10 and scale_y_log10
+comparison_data_pos <- comparison_data %>%
+  filter(integrated_KC10 > 0, integrated_FZH01 > 0)
+
+# Stats still on log-transformed data
+comparison_data_log <- comparison_data_pos %>%
+  mutate(
+    log_KC10 = log10(integrated_KC10),
+    log_FZH01 = log10(integrated_FZH01)
+  )
+
+cor_test_log <- cor.test(comparison_data_log$log_KC10, 
+                         comparison_data_log$log_FZH01)
+lm_fit_log <- lm(log_FZH01 ~ log_KC10, data = comparison_data_log)
+lm_summary_log <- summary(lm_fit_log)
+
+stats_text_log <- paste0(
+  "r = ", round(cor_test_log$estimate, 3), "\n",
+  "p = ", format.pval(cor_test_log$p.value, digits = 3), "\n",
+  "R² = ", round(lm_summary_log$r.squared, 3), "\n",
+  "slope = ", round(coef(lm_fit_log)[2], 3), "\n",
+  "n = ", nrow(comparison_data_log)
+)
+
+ggplot(comparison_data_pos, aes(x = integrated_KC10, y = integrated_FZH01)) +
+  geom_point(size = 3, alpha = 0.7, color = "#2E86AB") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "#A23B72", fill = "#A23B72", alpha = 0.2) +
+  annotate("text", 
+           x = 2, y = 250,
+           label = stats_text_log,
+           hjust = 0, vjust = 1, size = 4, fontface = "bold") +
+  scale_x_log10(name = "KC10 Integrated Fluorescence (0-30m, mg/m²)") +
+  scale_y_log10(name = "FZH01 Integrated Fluorescence (0-30m, mg/m²)") +
+  coord_fixed(ratio = 1) +
+  labs(
+    title = "Comparison of Integrated Fluorescence: KC10 vs FZH01",
+    subtitle = "Log10 scale, daily averages on matching dates",
+    caption = "Dashed line = 1:1 relationship"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(here("figures", "integrated_comparison_station_log_scale.png"),
+       width = 8,
+       height = 8)
+```
+```{r}
+# Calculate correlation and linear model statistics on log10-transformed data
+comparison_data_log <- comparison_data %>%
+  filter(integrated_KC10 > 0, integrated_FZH01 > 0) %>%  # Remove zeros for log transform
+  mutate(
+    log_KC10 = log10(integrated_KC10),
+    log_FZH01 = log10(integrated_FZH01)
+  )
+
+cor_test_log <- cor.test(comparison_data_log$log_KC10, 
+                         comparison_data_log$log_FZH01)
+lm_fit_log <- lm(log_FZH01 ~ log_KC10, data = comparison_data_log)
+lm_summary_log <- summary(lm_fit_log)
+
+# Create annotation text
+stats_text_log <- paste0(
+  "r = ", round(cor_test_log$estimate, 3), "\n",
+  "p = ", format.pval(cor_test_log$p.value, digits = 3), "\n",
+  "R² = ", round(lm_summary_log$r.squared, 3), "\n",
+  "slope = ", round(coef(lm_fit_log)[2], 3), "\n",
+  "n = ", nrow(comparison_data_log)
+)
+
+# Get axis limits for equal scaling (in log space)
+log_limits <- c(
+  min(c(comparison_data_log$log_KC10, comparison_data_log$log_FZH01), na.rm = TRUE),
+  max(c(comparison_data_log$log_KC10, comparison_data_log$log_FZH01), na.rm = TRUE)
+)
+
+# Create scatter plot
+ggplot(comparison_data_log, aes(x = log_KC10, y = log_FZH01)) +
+  geom_point(size = 3, alpha = 0.7, color = "#2E86AB") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "#A23B72", fill = "#A23B72", alpha = 0.2) +
+  annotate("text", 
+           x = log_limits[1] + (log_limits[2] - log_limits[1]) * 0.05,
+           y = log_limits[2] - (log_limits[2] - log_limits[1]) * 0.05,
+           label = stats_text_log,
+           hjust = 0, vjust = 1, size = 4, fontface = "bold") +
+  coord_fixed(ratio = 1, xlim = log_limits, ylim = log_limits) +
+  labs(
+    x = expression(log[10]~"KC10 Integrated Fluorescence (mg/m²)"),
+    y = expression(log[10]~"FZH01 Integrated Fluorescence (mg/m²)"),
+    title = "Comparison of Integrated Fluorescence: KC10 vs FZH01",
+    subtitle = "Log10-transformed, daily averages on matching dates",
+    caption = "Dashed line = 1:1 relationship"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(here("figures", "integrated_comparison_station_log.png"),
+       width = 8,
+       height = 8)
+```
+
+
 
 ```{r}
 #Working with the discrete chlorophyll dataset
