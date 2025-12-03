@@ -63,8 +63,12 @@ fw_tot <- fw %>%
          month = month(date)) %>% 
   filter(year >= 2017)
 
+fw_m <- fw %>% 
+  filter(Watershed_group %in% c("Q_GM", "Q_SM")) %>% 
+  pivot_wider(names_from = Watershed_group, values_from = Q) %>% 
+  mutate(date = date(Date)) %>% 
+  select(-Date)
 ```
-
 
 
 ```{r}

@@ -1,0 +1,1117 @@
+---
+title: "SOPO Presentation"
+output: html_notebook
+---
+```{r}
+#Upload packages -  go through these to see which apply.
+library(tidyverse)
+library(here)
+library(patchwork)
+library(readxl)
+library(gsw)
+library(zoo)
+```
+
+```{r}
+#KC10 and FZH01 dataset
+ctd <- read_csv(here("files", "ctd_kc10_fzh01_2025-08-09.csv"))
+
+#Wind from the lookout?
+wind <- read_csv(here("files", "wind_lo_2025-09-08.csv"))
+
+#Nutrients
+n <- read_csv(here("files", "2025-12-02_HakaiData_nutrients.csv"))
+
+#Freshwater
+fw <- read_csv(here("files", "Daily_flow_long_2014_2024_v2025_04_03.csv"))
+```
+
+
+
+```{r}
+#Daily average of wind and wind direction with 3 day backwards average
+wind_dm <- wind %>% 
+  mutate(date_time = mdy_hm(measurementTime),
+         date = date(date_time)) %>%
+  filter(WindSpd_UQL == 2) %>%
+  filter(WindDir_UQL == 2) %>% 
+  group_by(date) %>% 
+  summarise(w_dm = mean(WindSpd_Avg),
+            wd_dm = mean(WindDir_Avg)) %>% 
+  mutate(wind_b1_3 = rollmeanr(lag(w_dm, 1), k = 3, fill = NA),
+            wd_b1_3 = rollmeanr(lag(wd_dm, 1), k = 3, fill = NA)) %>% 
+  ungroup()
+```
+
+```{r}
+#Daily average of freshwater discharge with 10 day backward averages
+fw_m <- fw %>% 
+  filter(Watershed_group %in% c("Q_GM", "Q_SM")) %>% 
+  pivot_wider(names_from = Watershed_group, values_from = Q) %>% 
+  mutate(date = date(Date)) %>% 
+  select(-Date) %>% 
+  mutate(qgm_10 = rollmeanr(lag(Q_GM, 1), k = 10, fill = NA),
+         qsm_10 = rollmeanr(lag(Q_SM, 1), k = 10, fill = NA)) 
+```
+
+```{r}
+#Join the daily averaged weather data
+weather_join <- wind_dm %>% 
+  left_join(fw_m)
+```
+```{r}
+ctd_stratification <- ctd_calc %>%
+  group_by(castpk) %>%
+  arrange(castpk, pres) %>%
+  filter(pres >= 2 & pres <= 30) %>%
+  
+  mutate(
+    # Manual density gradient (keep for reference)
+    delta_sigma = c(NA, diff(sigma_theta)),
+    delta_pres = c(NA, diff(pres)),
+    d_sigma_dz = delta_sigma / delta_pres
+  ) %>%
+  
+  summarise(
+    date = first(date),
+    station = first(station),
+    latitude = first(latitude),
+    longitude = first(longitude),
+    
+    # Manual metrics (keep these - they're useful)
+    mean_density_gradient = mean(d_sigma_dz, na.rm = TRUE),
+    max_density_gradient = max(d_sigma_dz, na.rm = TRUE),
+    pycnocline_depth_manual = pres[which.max(d_sigma_dz)],
+    
+    # Density difference (2m - 30m)
+    sigma_2m = sigma_theta[which.min(abs(pres - 2))],
+    sigma_30m = sigma_theta[which.min(abs(pres - 30))],
+    delta_sigma_2_30 = sigma_30m - sigma_2m,
+    stratification_index = delta_sigma_2_30 / 28,
+    
+    # PROPER N² using gsw (use this for RDA)
+    N2_gsw = list(gsw_Nsquared(
+      SA = sa,
+      CT = ct,
+      p = pres,
+      lat = first(latitude)
+    )),
+    
+    .groups = 'drop'
+  ) %>%
+  
+  # Extract gsw N² metrics
+  mutate(
+    mean_N2 = map_dbl(N2_gsw, ~mean(.x$N2, na.rm = TRUE)),
+    max_N2 = map_dbl(N2_gsw, ~max(.x$N2, na.rm = TRUE)),
+    mean_N = sqrt(abs(mean_N2)),  # BV frequency (rad/s)
+    pycnocline_depth = map_dbl(N2_gsw, ~{
+      if(length(.x$N2) > 0 && !all(is.na(.x$N2))) {
+        .x$p_mid[which.max(.x$N2)]
+      } else {
+        NA_real_
+      }
+    })
+  ) %>%
+  select(-N2_gsw)  # Remove list column
+```
+```{r}
+ctd_stratification %>% 
+  ggplot(aes(x = delta_sigma_2_30, y = mean_N2)) +
+  geom_point()
+```
+
+
+```{r}
+#Wrangling the CTD data - renaming some of the key columns/variables that I will be working with
+ctd <- ctd %>% 
+  select(cast_pk = `Cast PK`,
+         date_time = `Measurement time`,
+         station = Station,
+         lat = `Station Latitude`,
+         long =`Station Longitude`,
+         pres = `Pressure (dbar)`,
+         sal = `Salinity (PSU)`,
+         temp = `Temperature (deg C)`,
+         f = `Fluorometry Chlorophyll (ug/L)`)
+
+#Adding a date column
+ctd <- ctd %>% 
+  mutate(date = lubridate::date(date_time)) %>% 
+  relocate(date, .after = date_time)
+
+#Looking at coordinates for the CTD dataset - are there any missing? Mssing values need to be filled for later calculations
+ctd_coord <- ctd %>% 
+  distinct(station, lat, long)
+```
+
+```{r}
+#Selecting 5m depth nutrients for QU39.
+n <- n %>%
+  select(date,
+         pres = line_out_depth,
+         no2 = no2_no3_um,
+         sio2 = sio2,
+         po4 = po4) %>%
+  drop_na()
+
+#Calculating daily mean in situation where there are duplicates.
+n_dm <- n %>%
+  group_by(date, pres) %>%
+  summarise(no2_dm = mean(no2),
+            po4_dm = mean(po4),
+            sio2_dm = mean(sio2)) %>%
+  ungroup() %>% 
+  mutate(pres = case_when(pres == 0 ~ 1,
+                          T ~ as.numeric(pres)))
+```
+
+
+```{r}
+#Performing GSW calculations to derive density 
+
+#Calculating absolute salinity
+SA <- gsw_SA_from_SP(ctd$sal, ctd$pres, ctd$long, ctd$lat)
+
+#Converting absolute salinity output to a dataframe
+SA <- as.data.frame(SA)
+
+#Calculating conservative temperature
+CT <- gsw_CT_from_t(SA$SA, ctd$temp, ctd$pres)
+
+#Converting conservative temperature output to a dataframe
+CT <- as.data.frame(CT)
+
+#Calculating Density
+rho = gsw_rho(SA$SA, CT$CT, ctd$pres)
+
+#Converting Density to a dataframe
+rho <- as.data.frame(rho)
+
+#Calculating Brunt-Vaisala frequency
+bv <- gsw_Nsquared(SA$SA, CT$CT, ctd$pres)
+
+#Converting Brunt-Vaisala frequency to a dataframe
+bv <- bind_rows(bv)
+
+#Adding a row at the bottom of the Brunt-Vaisala dataframe to make the vector length equal to the other calculations -  not sure why this does this, but I think the calculation takes two consequative depths into consideration and throws an NA at the last cell because there - does this mess up calculations between profiles then? Maybe - not using this for now.
+bv <- bv %>% 
+  add_row(N2 = NA, p_mid = NA)
+
+#Binding calculations to ctd dataframe
+ctd <- cbind(ctd, SA, CT, rho, bv)
+```
+
+
+
+```{r}
+#Performing calculations for delta_rho 
+
+#Finding minimum cast start depth for each profile to determine range of depths to use for density difference. Only 5 casts start deeper than three meters and only 1 doesn't go to 30m. Using 2 and 30 meters for delta_rho calculation
+range_pres <- ctd %>% 
+  group_by(cast_pk) %>% 
+  summarise(min_pres = min(pres),
+            max_pres = max(pres)) %>% 
+  ungroup() %>% 
+  arrange(desc(min_pres))
+
+#The next few steps are used to determine the density difference as a measure of stratification. Using 2 and 30m
+
+#Filter 2m data from the CTD datasheet
+ctd_2 <- ctd %>% 
+  filter(pres == 2) %>% 
+  select(cast_pk, date, station, lat, long, date, rho_2 = rho)
+
+#filter 30m data
+ctd_30 <- ctd %>% 
+  filter(pres == 30) %>% 
+  select(cast_pk, date, rho_30 = rho)
+
+#joining 2m data to 3m data
+ctd_dd <- ctd_2 %>% 
+  left_join(ctd_30) 
+
+#Calculating difference in density
+ctd_dd <- ctd_dd %>% 
+  mutate(delta_rho = rho_30 - rho_2)
+
+#Preparing delta_rho calculation sheet for merging back into ctd datasheet
+ctd_dr_dm <- ctd_dd %>% 
+  select(date, station, delta_rho) %>% 
+  group_by(date) %>% 
+  summarise(dr_dm = mean(delta_rho))
+```
+
+
+```{r}
+rho24_dm <- ctd %>% 
+  group_by(cast_pk) %>% 
+  mutate(diff = abs(rho - 1024)) %>% 
+  slice_min(diff, with_ties = F) %>% 
+  ungroup() %>%
+  select(date, rho1024_dep = pres) %>% 
+  filter(rho1024_dep < 50) %>% 
+  group_by(date) %>% 
+  summarise(r24_dep_dm = mean(rho1024_dep)) %>% 
+  ungroup()
+```
+
+```{r}
+#Controversial step - doing daily mean of each variable for joining
+ctd_dm <- ctd %>% 
+  select(date:temp, rho, N2) %>% 
+  pivot_longer(c(sal:N2), values_to = "val", names_to = "par") %>% 
+  group_by(date, pres, par) %>% 
+  summarise(val_dm = mean(val)) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = "par", values_from = "val_dm")
+```
+
+
+```{r}
+ctd_j1 <- ctd_dm %>% 
+  left_join(ctd_dr_dm) %>% 
+  left_join(rho24_dm) %>% 
+  left_join(n_dm)
+
+test <- ctd_j1 %>% 
+  select(date, r24_dep_dm) %>% 
+  distinct() %>% 
+  group_by(date) %>% 
+  mutate(n = n()) %>% 
+  ungroup()
+
+test2 <- ctd_j1 %>% 
+  filter(pres == 5) %>% 
+  group_by(date) %>% 
+  summarise(n = n()) %>% 
+  ungroup()
+```
+
+```{r}
+# I need to:
+# daily average all sheets separately
+#then join them
+#rho_24
+#CTD_dd
+```
+
+
+```{r}
+write.csv(ctd_j1, here("outputs", "enviro_ctd_nut_2025-04-15.csv"))
+write.csv(weather_join, here("outputs", "enviro_weather_2025-04-14.csv"))
+write.csv(n_dm, here("outputs", "enviro_nutrient_2025-04-14.csv"))
+
+# write.csv(ctd, here("outputs", "ctd_wrangle_2025-04-25_kc10.csv"))
+# write.csv(ctd_anomaly_month, here("outputs", "ctd_anom_week_2025-04-25_kc10.csv"))
+# write.csv(wind_anomaly_day, here("outputs", "wind_anom_day_2025-04-25.csv"))
+
+```
+
+
+
+
+```{r}
+#Trying FWI calculation
+# fwc <- ctd %>%
+#   select(cast_pk, date, station, pres, sal) %>%
+#   group_by(cast_pk) %>% 
+#   filter(sal < 29.1 & pres > 2) %>% 
+#   ungroup() %>%
+#   mutate(fwc_1 = ((29.1 - sal)/29.1)) %>%
+#   group_by(cast_pk) %>%
+#   mutate(fwc = sum(fwc_1)) %>%
+#   ungroup() %>%
+#   distinct(cast_pk, fwc, .keep_all = TRUE) %>% 
+#   select(cast_pk, fwc)
+```
+
+
+
+
+
+
+
+```{r}
+#Selecting 5m depth and doing daily mean for values I am going to look at
+ctd_5 <- ctd %>% 
+  filter(pres == 5) %>% 
+  group_by(date) %>% 
+  summarise(sal = mean(SA),
+            temp = mean(CT),
+            dr = mean(delta_rho),
+            fwc = mean(fwc),
+            rho21_dep = mean(rho1021_dep)) %>% 
+  ungroup()
+
+#Checking that no duplicates exist anymore in the 5m ctd dataset
+ctd_5_dup_check <- ctd_5 %>% 
+  group_by(date) %>% 
+  mutate(n = n()) %>% 
+  ungroup() %>% 
+  filter(n > 1) %>% 
+  distinct(date, date, .keep_all = T) %>% 
+  select(date, date, sal, temp, dr, fwc)
+
+ctd_5 <- ctd_5 %>% 
+  mutate(fwc = case_when(is.na(fwc) ~ 0,
+         TRUE ~ as.numeric(fwc)))
+```
+
+
+
+```{r}
+ctd_5_long <- ctd_5 %>% 
+  pivot_longer(c(sal:rho24_dep), values_to = "val", names_to = "par")
+
+#calculate the climatological mean, standard deviation and number of samples in each bin
+ctd_full_mm <- ctd_5_long %>%
+  mutate(month = lubridate::month(date)) %>% 
+  select(month, par, val) %>% 
+  group_by(month, par) %>% 
+  summarise(mean_val = mean(val),
+            sd_val = sd(val),
+            n_full = n()) %>% 
+  ungroup()
+
+#calculate the monthly mean for each group over the entire timeseries
+ctd_mm <- ctd_5_long %>%
+  mutate(year = lubridate::year(date),
+         month = lubridate::month(date)) %>%
+  select(par, year, month, val) %>% 
+  group_by(year, month, par) %>% 
+  summarise(mm_mean_val = mean(val),
+            n = n()) %>% 
+  ungroup() 
+
+#calculate the standardized anomaly and create a center of the month date for plotting
+ctd_anomaly_month <- ctd_mm %>% 
+  left_join(ctd_full_mm) %>% 
+  mutate(anom = mm_mean_val - mean_val,
+         anom_std = anom/sd_val,
+         day = 15) %>% 
+  unite(year_month, c(year, month, day), sep = "-", remove = F) %>% 
+  mutate(year_month = ymd(year_month))
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+ctd_anomaly_month %>% 
+  filter(par == "temp") %>%
+  ggplot(aes(x = year_month, y = anom)) +
+  geom_col() +
+  facet_grid(par~., scales = "free_y") +
+  theme_bw() +
+  theme(text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        legend.position = "top",
+        legend.box = "horizontal") +
+  guides(fill = guide_colourbar(title.position = "top", title.hjust = 0.5,
+                                barwidth = 50, barheight = 1,
+                                frame.colour = "black", ticks.colour = "black"))
+
+ggsave(here("figures", "enviro_weekly.png"),
+        width = 16, height = 16, dpi = 300)
+```
+```{r}
+wind <- wind %>%
+  filter(WindSpd_UQL == 2) %>% 
+  mutate(speed_dm = WindSpd_Avg^3)
+
+#calculate the climatological mean, standard deviation and number of samples in each bin
+wind_full_dm <- wind %>%
+  mutate(yday = lubridate::yday(date)) %>%
+  select(yday, speed_dm) %>%
+  group_by(yday) %>%
+  summarise(mean_val = mean(speed_dm),
+            sd_val = sd(speed_dm),
+            n_full = n()) %>%
+  ungroup()
+
+#calculate the monthly mean for each group over the entire timeseries
+wind_dm <- wind %>%
+  mutate(year = lubridate::year(date),
+         yday = lubridate::yday(date)) %>%
+  select(year, yday, speed_dm) %>%
+  group_by(year, yday) %>%
+  summarise(wd_mean_val = mean(speed_dm),
+            n = n()) %>%
+  ungroup()
+
+#calculate the standardized anomaly and create a center of the month date for plotting
+wind_anomaly_day <- wind_dm %>%
+  left_join(wind_full_dm) %>%
+  mutate(anom = wd_mean_val - mean_val,
+         anom_std = anom/sd_val) 
+```
+
+```{r}
+write.csv(ctd_5, here("outputs", "enviro_5m_2025-04-25_kc10.csv"))
+write.csv(ctd, here("outputs", "ctd_wrangle_2025-04-25_kc10.csv"))
+write.csv(ctd_anomaly_month, here("outputs", "ctd_anom_week_2025-04-25_kc10.csv"))
+write.csv(wind_anomaly_day, here("outputs", "wind_anom_day_2025-04-25.csv"))
+```
+
+
+
+
+
+
+```{r}
+nuts_5_long <- nuts_5_dm %>% 
+  pivot_longer(c(no2_dm:sio2_dm), values_to = "val", names_to = "par")
+
+#calculate the climatological mean, standard deviation and number of samples in each bin
+nuts_full_mm <- nuts_5_long %>%
+  mutate(month = lubridate::month(date)) %>% 
+  select(month, par, val) %>% 
+  group_by(month, par) %>% 
+  summarise(mean_val = mean(val),
+            sd_val = sd(val),
+            n_full = n()) %>% 
+  ungroup()
+
+#calculate the monthly mean for each group over the entire timeseries
+nuts_mm <- nuts_5_long %>%
+  mutate(year = lubridate::year(date),
+         month = lubridate::month(date)) %>%
+  select(par, year, month, val) %>% 
+  group_by(year, month, par) %>% 
+  summarise(mm_mean_val = mean(val),
+            n = n()) %>% 
+  ungroup() 
+
+#calculate the standardized anomaly and create a center of the month date for plotting
+nuts_anomaly_month <- nuts_mm %>% 
+  left_join(nuts_full_mm) %>% 
+  mutate(anom = mm_mean_val - mean_val,
+         anom_std = anom/sd_val,
+         day = 15) %>% 
+  unite("date", year, month, day, sep = "-", remove = F) %>% 
+  mutate(date2 = lubridate::ymd(date)) %>% 
+  mutate(pos = anom_std >= 0) #allows me to plot red/blue colors
+
+```
+
+```{r}
+#Create the time-series anomaly plot with the monthly means with > 3 point in bold and < 3 in shaded.
+ctd_anomaly_month %>% 
+  ggplot(aes(x = date2, y = anom, fill = pos)) +
+  geom_col(data = filter(ctd_anomaly_month, n < 3),
+           position = "identity", colour = "transparent",
+           alpha = 0.4) +
+  geom_col(data = filter(ctd_anomaly_month, n >= 3),
+           position = "identity", colour = "black", size = 0.5) +
+  scale_fill_manual(values = c("blue", "red"), guide = FALSE) +
+  facet_grid(par ~ ., scales = "free_y") +
+  scale_x_date(limits = as.Date(c("2015-01-01", "2024-01-01")),
+               expand = c(0, 0),
+               date_breaks = "years", date_labels = "%b%y") +
+  labs(y = "Anomaly") +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        panel.grid.major.x =  element_line(color = "darkgrey", size = 0.5),
+        panel.grid.minor.x =  element_line(color = "darkgrey", size = 0.5),
+        text = element_text(size = 35),
+        axis.text = element_text(colour = "black"),
+        axis.title.x = element_blank())
+
+ggsave(here("figures",
+            "anomalies_ctd.png"),
+       width = 14, height = 12, dpi = 300)
+
+```
+
+
+
+
+```{r}
+#Create the time-series anomaly plot with the monthly means with > 3 point in bold and < 3 in shaded.
+nuts_anomaly_month %>% 
+  # filter(n > 2) %>% 
+  ggplot(aes(x = date2, y = anom, fill = pos)) +
+  geom_col(data = filter(nuts_anomaly_month, n < 3),
+           position = "identity", colour = "transparent",
+           alpha = 0.4) +
+  geom_col(data = filter(nuts_anomaly_month, n >= 3),
+           position = "identity", colour = "black", size = 0.5) +
+  scale_fill_manual(values = c("blue", "red"), guide = FALSE) +
+  facet_grid(par ~ ., scales = "free_y") +
+  # lims(y = c(-2.5, 2.5)) +
+  scale_x_date(limits = as.Date(c("2015-01-01", "2024-01-01")),
+               expand = c(0, 0),
+               date_breaks = "years", date_labels = "%b%y") +
+  labs(y = "Anomaly") +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        panel.grid.major.x =  element_line(color = "darkgrey", size = 0.5),
+        panel.grid.minor.x =  element_line(color = "darkgrey", size = 0.5),
+        # strip.text.x = element_blank(),
+        # panel.spacing = unit(2, "lines"),
+        text = element_text(size = 35),
+        axis.text = element_text(colour = "black"),
+        axis.title.x = element_blank())
+
+ggsave(here("figures",
+            "anomalies_nutrients.png"),
+       width = 14, height = 12, dpi = 300)
+
+```
+
+```{r}
+#Combining CTD and nutrient anomalies
+ctd_anomaly_month <- rbind(ctd_anomaly_month, nuts_anomaly_month)
+```
+
+```{r}
+anom_dr <- ctd_anomaly_month %>% 
+  filter(par == "dr" )
+
+anom_fwc <- ctd_anomaly_month %>% 
+  filter(par == "fwc")
+
+anom_dsi <- ctd_anomaly_month %>% 
+  filter(par == "sio2_dm")
+
+```
+
+```{r}
+#Create the time-series anomaly plot with the monthly means with > 3 point in bold and < 3 in shaded.
+fig_dr <- anom_dr %>% 
+  ggplot(aes(x = date2, y = anom, fill = pos)) +
+  geom_col(data = filter(anom_dr, n < 3),
+           position = "identity", colour = "transparent",
+           alpha = 0.4) +
+  geom_col(data = filter(anom_dr, n >= 3),
+           position = "identity", colour = "black", size = 0.5) +
+  scale_fill_manual(values = c("blue", "red"), guide = FALSE) +
+  scale_x_date(limits = as.Date(c("2015-01-01", "2024-01-01")),
+               expand = c(0, 0),
+               date_breaks = "years", date_labels = "%b%y") +
+  labs(y = "Anomaly") +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        panel.grid.major.x =  element_line(color = "black", size = 0.5),
+        panel.grid.minor.x =  element_line(color = "darkgrey", size = 0.5),
+        text = element_text(size = 40),
+        axis.text = element_text(colour = "black"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+
+
+fig_fwc <- 
+
+fig_dsi <- anom_dsi %>% 
+  ggplot(aes(x = date2, y = anom, fill = pos)) +
+  geom_col(data = filter(anom_dsi, n < 3),
+           position = "identity", colour = "transparent",
+           alpha = 0.4) +
+  geom_col(data = filter(anom_dsi, n >= 3),
+           position = "identity", colour = "black", size = 0.5) +
+  annotate("text", x = as.Date("2015-04-15"), y = 18, label = "d)", size = 12) +
+  geom_vline(xintercept = as.Date("2023-01-01"), size = 1.5) +
+  scale_fill_manual(values = c("blue", "red"), guide = FALSE) +
+  scale_x_date(limits = as.Date(c("2015-01-01", "2024-01-01")),
+               expand = c(0, 0),
+               date_breaks = "years", date_labels = "%b%y") +
+  scale_y_continuous(labels = scales::label_number(accuracy = 1), 
+                     limits = c(-20, 20),
+                     name = "DSi\u0020\u0028\u00B5mol\u0020L\u207B\u00B9\u0029") +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        panel.grid.major.x =  element_line(color = "black", size = 0.5),
+        panel.grid.minor.x =  element_line(color = "darkgrey", size = 0.5),
+        text = element_text(size = 40),
+        axis.text = element_text(colour = "black"),
+        axis.title.x = element_blank())
+```
+
+```{r}
+fig_pc2 <- diat_anom / fig_fwc / fig_dsi 
+
+# + plot_layout(axis_titles = "collect")
+
+
+fig_pc2 <- chem_full / fig_pc2 +
+  plot_layout(heights = c(0.65, 1))
+
+ggsave(here("figures", "timeseries_chemtax_chem_pc_anomalies.png"), fig_pc2,
+        width = 20, height = 18, dpi = 300)
+```
+
+
+```{r}
+#Filtering out FWC to plot with CHEMTAX data
+ctd_fwc <- ctd_5_long %>% 
+  filter(par == "fwc")
+
+#Adding FWC and wind data from sentry shoal to CHEMTAX
+chem_tchla_fwc <- chem_tchla %>% 
+  left_join(ctd_fwc) %>% 
+  left_join(wind_23)
+```
+
+
+```{r}
+scale_fwc <- 10
+
+chem_2023 <- chem_tchla_fwc %>%
+  mutate(year = lubridate::year(date),
+         yday = lubridate::yday(date)) %>%
+  filter(year == 2023)
+```
+
+
+```{r}
+chem_fig_2023 <- ggplot() +
+  geom_area(data = chem_2023, aes(date, contribution, fill = fct_rev(group)),
+            alpha = 0.8) +
+  # geom_point(aes(date, tchla)) +
+  geom_line(data = chem_2023, aes(x = date, y = val*scale_fwc), size = 1.5) +
+  geom_point(data = chem_2023, aes(x = date, y = val*scale_fwc),
+             size = 2, fill = "white",
+             pch = 21, stroke = 1) +
+  scale_fill_manual(values = palette,
+                    labels = c("Diat", "Dict", "Dino", "Cryt", "GA",
+                               "Hapt", "Cyan")) +
+  scale_y_continuous(sec.axis = sec_axis(~./scale_fwc,
+                                         name = "FWC")) +
+  scale_x_date(limits = as.Date(c("2023-01-01", "2023-12-15")),
+               expand = c(0, 0),
+               date_breaks = "1 month", date_labels = "%b") +
+  annotate("text", x = as.Date("2023-01-10"), y = 15, label = "a)", size = 15) +
+  theme_bw() +
+  labs(y = bquote("Phyto. (TChl, mg" ~ m^-3*")"),
+       fill = "Group") +
+  # scale_y_continuous(expand = c(0, 0), limits = c(0,12)) +
+  # scale_x_date(breaks = scales::date_breaks("3 month"),
+  #              labels = scales::date_format("%m/%y")) +
+  theme(legend.position = "none",
+        legend.title = element_blank(),
+        # strip.background = element_blank(),
+        # strip.text.x = element_blank(),
+        # panel.spacing = unit(2, "lines"),
+        text = element_text(size = 40), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank()) +
+        # plot.margin = margin(0, 50, 0, 0)) +
+  guides(fill = guide_legend(nrow = 1, reverse = TRUE))
+
+ggsave(here("figures",
+            "single_2023.png"),
+       width = 14, height = 6, dpi = 300)
+```
+
+```{r}
+nuts_2023 <- nuts_5_dm %>% 
+  mutate(year = lubridate::year(date),
+         yday = lubridate::yday(date)) %>%
+  filter(year == 2023) 
+```
+
+
+```{r}
+scale_wind <- 50
+
+nuts_fig_2023 <- ggplot() +
+  geom_area(data = wind_23, aes(x = date, y = speed_dm^3),
+            fill = "black", alpha = 0.4) +
+  geom_line(data = nuts_2023, aes(x = date, y = no2_dm*scale_wind), size = 2) +
+  geom_point(data = nuts_2023, aes(x = date, y = no2_dm*scale_wind), size = 2.5, fill = "white",
+             pch = 21, stroke = 1) +
+  scale_x_date(limits = as.Date(c("2023-01-01", "2023-12-15")),
+               expand = c(0, 0),
+               date_breaks = "1 month", date_labels = "%b") +
+  scale_y_continuous(sec.axis = sec_axis(~./scale_wind,
+                                         name = "DIN\u0020\u0028\u00B5mol\u0020L\u207B\u00B9\u0029")) + 
+  annotate("text", x = as.Date("2023-01-10"), y = 2100, label = "b)", size = 15) +
+  theme_bw() +
+  labs(y = bquote("Wind" ~ "("*m^3~s^3*")")) +
+  theme(legend.position = "none",
+        legend.title = element_blank(),
+        text = element_text(size = 40), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank())
+
+
+```
+
+```{r}
+fig_chem_fwc <- chem_fig_2023 / nuts_fig_2023
+
+ggsave(here("figures", "2023_chem_nuts_no2.png"), fig_chem_fwc,
+        width = 20, height = 12, dpi = 300)
+```
+
+
+```{r}
+anomaly_cors <- chem_anomaly_diat %>% 
+  select(date, month, year, mm_mean_contr, anom_diat = anom) %>% 
+  left_join(ctd_anomaly_month)
+
+```
+
+```{r}
+anomaly_cors %>% 
+  filter(par == "fwc") %>%
+  # filter(!is.na("dr")) %>% 
+  # filter(month == 3 | month == 2) %>%
+  ggplot(aes(x = anom, y = anom_diat)) +
+  geom_point() +
+  ggpubr::stat_cor(p.accuracy = 0.001, r.accuracy = 0.01, size = 8) +
+  geom_smooth(method = "lm") +
+  facet_wrap(~month) 
+
+ggsave(here("figures",
+            "pearson_fwc_diat_month.png"),
+       width = 12, height = 10, dpi = 300)  
+```
+
+
+
+
+
+```{r}
+Aug_sept_fig <- anomaly_cors %>% 
+  filter(par == "fwc") %>%
+  filter(month == 8 | month == 9) %>% 
+  ggplot(aes(x = anom, y = anom_diat)) +
+  geom_point(aes(fill = as.factor(year)), pch = 21, size = 6, stroke = 2) +
+  scale_fill_brewer(direction = -1,
+                       palette = "RdYlBu") +
+  ggpubr::stat_cor(p.accuracy = 0.001, r.accuracy = 0.01, size = 10,
+                   label.x = -0.1,
+                   label.y = 3.9) +
+  geom_smooth(method = "lm", color = "black", fill = "black", alpha = 0.2) +
+  coord_cartesian(ylim = c(-4, 4),
+                  xlim = c(-1.1, 1.1)) +
+  labs(x = bquote(Anomaly[FWC]),
+       y = bquote(Anomaly[DIATOM]),
+       fill = NULL) +
+  ggtitle("August & September") +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        text = element_text(size = 35),
+        axis.text = element_text(colour = "black"),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank())
+
+# ggsave(here("figures",
+#             "pearson_FWC_diatom_8_no2021.png"),
+#        width = 12, height = 10, dpi = 300)
+```
+
+```{r}
+march_fig <- anomaly_cors %>% 
+  filter(par == "fwc") %>%
+  filter(month == 3) %>% 
+  ggplot(aes(x = anom, y = anom_diat)) +
+  geom_point(aes(fill = as.factor(year)), pch = 21, size = 6, stroke = 2) +
+  scale_fill_brewer(direction = -1,
+                       palette = "RdYlBu") +
+  ggpubr::stat_cor(p.accuracy = 0.001, r.accuracy = 0.01, size = 10,
+                   label.x = -0.2,
+                   label.y = 3.9) +
+  geom_smooth(method = "lm", color = "black", fill = "black", alpha = 0.2) +
+  coord_cartesian(ylim = c(-4, 4),
+                  xlim = c(-1.1, 1.1)) +
+  labs(x = bquote(Anomaly[FWC]),
+       y = bquote(Anomaly[DIATOM]),
+       fill = NULL) +
+  ggtitle("March") +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        text = element_text(size = 35),
+        axis.text = element_text(colour = "black"),
+        legend.position = "none")
+
+# ggsave(here("figures",
+#             "pearson_FWC_diatom_8_march.png"),
+#        width = 12, height = 10, dpi = 300)
+```
+
+```{r}
+march_oct_fig <- anomaly_cors %>% 
+  filter(par == "fwc") %>%
+  filter(month > 2 & month < 11) %>% 
+  ggplot(aes(x = anom, y = anom_diat)) +
+  geom_point(aes(fill = as.factor(year)), pch = 21, size = 6, stroke = 2) +
+  scale_fill_brewer(direction = -1,
+                       palette = "RdYlBu") +
+  ggpubr::stat_cor(p.accuracy = 0.001, r.accuracy = 0.01, size = 10,
+                   label.x = -0.6,
+                   label.y = 4.8) +
+  geom_smooth(method = "lm", color = "black", fill = "black", alpha = 0.2) +
+  labs(x = bquote(Anomaly[FWC]),
+       y = bquote(Anomaly[DIATOM]),
+       fill = NULL) +
+  coord_cartesian(ylim = c(-5, 5),
+                  xlim = c(-1.2, 1.2)) +
+  ggtitle("March - October") +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        text = element_text(size = 35),
+        axis.text = element_text(colour = "black"),
+        legend.position = "none")
+
+# ggsave(here("figures",
+#             "pearson_FWC_diatom_8_march_oct.png"),
+#        width = 12, height = 10, dpi = 300)
+```
+
+```{r}
+fig_anom_cor <- march_fig + Aug_sept_fig
+
+ggsave(here("figures", "correlation_anomaly_panel.png"), fig_anom_cor,
+        width = 16, height = 7, dpi = 300)
+```
+
+
+```{r}
+# panel_2023_cor <- fig_chem_fwc / plot_spacer() / wrap_elements(full = fig_anom_cor) + plot_layout(heights = c(1, 1, 0.1, 1.3))
+# 
+# ggsave(here("figures", "correlation_chem_2023_anomaly_panel.png"), panel_2023_cor,
+#         width = 20, height = 20, dpi = 300)
+```
+
+
+```{r}
+#Timeseries annual anomaly
+chem_full_year <- chem_anom_calc %>%
+  select(group,  contribution) %>% 
+  group_by(group) %>% 
+  summarise(mean_contr = mean(contribution),
+            sd_contr = sd(contribution),
+            n_full = n()) %>% 
+  ungroup()
+
+#calculate the monthly mean for each group over the entire timeseries
+chem_year<- chem_anom_calc %>%
+  mutate(year = lubridate::year(date),
+         month = lubridate::month(date)) %>%
+  select(group, year, contribution) %>% 
+  group_by(year, group) %>% 
+  summarise(year_mean_contr = mean(contribution),
+            n = n()) %>% 
+  ungroup() 
+
+#calculate the standardized anomaly and create a center of the month date for plotting
+chem_anomaly_year <- chem_year %>% 
+  left_join(chem_full_year) %>% 
+  mutate(anom = year_mean_contr - mean_contr,
+         anom_std = anom/sd_contr) %>% 
+  mutate(pos = anom_std >= 0)
+```
+```{r}
+chem_anomaly_diat_year <- chem_anomaly_year %>%
+  filter(group == "diat")
+
+chem_anomaly_diat_year %>% 
+  ggplot(aes(x = year, y = anom, fill = pos)) +
+  geom_col(data = filter(chem_anomaly_diat_year, n < 3),
+           position = "identity", colour = "transparent",
+           alpha = 0.4) +
+  geom_col(data = filter(chem_anomaly_diat_year, n >= 3),
+           position = "identity", colour = "black", size = 0.5) +
+  # annotate("text", x = as.Date("2015-04-15"), y = 5, label = "b)", size = 12) +
+  # geom_vline(xintercept = as.Date("2023-01-01"), size = 1.5) +
+  scale_fill_manual(values = c("blue", "red"), guide = FALSE) +
+  # facet_grid(group ~ ., labeller = labeller(group = group_label)) +
+  # geom_hline(yintercept = 1) +
+  # geom_hline(yintercept = -1) +
+  # geom_hline(yintercept = 2, linetype = "dashed") +
+  # geom_hline(yintercept = -2, linetype = "dashed") +
+  # geom_vline(xintercept = as.Date("2023-01-01"), size = 1.5) +
+  # scale_x_date(limits = as.Date(c("2015-01-01", "2024-01-01")),
+  #              expand = c(0, 0),
+  #              date_breaks = "years", date_labels = "%b%y") +
+  # scale_y_continuous(labels = scales::label_number(accuracy = 1), 
+  #                    limits = c(-6, 6)) +
+  labs(y = bquote("Diat (mg" ~ m^-3*")")) +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        panel.grid.major.x =  element_line(color = "black", size = 0.5),
+        panel.grid.minor.x =  element_line(color = "darkgrey", size = 0.5),
+        # strip.text.x = element_blank(),
+        # panel.spacing = unit(2, "lines"),
+        text = element_text(size = 40),
+        axis.text = element_text(colour = "black"),
+        axis.title.x = element_blank())
+```
+
+```{r}
+#calculate the climatological mean, standard deviation and number of samples in each bin
+ctd_full_year <- ctd_5_long %>%
+  mutate(month = lubridate::month(date)) %>% 
+  select(par, val) %>% 
+  group_by(par) %>% 
+  summarise(mean_val = mean(val),
+            sd_val = sd(val),
+            n_full = n()) %>% 
+  ungroup()
+
+#calculate the monthly mean for each group over the entire timeseries
+ctd_year <- ctd_5_long %>%
+  mutate(year = lubridate::year(date),
+         month = lubridate::month(date)) %>%
+  select(par, year, val) %>% 
+  group_by(year, par) %>% 
+  summarise(year_mean_val = mean(val),
+            n = n()) %>% 
+  ungroup() 
+
+#calculate the standardized anomaly and create a center of the month date for plotting
+ctd_anomaly_year <- ctd_year %>% 
+  left_join(ctd_full_year) %>% 
+  mutate(anom = year_mean_val - mean_val,
+         anom_std = anom/sd_val) %>% 
+  mutate(pos = anom_std >= 0) #allows me to plot red/blue colors
+
+```
+
+```{r}
+anom_fwc_year <- ctd_anomaly_year %>% 
+  filter(par == "temp" & year < 2024)
+
+anom_fwc_year %>% 
+  ggplot(aes(x = as.factor(year), y = anom, fill = pos)) +
+  geom_col(data = filter(anom_fwc_year, n < 3),
+           position = "identity", colour = "transparent",
+           alpha = 0.4) +
+  geom_col(data = filter(anom_fwc_year, n >= 3),
+           position = "identity", colour = "black", size = 0.5) +
+  # annotate("text", x = as.Date("2015-04-15"), y = 1.7, label = "c)", size = 12) +
+  # geom_vline(xintercept = as.Date("2023-01-01"), size = 1.5) +
+  scale_fill_manual(values = c("blue", "red"), guide = FALSE) +
+  # scale_x_date(limits = as.Date(c("2015-01-01", "2024-01-01")),
+  #              expand = c(0, 0),
+  #              date_breaks = "years", date_labels = "%b%y") +
+  # scale_y_continuous(labels = scales::label_number(accuracy = 1), 
+  #                    limits = c(-2, 2)) +
+  labs(y = "FWC") +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        panel.grid.major.x =  element_line(color = "black", size = 0.5),
+        panel.grid.minor.x =  element_line(color = "darkgrey", size = 0.5),
+        text = element_text(size = 40),
+        axis.text = element_text(colour = "black"),
+        axis.title.x = element_blank())
+```
+
+
+```{r}
+scale_fwc <- 10
+
+chem_2019_21_23 <- chem_tchla_fwc %>%
+  mutate(year = lubridate::year(date),
+         yday = lubridate::yday(date)) %>%
+  filter(year == 2019 | year == 2021 | year == 2023)
+```
+
+
+```{r}
+ggplot() +
+  geom_area(data = chem_2019_21_23, aes(date, contribution, fill = fct_rev(group)),
+            alpha = 0.8) +
+  # geom_point(aes(date, tchla)) +
+  geom_line(data = chem_2019_21_23, aes(x = date, y = val*scale_fwc), size = 1.5) +
+  geom_point(data = chem_2019_21_23, aes(x = date, y = val*scale_fwc),
+             size = 2, fill = "white",
+             pch = 21, stroke = 1) +
+  scale_fill_manual(values = palette,
+                    labels = c("Diat", "Dict", "Dino", "Cryt", "GA",
+                               "Hapt", "Cyan")) +
+  scale_y_continuous(sec.axis = sec_axis(~./scale_fwc,
+                                         name = "FWC")) +
+  facet_grid(.~year, scales = "free_x") +
+  # scale_x_date(limits = as.Date(c("2021-01-01", "2021-12-15")),
+  #              expand = c(0, 0),
+  #              date_breaks = "1 month", date_labels = "%b") +
+  # annotate("text", x = as.Date("2021-01-10"), y = 15, label = "a)", size = 15) +
+  theme_bw() +
+  labs(y = bquote("Phyto. (TChl, mg" ~ m^-3*")"),
+       fill = "Group") +
+  # scale_y_continuous(expand = c(0, 0), limits = c(0,12)) +
+  scale_x_date(breaks = scales::date_breaks("3 month"),
+               labels = scales::date_format("%b")) +
+  theme(legend.position = "none",
+        legend.title = element_blank(),
+        # strip.background = element_blank(),
+        # strip.text.x = element_blank(),
+        # panel.spacing = unit(2, "lines"),
+        text = element_text(size = 40), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank()) +
+        # plot.margin = margin(0, 50, 0, 0)) +
+  guides(fill = guide_legend(nrow = 1, reverse = TRUE))
+
+ggsave(here("figures",
+            "single_2019_21_23.png"),
+       width = 16, height = 6, dpi = 300)
+```
+```{r}
+ctd %>% 
+  filter(pres < 30 & sal > 15) %>% 
+  mutate(year = lubridate::year(date),
+         month = lubridate::month(date)) %>% 
+  ggplot(aes(x = temp, y = sal, color = as.factor(month))) +
+  geom_point() +
+  facet_wrap(~year)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
