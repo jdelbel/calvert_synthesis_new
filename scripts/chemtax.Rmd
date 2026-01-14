@@ -17,6 +17,12 @@ library(RColorBrewer)
 ```{r}
 #Upload the full 5m chemtax timeseries - processing in same way as manuscript
 chem <- read_csv(here("files", "chemtax_single_2025-12-01.csv"))
+
+vert <- read_csv(here("outputs", "vertical_metrics.csv"))
+
+#Corrected CTD fluorescence data
+ctd_fl <- read_csv(here("outputs",
+                        "flu_qc_2025-11-25.csv"))
 ```
 
 ```{r}
@@ -805,6 +811,12 @@ print(table(comparison$rel_clust, comparison$abs_clust))
 ```
 
 ```{r}
+# Get cluster assignments (use the filtered 2016-2023 data if you removed 2024-2025)
+cluster_points <- abs_output$clusters %>%
+  distinct(date, community_cluster) %>%
+  filter(!is.na(community_cluster))
+
+
 #------------------------------------------------------------------------------
 # Updated color schemes for clusters (different from taxa but complementary)
 #------------------------------------------------------------------------------
@@ -948,6 +960,971 @@ print(p_combined)
 ggsave(here("figures", "phytoplankton_community_composition_combined_clusters.png"), 
        width = 16, height = 7.5, dpi = 300)
 ```
+
+```{r}
+chem_export <- chem_wide %>% 
+  left_join(abs_clusters)
+
+write.csv(chem_export, here("outputs", "chem_clusters_2025-12-03.csv"))
+```
+
+```{r}
+#------------------------------------------------------------------------------
+# Prepare integrated chlorophyll with consecutive sample averaging
+#------------------------------------------------------------------------------
+
+# Get all dates with CHEMTAX data
+chemtax_dates <- unique(c(
+  data_area_early$date,
+  data_bar_2020$date,
+  data_area_mid$date,
+  data_bars_late$date
+))
+
+# Filter integrated chlorophyll to only dates with CHEMTAX data, then average
+vert_filtered <- vert %>%
+  filter(date >= as.Date("2016-01-01") & date <= as.Date("2025-12-31")) %>%
+  filter(date %in% chemtax_dates) %>%  # Only keep dates with CHEMTAX data
+  arrange(date) %>%
+  mutate(
+    date_diff = c(Inf, diff(date)),
+    window_group = cumsum(date_diff > 2)  # Create new group when gap > 2 days
+  ) %>%
+  group_by(window_group) %>%
+  summarise(
+    date = mean(date),
+    int_chla = mean(int_chla, na.rm = TRUE),
+    n_samples = n(),
+    .groups = 'drop'
+  ) %>%
+  select(-window_group) %>%
+  mutate(date = as.Date(date, origin = "1970-01-01"))
+
+# Calculate scaling factor for secondary axis
+max_biomass <- max(c(
+  max(data_area_early$contribution, na.rm = TRUE),
+  max(data_area_mid$contribution, na.rm = TRUE),
+  max(data_bars_late$contribution, na.rm = TRUE)
+))
+
+max_chla <- max(vert_filtered$int_chla, na.rm = TRUE)
+scale_factor <- max_biomass / max_chla
+
+#------------------------------------------------------------------------------
+# Create main plot
+#------------------------------------------------------------------------------
+
+p_main <- ggplot() +
+  # Seasonal background shading
+  geom_rect(data = seasonal_backgrounds,
+            aes(xmin = start_date, xmax = end_date, ymin = 0, ymax = Inf, 
+                fill = season),
+            alpha = 0.15) +
+  
+  # Area plot for pre-2020-02-11
+  geom_area(data = data_area_early,
+            aes(x = date, y = contribution, fill = fct_rev(group)),
+            position = "stack", alpha = 0.9) +
+  
+  # Single bar for 2020-02-11
+  geom_bar(data = data_bar_2020,
+           aes(x = date, y = contribution, fill = fct_rev(group)),
+           position = "stack", stat = "identity", width = 20) +
+  
+  # Area plot for mid period
+  geom_area(data = data_area_mid,
+            aes(x = date, y = contribution, fill = fct_rev(group)),
+            position = "stack", alpha = 0.9) +
+  
+  # Bar plot for 2024-2025
+  geom_bar(data = data_bars_late,
+           aes(x = date, y = contribution, fill = fct_rev(group)),
+           position = "stack", stat = "identity", width = 20) +
+  
+  # Add integrated chlorophyll - line only, subtle
+  # geom_line(data = vert_filtered,
+  #           aes(x = date, y = int_chla * scale_factor),
+  #           color = "gray40", linewidth = 0.7) +
+  
+ # Add integrated chlorophyll line and points
+  geom_line(data = vert_filtered,
+            aes(x = date, y = int_chla * scale_factor),
+            color = "black", linewidth = 0.5) +
+  
+  geom_point(data = vert_filtered,
+             aes(x = date, y = int_chla * scale_factor),
+             shape = 21, size = 2, fill = "white", color = "black", stroke = 1) +
+  
+  scale_fill_manual(
+    values = c(taxon_colors, season_colors[c("Spring", "Summer")]),
+    breaks = names(taxon_colors),
+    name = NULL
+  ) +
+  
+  scale_x_date(limits = as.Date(c("2016-01-01", "2025-12-31")),
+               expand = c(0, 0),
+               date_breaks = "1 year", date_labels = "%Y") +
+  
+  scale_y_continuous(
+    expand = c(0, 0),
+    sec.axis = sec_axis(~ . / scale_factor, 
+                       name = expression(paste("Integrated Chl ", italic("a"), " (mg ", m^{-2}, ")")))
+  ) +
+  
+  labs(
+    y = expression(paste("Phytoplankton biomass (mg ", m^{-3}, ")"))
+  ) +
+  
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width = unit(0.8, "cm"),
+    legend.title = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    text = element_text(size = 28, color = "black"),
+    axis.title.y.right = element_text(margin = margin(l = 10)),
+    plot.margin = margin(5.5, 5.5, 0, 5.5)
+  ) +
+  guides(fill = guide_legend(nrow = 1))
+
+#------------------------------------------------------------------------------
+# Create cluster strip panel
+#------------------------------------------------------------------------------
+
+p_clusters <- ggplot(cluster_points, aes(x = date, y = 1, fill = community_cluster)) +
+  geom_tile(height = 0.5, width = 25) +
+  
+  scale_fill_manual(
+    values = cluster_colors,
+    labels = cluster_labels,
+    name = "Community Cluster"
+  ) +
+  
+  scale_x_date(limits = as.Date(c("2016-01-01", "2025-12-31")),
+               expand = c(0, 0),
+               date_breaks = "1 year", date_labels = "%Y") +
+  
+  scale_y_continuous(expand = c(0, 0)) +
+  
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width = unit(1.2, "cm"),
+    legend.title = element_text(size = 24, face = "bold", hjust = 0.5),
+    legend.text = element_text(size = 20),
+    legend.margin = margin(t = 5, b = 5),
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    text = element_text(size = 28, color = "black"),
+    plot.margin = margin(0, 5.5, 5.5, 5.5)
+  ) +
+  guides(fill = guide_legend(
+    title.position = "top",
+    title.hjust = 0.5,
+    nrow = 1
+  ))
+
+#------------------------------------------------------------------------------
+# Combine plots
+#------------------------------------------------------------------------------
+
+library(patchwork)
+p_combined <- p_main / p_clusters + 
+  plot_layout(heights = c(12, 1))
+
+print(p_combined)
+ggsave(here("figures", "phytoplankton_community_composition_combined_clusters_integrated.png"), 
+       width = 16, height = 8.5, dpi = 300)
+```
+
+```{r}
+#------------------------------------------------------------------------------
+# Prepare CTD fluorescence data and calculate integrated chlorophyll
+#------------------------------------------------------------------------------
+
+# Get all dates with CHEMTAX data first
+chemtax_dates <- unique(c(
+  data_area_early$date,
+  data_bar_2020$date,
+  data_area_mid$date,
+  data_bars_late$date
+))
+
+# Filter and average CTD data by date and pres (averaging across stations)
+# Only keep dates that match CHEMTAX dates
+ctd_fl_filtered <- ctd_fl %>%
+  filter(date >= as.Date("2016-01-01") & date <= as.Date("2025-12-31")) %>%
+  filter(date %in% chemtax_dates) %>%
+  filter(!is.na(f_final)) %>%
+  filter(!is.na(pres)) %>%
+  mutate(
+    pres = as.numeric(pres),
+    f_final = as.numeric(f_final)
+  ) %>%
+  filter(pres <= 30) %>%
+  # Average across stations for each date and pres
+  group_by(date, pres) %>%
+  summarise(
+    f_final = mean(f_final, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Calculate integrated chlorophyll directly from filtered CTD data (0-30m)
+vert_filtered <- ctd_fl_filtered %>%
+  arrange(date, pres) %>%
+  group_by(date) %>%
+  summarise(
+    int_chla = pracma::trapz(pres, f_final),
+    .groups = 'drop'
+  ) %>%
+  # Apply consecutive day averaging
+  arrange(date) %>%
+  mutate(
+    date_diff = c(Inf, diff(date)),
+    window_group = cumsum(date_diff > 2)
+  ) %>%
+  group_by(window_group) %>%
+  summarise(
+    date = mean(date),
+    int_chla = mean(int_chla, na.rm = TRUE),
+    n_samples = n(),
+    .groups = 'drop'
+  ) %>%
+  select(-window_group) %>%
+  mutate(date = as.Date(date, origin = "1970-01-01"))
+
+#------------------------------------------------------------------------------
+# Create CTD fluorescence section plot
+#------------------------------------------------------------------------------
+
+# Define color palette for fluorescence
+colors_v3 <- c("#08519c", "#3182bd", "#6baed6", "#9ecae1", 
+               "#c6dbef", "#ffffcc", "#ffeda0", "#fed976", 
+               "#feb24c", "#fd8d3c", "#fc4e2a", "#e31a1c", "#bd0026")
+
+p_ctd <- ggplot(ctd_fl_filtered, aes(x = date, y = pres, fill = f_final)) +
+  geom_tile() +
+  geom_hline(yintercept = 5, size = 1) +
+  scale_x_date(
+    limits = as.Date(c("2016-01-01", "2025-12-31")),
+    expand = c(0, 0),
+    date_breaks = "1 year",
+    date_labels = "%Y"
+  ) +
+  scale_y_reverse(
+    expand = c(0, 0),
+    breaks = seq(0, 30, by = 10)
+  ) +
+  scale_fill_gradientn(
+    colors = colors_v3,
+    values = scales::rescale(c(0, 2, 5, 10, 20, 30)),
+    na.value = "grey90",
+    name = "CTD Fluorescence"
+  ) +
+  labs(
+    y = "Depth (m)"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.key.width = unit(2, "cm"),
+    legend.key.height = unit(0.4, "cm"),
+    legend.title = element_text(size = 24),
+    legend.text = element_text(size = 20),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    text = element_text(size = 28, color = "black"),
+    plot.margin = margin(5.5, 5.5, 0, 5.5)
+  )
+
+# Calculate scaling factor for secondary axis
+max_biomass <- max(c(
+  max(data_area_early$contribution, na.rm = TRUE),
+  max(data_area_mid$contribution, na.rm = TRUE),
+  max(data_bars_late$contribution, na.rm = TRUE)
+))
+
+max_chla <- max(vert_filtered$int_chla, na.rm = TRUE)
+scale_factor <- max_biomass / max_chla
+
+#------------------------------------------------------------------------------
+# Create main CHEMTAX plot
+#------------------------------------------------------------------------------
+
+p_main <- ggplot() +
+  geom_rect(data = seasonal_backgrounds,
+            aes(xmin = start_date, xmax = end_date, ymin = 0, ymax = Inf, 
+                fill = season),
+            alpha = 0.15) +
+  geom_area(data = data_area_early,
+            aes(x = date, y = contribution, fill = fct_rev(group)),
+            position = "stack", alpha = 0.9) +
+  geom_bar(data = data_bar_2020,
+           aes(x = date, y = contribution, fill = fct_rev(group)),
+           position = "stack", stat = "identity", width = 20) +
+  geom_area(data = data_area_mid,
+            aes(x = date, y = contribution, fill = fct_rev(group)),
+            position = "stack", alpha = 0.9) +
+  geom_bar(data = data_bars_late,
+           aes(x = date, y = contribution, fill = fct_rev(group)),
+           position = "stack", stat = "identity", width = 20) +
+  geom_line(data = vert_filtered,
+            aes(x = date, y = int_chla * scale_factor),
+            color = "black", linewidth = 0.5) +
+  geom_point(data = vert_filtered,
+             aes(x = date, y = int_chla * scale_factor),
+             shape = 21, size = 2, fill = "white", color = "black", stroke = 1) +
+  scale_fill_manual(
+    values = c(taxon_colors, season_colors[c("Spring", "Summer")]),
+    breaks = names(taxon_colors),
+    name = "Phytoplankton Taxa"
+  ) +
+  scale_x_date(limits = as.Date(c("2016-01-01", "2025-12-31")),
+               expand = c(0, 0),
+               date_breaks = "1 year", date_labels = "%Y") +
+  scale_y_continuous(
+    expand = c(0, 0),
+    sec.axis = sec_axis(~ . / scale_factor, 
+                       name = expression(paste("Integrated Chl ", italic("a"), " (mg ", m^{-2}, ")")))
+  ) +
+  labs(
+    y = expression(paste("Phytoplankton biomass (mg ", m^{-3}, ")"))
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width = unit(0.8, "cm"),
+    legend.title = element_text(size = 24),
+    legend.text = element_text(size = 20),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    text = element_text(size = 28, color = "black"),
+    axis.title.y.right = element_text(margin = margin(l = 10)),
+    plot.margin = margin(0, 5.5, 0, 5.5)
+  ) +
+  guides(fill = guide_legend(nrow = 1, title.position = "left"))
+
+#------------------------------------------------------------------------------
+# Create cluster strip panel
+#------------------------------------------------------------------------------
+
+p_clusters <- ggplot(cluster_points, aes(x = date, y = 1, fill = community_cluster)) +
+  geom_tile(height = 0.5, width = 25) +
+  scale_fill_manual(
+    values = cluster_colors,
+    labels = cluster_labels,
+    name = "Community Cluster"
+  ) +
+  scale_x_date(limits = as.Date(c("2016-01-01", "2025-12-31")),
+               expand = c(0, 0),
+               date_breaks = "1 year", date_labels = "%Y") +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width = unit(1.2, "cm"),
+    legend.title = element_text(size = 24, hjust = 0),
+    legend.text = element_text(size = 20),
+    legend.margin = margin(t = 5, b = 5),
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    text = element_text(size = 28, color = "black"),
+    plot.margin = margin(0, 5.5, 5.5, 5.5)
+  ) +
+  guides(fill = guide_legend(
+    title.position = "left",
+    nrow = 1
+  ))
+
+#------------------------------------------------------------------------------
+# Combine all three panels
+#------------------------------------------------------------------------------
+
+library(patchwork)
+p_combined <- p_ctd / p_main / p_clusters + 
+  plot_layout(heights = c(4, 10, 1))
+
+print(p_combined)
+ggsave(here("figures", "phytoplankton_community_composition_combined_clusters_integrated.png"), 
+       width = 16, height = 12, dpi = 300)
+```
+
+```{r}
+#------------------------------------------------------------------------------
+# Prepare CTD fluorescence data and calculate integrated chlorophyll
+#------------------------------------------------------------------------------
+
+# Get all dates with CHEMTAX data first
+chemtax_dates <- unique(c(
+  data_area_early$date,
+  data_bar_2020$date,
+  data_area_mid$date,
+  data_bars_late$date
+))
+
+# Filter and average CTD data by date and pres (averaging across stations)
+# Only keep dates that match CHEMTAX dates
+ctd_fl_filtered <- ctd_fl %>%
+  filter(date >= as.Date("2016-01-01") & date <= as.Date("2025-12-31")) %>%
+  filter(date %in% chemtax_dates) %>%
+  filter(!is.na(f_final)) %>%
+  filter(!is.na(pres)) %>%
+  mutate(
+    pres = as.numeric(pres),
+    f_final = as.numeric(f_final)
+  ) %>%
+  filter(pres <= 30) %>%
+  # Average across stations for each date and pres
+  group_by(date, pres) %>%
+  summarise(
+    f_final = mean(f_final, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Calculate SCM depth (depth of maximum fluorescence for each date)
+scm_depth <- ctd_fl_filtered %>%
+  group_by(date) %>%
+  slice_max(f_final, n = 1) %>%
+  slice(1) %>%  # In case of ties, take the first
+  ungroup()
+
+# Calculate integrated chlorophyll directly from filtered CTD data (0-30m)
+vert_filtered <- ctd_fl_filtered %>%
+  arrange(date, pres) %>%
+  group_by(date) %>%
+  summarise(
+    int_chla = pracma::trapz(pres, f_final),
+    .groups = 'drop'
+  ) %>%
+  # Apply consecutive day averaging
+  arrange(date) %>%
+  mutate(
+    date_diff = c(Inf, diff(date)),
+    window_group = cumsum(date_diff > 2)
+  ) %>%
+  group_by(window_group) %>%
+  summarise(
+    date = mean(date),
+    int_chla = mean(int_chla, na.rm = TRUE),
+    n_samples = n(),
+    .groups = 'drop'
+  ) %>%
+  select(-window_group) %>%
+  mutate(date = as.Date(date, origin = "1970-01-01"))
+
+#------------------------------------------------------------------------------
+# Create CTD fluorescence section plot
+#------------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------
+# Create CTD fluorescence section plot
+#------------------------------------------------------------------------------
+
+# Define improved blue-yellow-red color palette with better mid-range contrast
+colors_fluor <- c("#08519c", "#3182bd", "#6baed6", "#9ecae1", 
+                  "#c6dbef", "#fef0d9", "#fdcc8a", "#fc8d59", 
+                  "#e34a33", "#b30000")
+
+p_ctd <- ggplot(ctd_fl_filtered, aes(x = date, y = pres, fill = f_final)) +
+  geom_tile() +
+  geom_hline(yintercept = 5, size = 1) +
+  geom_point(data = scm_depth, 
+             aes(x = date, y = pres),
+             shape = 21, size = 2, fill = "white", color = "black", 
+             stroke = 0.8, inherit.aes = FALSE) +
+  scale_x_date(
+    limits = as.Date(c("2016-01-01", "2025-12-31")),
+    expand = c(0, 0),
+    date_breaks = "1 year",
+    date_labels = "%Y"
+  ) +
+  scale_y_reverse(
+    expand = c(0, 0),
+    breaks = seq(0, 30, by = 10)
+  ) +
+  scale_fill_gradientn(
+    colors = colors_v3,
+    values = scales::rescale(c(0, 2, 5, 10, 20, 30)),
+    na.value = "grey90",
+    name = "CTD Fluorescence"
+  ) +
+  labs(
+    y = "Depth (m)"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.key.width = unit(2, "cm"),
+    legend.key.height = unit(0.4, "cm"),
+    legend.title = element_text(size = 24),
+    legend.text = element_text(size = 20),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    text = element_text(size = 28, color = "black"),
+    plot.margin = margin(5.5, 5.5, 0, 5.5)
+  )
+
+# Calculate scaling factor for secondary axis
+max_biomass <- max(c(
+  max(data_area_early$contribution, na.rm = TRUE),
+  max(data_area_mid$contribution, na.rm = TRUE),
+  max(data_bars_late$contribution, na.rm = TRUE)
+))
+
+max_chla <- max(vert_filtered$int_chla, na.rm = TRUE)
+scale_factor <- max_biomass / max_chla
+
+#------------------------------------------------------------------------------
+# Create main CHEMTAX plot
+#------------------------------------------------------------------------------
+
+p_main <- ggplot() +
+  geom_rect(data = seasonal_backgrounds,
+            aes(xmin = start_date, xmax = end_date, ymin = 0, ymax = Inf, 
+                fill = season),
+            alpha = 0.15) +
+  geom_area(data = data_area_early,
+            aes(x = date, y = contribution, fill = fct_rev(group)),
+            position = "stack", alpha = 0.9) +
+  geom_bar(data = data_bar_2020,
+           aes(x = date, y = contribution, fill = fct_rev(group)),
+           position = "stack", stat = "identity", width = 20) +
+  geom_area(data = data_area_mid,
+            aes(x = date, y = contribution, fill = fct_rev(group)),
+            position = "stack", alpha = 0.9) +
+  geom_bar(data = data_bars_late,
+           aes(x = date, y = contribution, fill = fct_rev(group)),
+           position = "stack", stat = "identity", width = 20) +
+  geom_line(data = vert_filtered,
+            aes(x = date, y = int_chla * scale_factor),
+            color = "black", linewidth = 0.5) +
+  geom_point(data = vert_filtered,
+             aes(x = date, y = int_chla * scale_factor),
+             shape = 21, size = 2, fill = "white", color = "black", stroke = 1) +
+  scale_fill_manual(
+    values = c(taxon_colors, season_colors[c("Spring", "Summer")]),
+    breaks = names(taxon_colors),
+    name = NULL
+  ) +
+  scale_x_date(limits = as.Date(c("2016-01-01", "2025-12-31")),
+               expand = c(0, 0),
+               date_breaks = "1 year", date_labels = "%Y") +
+  scale_y_continuous(
+    expand = c(0, 0),
+    sec.axis = sec_axis(~ . / scale_factor, 
+                       name = expression(paste("Integrated Chl ", italic("a"), " (mg ", m^{-2}, ")")))
+  ) +
+  labs(
+    y = expression(paste("Phytoplankton biomass (mg ", m^{-3}, ")"))
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = c(0.02, 0.98),
+    legend.justification = c(0, 1),
+    legend.direction = "horizontal",
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width = unit(0.8, "cm"),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 20),
+    legend.box.margin = margin(4, 4, 4, 4),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    text = element_text(size = 28, color = "black"),
+    axis.title.y.right = element_text(margin = margin(l = 10)),
+    plot.margin = margin(0, 5.5, 0, 5.5)
+  ) +
+  guides(fill = guide_legend(nrow = 1))
+
+#------------------------------------------------------------------------------
+# Create cluster strip panel
+#------------------------------------------------------------------------------
+
+p_clusters <- ggplot(cluster_points, aes(x = date, y = 1, fill = community_cluster)) +
+  geom_tile(height = 0.5, width = 25) +
+  scale_fill_manual(
+    values = cluster_colors,
+    labels = cluster_labels,
+    name = "Community Cluster"
+  ) +
+  scale_x_date(limits = as.Date(c("2016-01-01", "2025-12-31")),
+               expand = c(0, 0),
+               date_breaks = "1 year", date_labels = "%Y") +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width = unit(1.2, "cm"),
+    legend.title = element_text(size = 24, hjust = 0),
+    legend.text = element_text(size = 20),
+    legend.margin = margin(t = 5, b = 5),
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    text = element_text(size = 28, color = "black"),
+    plot.margin = margin(0, 5.5, 5.5, 5.5)
+  ) +
+  guides(fill = guide_legend(
+    title.position = "left",
+    nrow = 1
+  ))
+
+#------------------------------------------------------------------------------
+# Combine all three panels
+#------------------------------------------------------------------------------
+
+library(patchwork)
+p_combined <- p_ctd / p_main / p_clusters + 
+  plot_layout(heights = c(4, 9, 1))
+
+print(p_combined)
+ggsave(here("figures", "phytoplankton_community_composition_combined_clusters_integrated2.png"), 
+       width = 16, height = 11, dpi = 300)
+```
+
+```{r}
+#------------------------------------------------------------------------------
+# Calculate stratification index for dates in the figure
+#------------------------------------------------------------------------------
+
+# Calculate stratification metric: max/integrated fluorescence
+# Using only the dates that are in ctd_fl_filtered (which already matches chemtax_dates)
+stratification_metrics <- ctd_fl_filtered %>%
+  arrange(date, pres) %>%
+  group_by(date) %>%
+  summarise(
+    f_max = max(f_final, na.rm = TRUE),
+    f_integrated = pracma::trapz(pres, f_final),
+    depth_range = max(pres) - min(pres),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    # Normalize by depth range to get average concentration
+    f_mean_equiv = f_integrated / depth_range,
+    # Stratification index: max / mean
+    stratification_index = f_max / f_mean_equiv
+  ) %>%
+  mutate(
+    # Categorize based on stratification index
+    stratification_category = case_when(
+      stratification_index < 1.5 ~ "Well-mixed",
+      stratification_index >= 1.5 & stratification_index < 2.5 ~ "Weakly stratified",
+      stratification_index >= 2.5 ~ "Strongly stratified"
+    ),
+    # Binary for filtering
+    well_mixed = stratification_index < 1.5,
+    stratified = stratification_index >= 1.5
+  )
+
+#------------------------------------------------------------------------------
+# Calculate surface enhancement metric
+#------------------------------------------------------------------------------
+
+# Calculate SCM intensity: compares subsurface max to surface (0-5m) mean
+scm_intensity <- ctd_fl_filtered %>%
+  group_by(date) %>%
+  summarise(
+    f_surface = mean(f_final[pres <= 5], na.rm = TRUE),
+    f_subsurface_max = max(f_final[pres > 5], na.rm = TRUE),
+    depth_subsurface_max = pres[pres > 5][which.max(f_final[pres > 5])],
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    # SCM intensity ratio
+    scm_intensity = f_subsurface_max / f_surface,
+    # Difference (for absolute scale)
+    scm_enhancement_diff = f_subsurface_max - f_surface
+  ) %>%
+  mutate(
+    # Categorize subsurface chlorophyll development
+    scm_category = case_when(
+      scm_intensity < 1.2 ~ "Surface dominated",
+      scm_intensity >= 1.2 & scm_intensity < 1.5 ~ "Weak SCM",
+      scm_intensity >= 1.5 ~ "Strong SCM"
+    )
+  )
+
+# Rename stratification_metrics for clarity
+vertical_concentration <- stratification_metrics %>%
+  rename(
+    vertical_concentration_index = stratification_index,
+    concentration_category = stratification_category
+  ) %>%
+  mutate(
+    concentration_category = case_when(
+      concentration_category == "Well-mixed" ~ "Uniform",
+      concentration_category == "Weakly stratified" ~ "Weakly concentrated",
+      concentration_category == "Strongly stratified" ~ "Highly concentrated",
+      TRUE ~ concentration_category
+    )
+  )
+
+#------------------------------------------------------------------------------
+# Create 4-panel stratification analysis figure
+#------------------------------------------------------------------------------
+
+# Panel 1: CTD fluorescence section
+scm_depth_filtered <- scm_depth %>%
+  left_join(vertical_concentration, by = "date") %>%
+  filter(stratified == TRUE)  # Only show SCM when stratified
+
+colors_v3 <- c("#08519c", "#3182bd", "#6baed6", "#9ecae1", 
+               "#c6dbef", "#ffffcc", "#ffeda0", "#fed976", 
+               "#feb24c", "#fd8d3c", "#fc4e2a", "#e31a1c", "#bd0026")
+
+p1_ctd <- ggplot(ctd_fl_filtered, aes(x = date, y = pres, fill = f_final)) +
+  geom_tile() +
+  geom_hline(yintercept = 5, size = 1) +
+  scale_x_date(
+    limits = as.Date(c("2016-01-01", "2025-12-31")),
+    expand = c(0, 0),
+    date_breaks = "1 year",
+    date_labels = "%Y"
+  ) +
+  scale_y_reverse(
+    expand = c(0, 0),
+    breaks = seq(0, 30, by = 10)
+  ) +
+  scale_fill_gradientn(
+    colors = colors_v3,
+    values = scales::rescale(c(0, 2, 5, 10, 20, 30)),
+    na.value = "grey90",
+    name = "CTD Fluorescence"
+  ) +
+  labs(
+    y = "Depth (m)",
+    title = "(a) CTD Fluorescence Profiles"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.key.width = unit(1.5, "cm"),
+    legend.key.height = unit(0.4, "cm"),
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 14),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    text = element_text(size = 20, color = "black"),
+    plot.title = element_text(hjust = 0, size = 20, face = "bold"),
+    plot.margin = margin(5.5, 5.5, 5.5, 5.5)
+  )
+
+# Panel 2: Integrated chlorophyll time series
+p2_intchla <- ggplot(vert_filtered, aes(x = date, y = int_chla)) +
+  geom_line(color = "black", linewidth = 0.8) +
+  geom_point(shape = 21, size = 2.5, fill = "white", color = "black", stroke = 1) +
+  scale_x_date(
+    limits = as.Date(c("2016-01-01", "2025-12-31")),
+    expand = c(0, 0),
+    date_breaks = "1 year",
+    date_labels = "%Y"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0.05, 0.1))
+  ) +
+  labs(
+    y = expression(paste("Integrated Chl ", italic("a"), " (mg ", m^{-2}, ")")),
+    title = "(b) Integrated Chlorophyll (0-30m)"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 20, color = "black"),
+    plot.title = element_text(hjust = 0, size = 20, face = "bold"),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.margin = margin(5.5, 5.5, 5.5, 5.5)
+  )
+
+# Panel 3: Vertical concentration index time series
+p3_vertical_concentration <- ggplot(vertical_concentration, aes(x = date, y = vertical_concentration_index)) +
+  geom_hline(yintercept = 1.5, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+  geom_hline(yintercept = 2.5, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+  geom_line(color = "black", linewidth = 0.8) +
+  geom_point(aes(fill = concentration_category), 
+             shape = 21, size = 2.5, color = "black", stroke = 0.8) +
+  scale_fill_manual(
+    values = c("Uniform" = "#d7191c", 
+               "Weakly concentrated" = "#fdae61", 
+               "Highly concentrated" = "#2b83ba"),
+    name = "Vertical Distribution"
+  ) +
+  scale_x_date(
+    limits = as.Date(c("2016-01-01", "2025-12-31")),
+    expand = c(0, 0),
+    date_breaks = "1 year",
+    date_labels = "%Y"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0.05, 0.1))
+  ) +
+  labs(
+    y = "Vertical Concentration Index\n(max / mean fluorescence)",
+    title = "(c) Vertical Concentration Index"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.key.height = unit(0.4, "cm"),
+    legend.key.width = unit(0.8, "cm"),
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 14),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 20, color = "black"),
+    plot.title = element_text(hjust = 0, size = 20, face = "bold"),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.margin = margin(5.5, 5.5, 5.5, 5.5)
+  )
+
+# Panel 4: SCM intensity time series
+p4_scm_intensity <- ggplot(scm_intensity, aes(x = date, y = scm_intensity)) +
+  geom_hline(yintercept = 1.0, linetype = "solid", color = "gray70", linewidth = 0.5) +
+  geom_hline(yintercept = 1.2, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+  geom_hline(yintercept = 1.5, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+  geom_line(color = "black", linewidth = 0.8) +
+  geom_point(aes(fill = scm_category), 
+             shape = 21, size = 2.5, color = "black", stroke = 0.8) +
+  scale_fill_manual(
+    values = c("Surface dominated" = "#fee0d2", 
+               "Weak SCM" = "#fc9272", 
+               "Strong SCM" = "#de2d26"),
+    name = "SCM Development"
+  ) +
+  scale_x_date(
+    limits = as.Date(c("2016-01-01", "2025-12-31")),
+    expand = c(0, 0),
+    date_breaks = "1 year",
+    date_labels = "%Y"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0.05, 0.1))
+  ) +
+  labs(
+    x = "Year",
+    y = "SCM Intensity\n(subsurface max / surface mean)",
+    title = "(d) SCM Intensity"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.key.height = unit(0.4, "cm"),
+    legend.key.width = unit(0.8, "cm"),
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 14),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 20, color = "black"),
+    plot.title = element_text(hjust = 0, size = 20, face = "bold"),
+    plot.margin = margin(5.5, 5.5, 5.5, 5.5)
+  )
+
+#------------------------------------------------------------------------------
+# Combine all four panels
+#------------------------------------------------------------------------------
+
+# Create layout: 4 panels stacked vertically
+p_combined_strat <- p1_ctd / p2_intchla / p3_vertical_concentration / p4_scm_intensity +
+  plot_layout(heights = c(1, 1, 1, 1))
+
+print(p_combined_strat)
+ggsave(here("figures", "vertical_structure_analysis_4panel.png"), 
+       width = 16, height = 16, dpi = 300)
+
+#------------------------------------------------------------------------------
+# Summary statistics
+#------------------------------------------------------------------------------
+
+cat("\nVertical Concentration Index Summary:\n")
+print(summary(vertical_concentration$vertical_concentration_index))
+
+cat("\nVertical Distribution Category Counts:\n")
+print(table(vertical_concentration$concentration_category))
+
+cat("\nSCM Intensity Summary:\n")
+print(summary(scm_intensity$scm_intensity))
+
+cat("\nSCM Category Counts:\n")
+print(table(scm_intensity$scm_category))
+
+cat("\nCorrelation between metrics:\n")
+combined_metrics <- vertical_concentration %>%
+  left_join(scm_intensity, by = "date")
+cat("Vertical Concentration Index vs SCM Intensity: ", 
+    cor(combined_metrics$vertical_concentration_index, 
+        combined_metrics$scm_intensity, 
+        use = "complete.obs"), "\n")
+
+#------------------------------------------------------------------------------
+# Export vertical structure metrics for RDA analysis
+#------------------------------------------------------------------------------
+
+# Combine both metrics and integrated chlorophyll into a single dataframe
+vertical_metrics_export <- vertical_concentration %>%
+  select(date, vertical_concentration_index, concentration_category, 
+         well_mixed, stratified) %>%
+  left_join(
+    scm_intensity %>% select(date, scm_intensity, scm_category, 
+                             f_surface, f_subsurface_max, depth_subsurface_max),
+    by = "date"
+  ) %>%
+  left_join(
+    vert_filtered %>% select(date, int_chla),
+    by = "date"
+  )
+
+# Save as CSV
+write.csv(vertical_metrics_export, 
+          here("outputs", "vertical_structure_metrics.csv"),
+          row.names = FALSE)
+
+
+
+```
+
+
+
+
 
 ```{r}
 #==============================================================================

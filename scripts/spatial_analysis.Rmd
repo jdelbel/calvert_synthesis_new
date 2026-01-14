@@ -1,0 +1,21 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(here)
+```
+
+```{r}
+f <- read_excel(here("files", "8_binAvg-1768259917283.xlsx"), "Data")
+```
+
+```{r}
+f <- f %>% 
+  select(`Cast PK` = `Cast PK`,
+         station = st)
+```
+

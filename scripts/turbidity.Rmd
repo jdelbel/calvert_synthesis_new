@@ -1,0 +1,99 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Some new interpolation tutorials to consider:
+https://search.r-project.org/CRAN/refmans/rioja/html/interp.dataset.html
+https://github.com/hdugan/NTLlakeloads
+
+```{r}
+#Upload packages
+library(tidyverse)
+library(here)
+library(readxl)
+library(patchwork)
+library(lubridate)
+```
+
+```{r}
+ctd <- read_csv(here("files", "8_binAvg-1768003125312.csv"))
+```
+```{r}
+ctd_calc <- ctd %>% 
+  mutate(date = date(`Measurement time`)) %>%
+  filter(`Cast Direction Flag` == "d") %>% 
+  # filter(is.na(`Fluorometry Chlorophyll flag`)) %>% 
+  select(castpk = `Cast PK`,
+         ctd_num =`CTD serial number`,
+         date,
+         m_time = `Measurement time`,
+         station = Station,
+         longitude = `Station Longitude`,
+         latitude = `Station Latitude`,
+         pres = `Pressure (dbar)`,
+         # sal = `Salinity (PSU)`,
+         # temp = `Temperature (deg C)`,
+         turb = `Turbidity (FTU)`,
+         ) %>% 
+  filter(!is.na(turb)) %>%  # Remove missing values
+  
+  # Step 1: Calculate daily means by depth
+  group_by(date, pres, station, ctd_num) %>%
+  summarise(
+    turb_daily = mean(turb, na.rm = TRUE),
+    # o2_daily = mean(o2, na.rm = TRUE),
+    .groups = 'drop'
+    )
+
+```
+
+```{r}
+ctd_23 <- ctd_calc %>% 
+  mutate(year = year(date)) %>% 
+  filter(year == "2023")
+```
+
+```{r}
+library(ggplot2)
+library(viridis)
+library(dplyr)
+library(lubridate)
+
+ctd_23_kc10 <- ctd_23 %>% 
+  filter(station == "KC10" &
+           pres > 3 &
+           ctd_num == 211567
+         ) %>%
+  mutate(month = month(date, label = TRUE, abbr = TRUE))
+
+p <- ggplot(ctd_23_kc10, aes(x = turb_daily, y = pres, color = month)) +
+  geom_point(alpha = 0.3, size = 1) +
+  geom_smooth(aes(group = date), 
+              orientation = "y", 
+              method = "loess",
+              span = 0.1,
+              se = FALSE,
+              linewidth = 1.5) +
+  geom_vline(xintercept = 0.2) +
+  scale_y_reverse() +
+  scale_color_viridis_d(option = "turbo", name = "Month") +
+  facet_wrap(~ month, scales = "free_x") +
+  labs(x = "Turbidity (FTU)", 
+       y = "Pressure (dbar)",
+       title = "Turbidity Profiles at Station KC10 (2023)") +
+  theme_bw(base_size = 18) +
+  theme(legend.position = "none",
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "grey90"),
+        strip.text = element_text(face = "bold", size = 18),
+        axis.title = element_text(size = 18),
+        plot.title = element_text(size = 16, face = "bold"))
+
+ggsave(here("figures", "turbidity_profiles_KC10_2023.png"), 
+       plot = p, 
+       width = 12, 
+       height = 14, 
+       dpi = 300)
+```
+

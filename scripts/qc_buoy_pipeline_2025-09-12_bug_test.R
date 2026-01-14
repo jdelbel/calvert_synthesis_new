@@ -340,16 +340,11 @@ plot_qc_progression <- function(qc_steps) {
 
 
 
-
-
-
-
-
 #Downloading hourly data from the KC10 buoy fl
-chl <- read_csv(here("files", "buoy_fl_2025-09-08.1hourSamples.all.csv"))
+chl <- read_csv(here("files", "bouy_fl_2026-01-13.1hour.Samples.all.csv"))
+# 2026-01-13.1hourSamples.all
 
-
-
+# buoy_fl_2025-09-08.1hourSamples.all
 # 2024-12-05.1hourSamples.all
 # 2025-08-20.1hourSamples.all
 
@@ -392,4 +387,4 @@ final_data %>%
 test2 <- final_data %>% 
   filter(date_corr == "2022-03-07")
 
-write.csv(final_data, here("outputs", "qc_buoy_2025-09-12_bug_test.csv"))
+write.csv(final_data, here("outputs", "qc_buoy_2026-01-13_bug_test.csv"))

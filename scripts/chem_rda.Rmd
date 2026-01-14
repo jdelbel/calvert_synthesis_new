@@ -1,0 +1,1480 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+```{r}
+library(tidyverse)
+library(here)
+library(vegan)
+```
+
+```{r}
+chem <- read_csv(here("outputs", "chem_clusters_2025-12-03.csv"))
+
+env <- read_csv(here("outputs", "enviro_2025-12-03.csv"))
+
+vert <- read_csv(here("outputs", "vertical_metrics.csv"))
+```
+
+```{r}
+#------------------------------------------------------------------------------
+# 1. DATA PREPARATION
+#------------------------------------------------------------------------------
+
+# Remove ...1 columns
+chem_clean <- chem %>% select(-`...1`)
+env_clean <- env %>% select(-`...1`)
+
+# Average environmental data by date and station
+env_averaged <- env_clean %>%
+  group_by(date) %>%
+  summarise(
+    across(where(is.numeric), ~mean(.x, na.rm = TRUE)),
+    .groups = 'drop'
+  )
+
+env_averaged <- env_averaged %>% 
+  left_join(vert)
+
+# Check for any columns that became all NA
+na_cols <- env_averaged %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything()) %>%
+  filter(value == nrow(env_averaged))
+
+if(nrow(na_cols) > 0) {
+  cat("Warning: These columns are all NA after averaging:\n")
+  print(na_cols$name)
+}
+
+# Join CHEMTAX with environmental data
+rda_data <- chem_clean %>%
+  left_join(env_averaged, by = c("date")) %>%
+  drop_na()  # Remove any rows with missing data
+
+cat("\n=== DATA COVERAGE ===\n")
+cat("CHEMTAX samples:", nrow(chem_clean), "\n")
+cat("After joining with env data:", nrow(rda_data), "\n")
+cat("Coverage:", round(nrow(rda_data) / nrow(chem_clean) * 100, 1), "%\n")
+```
+
+
+```{r}
+#------------------------------------------------------------------------------
+# 2. PREPARE RDA MATRICES
+#------------------------------------------------------------------------------
+
+# Response matrix: Phytoplankton groups (relative abundance)
+# Assuming your 8 phyto groups are named: diat, raph, dict, dino, cryp, GA, hapt, cyan
+phyto_groups <- c("diat", "raph", "dict", "dino", "cryp", "GA", "hapt", "cyan")
+
+phyto_response <- rda_data %>%
+  select(all_of(phyto_groups)) %>%
+  as.data.frame()
+
+# Predictor matrix: Environmental variables
+# Remove non-numeric and identifier columns
+env_predictors <- rda_data %>%
+  select(-all_of(phyto_groups), -date, -abs_clust) %>%
+  select(where(is.numeric)) %>%
+  as.data.frame()
+
+env_predictors <- env_predictors %>%
+  select(-sigma_5m,
+         -sigma_30m,
+         -density_5m,
+         -density_30m,
+         -delta_sigma_5_30,
+         -temp_30m,
+         -sal_30m,
+         -nitrate_30m,
+         -phosphate_5m,
+         -phosphate_30m,
+         -silicate_5m,
+         -silicate_30m,
+         -delta_phosphate_5_30,
+         -delta_silicate_5_30,
+         -sigma_30m,
+         -mean_N2,
+         -stratification_index,
+         -qgm_10,
+         -Q_SM,
+         -Q_GM,
+         -w_dm,
+         -wd_dm,
+         -nutrient_isolation,
+         -pycnocline_depth,
+         -n_casts,
+         -nitrate_depletion,
+         -surface_depletion,
+         -NP_ratio_5m,
+         -delta_nitrate_5_30,
+         -profile_shape,
+         -centroid_depth)
+
+# env_predictors <- env_predictors %>%
+#   select(temp_5m,
+#          sal_5m,
+#          nitrate_5m,
+#          nitrate_30m,
+#          delta_sigma_2_30,
+#          delta_temp_5_30,
+#          wind_b1_3,
+#          wd_b1_3,
+#          qsm_10,
+#          NP_ratio_5m,
+#         )
+
+# Check for columns with zero variance (will cause problems)
+zero_var_cols <- env_predictors %>%
+  summarise(across(everything(), ~var(.x, na.rm = TRUE))) %>%
+  pivot_longer(everything()) %>%
+  filter(value == 0 | is.na(value))
+
+if(nrow(zero_var_cols) > 0) {
+  cat("\nRemoving zero-variance columns:\n")
+  print(zero_var_cols$name)
+  env_predictors <- env_predictors %>%
+    select(-all_of(zero_var_cols$name))
+}
+
+# Standardize environmental variables (important for RDA!)
+env_scaled <- scale(env_predictors)
+```
+
+
+```{r}
+# Check for perfect collinearity
+cor_matrix <- cor(env_scaled, use = "complete.obs")
+high_cor <- which(abs(cor_matrix) > 0.9 & cor_matrix != 1, arr.ind = TRUE)
+
+if(nrow(high_cor) > 0) {
+  cat("\nWarning: High correlations detected between:\n")
+  for(i in 1:nrow(high_cor)) {
+    cat(rownames(cor_matrix)[high_cor[i,1]], "and", 
+        colnames(cor_matrix)[high_cor[i,2]], 
+        "r =", round(cor_matrix[high_cor[i,1], high_cor[i,2]], 3), "\n")
+  }
+  cat("Consider removing one variable from each pair.\n")
+}
+
+cat("\n=== RDA DATA SUMMARY ===\n")
+cat("Response variables (phyto groups):", ncol(phyto_response), "\n")
+cat("Predictor variables (env):", ncol(env_scaled), "\n")
+cat("Number of samples:", nrow(rda_data), "\n")
+```
+
+
+```{r}
+#------------------------------------------------------------------------------
+# 3. RUN RDA
+#------------------------------------------------------------------------------
+
+# Full model with all environmental variables
+rda_full <- rda(phyto_response ~ ., data = as.data.frame(env_scaled))
+
+# Model summary
+cat("\n=== RDA MODEL SUMMARY ===\n")
+summary(rda_full)
+
+# Variance partitioning
+cat("\n=== VARIANCE EXPLAINED ===\n")
+r2 <- RsquareAdj(rda_full)
+cat("R² =", round(r2$r.squared, 3), "\n")
+cat("Adjusted R² =", round(r2$adj.r.squared, 3), "\n")
+
+# Overall significance test
+cat("\n=== OVERALL MODEL SIGNIFICANCE ===\n")
+anova_full <- anova(rda_full, permutations = 999)
+print(anova_full)
+
+# Test significance of each environmental variable
+cat("\n=== INDIVIDUAL VARIABLE SIGNIFICANCE ===\n")
+anova_terms <- anova(rda_full, by = "terms", permutations = 999)
+print(anova_terms)
+
+# Test significance of each RDA axis
+cat("\n=== RDA AXIS SIGNIFICANCE ===\n")
+anova_axis <- anova(rda_full, by = "axis", permutations = 999)
+print(anova_axis)
+```
+
+```{r}
+#------------------------------------------------------------------------------
+# 2. Calculate VIF for the FULL model
+#------------------------------------------------------------------------------
+
+cat("\n=== VARIANCE INFLATION FACTORS (VIF) - FULL MODEL ===\n")
+
+# VIF from RDA model
+vif_full <- vif.cca(rda_full)
+
+vif_df_full <- data.frame(
+  Variable = names(vif_full),
+  VIF = vif_full
+) %>%
+  arrange(desc(VIF)) %>%
+  mutate(
+    Problem = case_when(
+      VIF > 10 ~ "SEVERE multicollinearity",
+      VIF > 5 ~ "Moderate multicollinearity",
+      VIF > 3 ~ "Mild multicollinearity",
+      TRUE ~ "OK"
+    )
+  )
+
+print(vif_df_full)
+
+# Plot VIF values
+p_vif_full <- ggplot(vif_df_full, aes(x = reorder(Variable, VIF), y = VIF)) +
+  geom_col(aes(fill = VIF > 10), show.legend = FALSE) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "red", linewidth = 1) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "orange", linewidth = 1) +
+  geom_text(aes(label = round(VIF, 1)), hjust = -0.2, size = 4) +
+  scale_fill_manual(values = c("TRUE" = "#E74C3C", "FALSE" = "#3498DB")) +
+  coord_flip() +
+  labs(
+    title = "Variance Inflation Factors - Full Model",
+    subtitle = "VIF > 10 = severe collinearity | VIF > 5 = moderate",
+    x = "Variable",
+    y = "VIF"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5)
+  )
+
+print(p_vif_full)
+
+ggsave(here("figures", "vif_full_model.png"),
+       width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+
+
+```{r}
+#------------------------------------------------------------------------------
+# 4. FORWARD SELECTION (if you have many predictors)
+#------------------------------------------------------------------------------
+
+# Start with null model
+rda_null <- rda(phyto_response ~ 1, data = as.data.frame(env_scaled))
+
+# Forward selection to identify key drivers
+cat("\n=== FORWARD SELECTION ===\n")
+rda_forward <- ordiR2step(
+  rda_null,
+  scope = formula(rda_full),
+  direction = "forward",
+  permutations = 999,
+  trace = FALSE
+)
+
+print(rda_forward$anova)
+
+# Use reduced model with only significant predictors
+rda_reduced <- rda_forward
+
+cat("\n=== REDUCED MODEL VARIANCE ===\n")
+r2_reduced <- RsquareAdj(rda_reduced)
+cat("R² =", round(r2_reduced$r.squared, 3), "\n")
+cat("Adjusted R² =", round(r2_reduced$adj.r.squared, 3), "\n")
+
+#------------------------------------------------------------------------------
+# 5. VISUALIZATION
+#------------------------------------------------------------------------------
+
+# Extract scores
+site_scores <- scores(rda_reduced, display = "sites", choices = 1:2)
+species_scores <- scores(rda_reduced, display = "species", choices = 1:2)
+env_scores <- scores(rda_reduced, display = "bp", choices = 1:2)
+
+# Prepare plotting data
+plot_data <- as.data.frame(site_scores) %>%
+  mutate(
+    date = rda_data$date,
+    cluster = rda_data$abs_clust,
+    year = year(date),
+    month = month(date),
+    season = case_when(
+      month %in% c(12, 1, 2) ~ "Winter",
+      month %in% 3:5 ~ "Spring",
+      month %in% 6:8 ~ "Summer",
+      month %in% 9:11 ~ "Fall"
+    )
+  )
+
+species_arrows <- as.data.frame(species_scores) %>%
+  mutate(taxon = rownames(species_scores))
+
+env_arrows <- as.data.frame(env_scores) %>%
+  mutate(variable = rownames(env_scores))
+
+# Calculate variance explained by each axis
+variance_explained <- summary(rda_reduced)$cont$importance[2, 1:2] * 100
+
+# Create biplot
+p_rda <- ggplot() +
+  # Sample points colored by cluster
+  geom_point(data = plot_data, 
+             aes(x = RDA1, y = RDA2, fill = factor(cluster)),
+             size = 4, alpha = 0.7, shape = 21, color = "black") +
+  
+  # Phytoplankton group vectors (species scores)
+  geom_segment(data = species_arrows,
+               aes(x = 0, y = 0, xend = RDA1 * 2, yend = RDA2 * 2),
+               arrow = arrow(length = unit(0.3, "cm")),
+               color = "darkred", linewidth = 1) +
+  geom_text(data = species_arrows,
+            aes(x = RDA1 * 2.2, y = RDA2 * 2.2, label = taxon),
+            color = "darkred", size = 4, fontface = "bold") +
+  
+  # Environmental vectors
+  geom_segment(data = env_arrows,
+               aes(x = 0, y = 0, xend = RDA1 * 3, yend = RDA2 * 3),
+               arrow = arrow(length = unit(0.3, "cm")),
+               color = "darkblue", linewidth = 1.2) +
+  geom_text(data = env_arrows,
+            aes(x = RDA1 * 3.3, y = RDA2 * 3.3, label = variable),
+            color = "darkblue", size = 4, fontface = "bold") +
+  
+  # Formatting
+  # scale_fill_manual(
+  #   values = cluster_colors,
+  #   labels = cluster_labels,
+  #   name = "Community\nCluster"
+  # ) +
+  labs(
+    title = "RDA: Environmental Drivers of Phytoplankton Community Composition",
+    subtitle = paste0("Model R² = ", round(r2_reduced$adj.r.squared, 3),
+                     " (p = ", format.pval(anova_full$`Pr(>F)`[1], digits = 3), ")"),
+    x = paste0("RDA1 (", round(variance_explained[1], 1), "%)"),
+    y = paste0("RDA2 (", round(variance_explained[2], 1), "%)"),
+    caption = "Blue arrows = environmental drivers; Red arrows = phytoplankton groups"
+  ) +
+  coord_fixed() +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    plot.caption = element_text(size = 10, hjust = 0),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14, face = "bold"),
+    legend.position = "right",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1)
+  )
+
+print(p_rda)
+ggsave(here("figures", "rda_environmental_drivers.png"),
+       width = 12, height = 9, dpi = 300, bg = "white")
+
+#------------------------------------------------------------------------------
+# 6. CLUSTER-ENVIRONMENT CORRELATIONS
+#------------------------------------------------------------------------------
+
+# Calculate mean environmental conditions for each cluster
+cluster_env_means <- rda_data %>%
+  group_by(abs_clust) %>%
+  summarise(
+    across(all_of(colnames(env_predictors)), ~mean(.x, na.rm = TRUE)),
+    n = n(),
+    .groups = 'drop'
+  )
+
+print(cluster_env_means)
+
+# Save results
+write_csv(cluster_env_means, here("outputs", "cluster_environmental_means.csv"))
+
+# Correlation heatmap
+cor_cluster_env <- cor(
+  phyto_response,
+  env_predictors,
+  use = "pairwise.complete.obs"
+)
+
+library(pheatmap)
+pheatmap(
+  t(cor_cluster_env),
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  color = colorRampPalette(c("#2E8B57", "white", "#8B4513"))(100),
+  main = "Phytoplankton-Environment Correlations",
+  fontsize = 10,
+  filename = here("figures", "correlation_heatmap.png"),
+  width = 10,
+  height = 8
+)
+
+cat("\n=== RDA ANALYSIS COMPLETE ===\n")
+```
+
+```{r}
+#==============================================================================
+# COMPLETE COMPARISON: Regular RDA vs Hellinger+RDA vs db-RDA
+#==============================================================================
+
+library(vegan)
+library(tidyverse)
+library(here)
+library(patchwork)
+
+# Alternative option 2: Paul Tol's colorblind-safe palette
+cluster_colors <- c(
+  "1" = "#DDAA33",  # Gold - Mixed
+  "2" = "#228833",  # Green - Diatoms
+  "3" = "#CC6677",  # Rose/pink - Dinoflagellates
+  "4" = "#4477AA"   # Blue - Winter
+)
+
+# Cluster labels with descriptions
+cluster_labels <- c(
+  "1" = "1 (Mixed)",
+  "2" = "2 (Diatoms)",
+  "3" = "3 (Dinoflagellates)",
+  "4" = "4 (Winter)"
+)
+
+#------------------------------------------------------------------------------
+# Approach 1: Regular RDA (your original)
+#------------------------------------------------------------------------------
+
+cat("\n=== APPROACH 1: REGULAR RDA ===\n")
+
+# Full model
+rda_full <- rda(phyto_response ~ ., data = as.data.frame(env_scaled))
+
+# Forward selection
+rda_null <- rda(phyto_response ~ 1, data = as.data.frame(env_scaled))
+
+rda_forward <- ordiR2step(
+  rda_null,
+  scope = formula(rda_full),
+  direction = "forward",
+  permutations = 999,
+  trace = FALSE
+)
+
+rda_final <- rda_forward  # This is your final model
+
+cat("Selected variables:", paste(attr(terms(rda_final), "term.labels"), collapse = ", "), "\n")
+cat("R² =", round(RsquareAdj(rda_final)$adj.r.squared, 3), "\n")
+
+print(anova(rda_final, permutations = 999))
+print(anova(rda_final, by = "axis", permutations = 999))
+
+#------------------------------------------------------------------------------
+# Approach 2: Hellinger Transformation + RDA
+#------------------------------------------------------------------------------
+
+cat("\n=== APPROACH 2: HELLINGER + RDA ===\n")
+
+# Hellinger transform
+phyto_hellinger <- decostand(phyto_response, method = "hellinger")
+
+# Full model
+rda_hellinger_full <- rda(phyto_hellinger ~ ., data = as.data.frame(env_scaled))
+
+# Forward selection
+rda_hellinger_null <- rda(phyto_hellinger ~ 1, data = as.data.frame(env_scaled))
+
+rda_hellinger_forward <- ordiR2step(
+  rda_hellinger_null,
+  scope = formula(rda_hellinger_full),
+  direction = "forward",
+  permutations = 999,
+  trace = FALSE
+)
+
+rda_hellinger_final <- rda_hellinger_forward
+
+cat("Selected variables:", paste(attr(terms(rda_hellinger_final), "term.labels"), collapse = ", "), "\n")
+cat("R² =", round(RsquareAdj(rda_hellinger_final)$adj.r.squared, 3), "\n")
+
+print(anova(rda_hellinger_final, permutations = 999))
+print(anova(rda_hellinger_final, by = "axis", permutations = 999))
+
+#------------------------------------------------------------------------------
+# Approach 3: Distance-Based RDA (Bray-Curtis)
+#------------------------------------------------------------------------------
+
+cat("\n=== APPROACH 3: db-RDA (BRAY-CURTIS) ===\n")
+
+# Calculate Bray-Curtis distance
+phyto_dist_bray <- vegdist(phyto_response, method = "bray")
+
+# Full model
+dbrda_full <- capscale(phyto_dist_bray ~ ., data = as.data.frame(env_scaled))
+
+# Forward selection
+dbrda_null <- capscale(phyto_dist_bray ~ 1, data = as.data.frame(env_scaled))
+
+dbrda_forward <- ordiR2step(
+  dbrda_null,
+  scope = formula(dbrda_full),
+  direction = "forward",
+  permutations = 999,
+  trace = FALSE
+)
+
+dbrda_final <- dbrda_forward
+
+cat("Selected variables:", paste(attr(terms(dbrda_final), "term.labels"), collapse = ", "), "\n")
+cat("R² =", round(RsquareAdj(dbrda_final)$adj.r.squared, 3), "\n")
+
+print(anova(dbrda_final, permutations = 999))
+print(anova(dbrda_final, by = "axis", permutations = 999))
+
+#------------------------------------------------------------------------------
+# Create Comparison Table
+#------------------------------------------------------------------------------
+
+cat("\n=== COMPARISON SUMMARY ===\n")
+
+comparison_table <- data.frame(
+  Method = c("Regular RDA", 
+             "Hellinger + RDA", 
+             "db-RDA (Bray-Curtis)"),
+  
+  R2_adjusted = c(
+    round(RsquareAdj(rda_final)$adj.r.squared, 3),
+    round(RsquareAdj(rda_hellinger_final)$adj.r.squared, 3),
+    round(RsquareAdj(dbrda_final)$adj.r.squared, 3)
+  ),
+  
+  n_variables = c(
+    length(attr(terms(rda_final), "term.labels")),
+    length(attr(terms(rda_hellinger_final), "term.labels")),
+    length(attr(terms(dbrda_final), "term.labels"))
+  ),
+  
+  Variables = c(
+    paste(attr(terms(rda_final), "term.labels"), collapse = ", "),
+    paste(attr(terms(rda_hellinger_final), "term.labels"), collapse = ", "),
+    paste(attr(terms(dbrda_final), "term.labels"), collapse = ", ")
+  )
+)
+
+print(comparison_table)
+write_csv(comparison_table, here("outputs", "rda_method_comparison.csv"))
+
+#------------------------------------------------------------------------------
+# Plot All Three Side-by-Side
+#------------------------------------------------------------------------------
+```
+
+
+```{r}
+# Function to create consistent plots with EQUAL SIZES
+create_ordination_plot <- function(model, title_text, method_type = "rda") {
+  
+  site_scores <- scores(model, display = "sites", choices = 1:2)
+  env_scores <- scores(model, display = "bp", choices = 1:2)
+  
+  plot_data <- as.data.frame(site_scores) %>%
+    mutate(cluster = factor(rda_data$abs_clust))
+  
+  # Get axis names (RDA vs CAP/dbRDA)
+  axis_names <- colnames(site_scores)
+  
+  env_arrows <- as.data.frame(env_scores) %>%
+    mutate(variable = rownames(env_scores))
+  
+  # Variance explained
+  var_exp <- summary(model)$cont$importance[2, 1:2] * 100
+  
+  p <- ggplot() +
+    geom_point(data = plot_data,
+               aes(x = .data[[axis_names[1]]], 
+                   y = .data[[axis_names[2]]], 
+                   fill = cluster),
+               size = 3, alpha = 0.7, shape = 21, color = "black", stroke = 0.3) +
+    geom_segment(data = env_arrows,
+                 aes(x = 0, y = 0, 
+                     xend = .data[[axis_names[1]]] * 3, 
+                     yend = .data[[axis_names[2]]] * 3),
+                 arrow = arrow(length = unit(0.25, "cm")),
+                 color = "darkblue", linewidth = 1) +
+    geom_text(data = env_arrows,
+              aes(x = .data[[axis_names[1]]] * 3.3, 
+                  y = .data[[axis_names[2]]] * 3.3, 
+                  label = variable),
+              color = "darkblue", size = 3, fontface = "bold") +
+    scale_fill_manual(values = cluster_colors, labels = cluster_labels,
+                     name = "Cluster") +
+    labs(
+      title = title_text,
+      subtitle = paste0("R² = ", round(RsquareAdj(model)$adj.r.squared, 3)),
+      x = paste0(axis_names[1], " (", round(var_exp[1], 1), "%)"),
+      y = paste0(axis_names[2], " (", round(var_exp[2], 1), "%)")
+    ) +
+    # REMOVED coord_fixed() - this was causing different sizes
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.title = element_text(size = 11, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 9, hjust = 0.5),
+      legend.position = "none",
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+      panel.grid.minor = element_blank(),
+      aspect.ratio = 1,  # ADDED - forces square plots with equal sizes
+      plot.margin = margin(2, 2, 2, 2)  # Small consistent margins
+    )
+  
+  return(p)
+}
+
+# Create individual plots
+p1 <- create_ordination_plot(rda_final, "Regular RDA")
+p2 <- create_ordination_plot(rda_hellinger_final, "Hellinger + RDA")
+p3 <- create_ordination_plot(dbrda_final, "db-RDA (Bray-Curtis)")
+
+# Combine with equal widths
+p_comparison <- (p1 | p2 | p3) + 
+  plot_layout(
+    guides = "collect",
+    widths = c(1, 1, 1)  # Force equal panel widths
+  ) &
+  theme(
+    legend.position = "bottom",
+    plot.margin = margin(0, 0, 0, 0)
+  )
+
+print(p_comparison)
+
+ggsave(here("figures", "rda_methods_comparison.png"),
+       width = 15, height = 5.5, dpi = 300, bg = "white")
+```
+
+```{r}
+#------------------------------------------------------------------------------
+# Publication-Quality db-RDA Plot - Fixed text cutoff
+#------------------------------------------------------------------------------
+
+# Extract scores
+site_scores <- scores(dbrda_final, display = "sites", choices = 1:2)
+env_scores <- scores(dbrda_final, display = "bp", choices = 1:2)
+
+# Prepare data
+plot_data <- as.data.frame(site_scores) %>%
+  mutate(cluster = factor(rda_data$abs_clust))
+
+env_arrows <- as.data.frame(env_scores) %>%
+  mutate(
+    variable = rownames(env_scores),
+    label = recode(variable,
+                  "nitrate_5" = "Nitrate (5m)",
+                  "nitrate_5m" = "Nitrate (5m)",
+                  "NP_ratio_5m" = "N:P Ratio",
+                  "np_5m" = "N:P Ratio",
+                  "temp_5m" = "Temperature",
+                  "int_chla" = "Integrated Chl-a",
+                  "scm_depth" = "SCM Depth",
+                  "rd_b1" = "Density Gradient",
+                  "rd_b1_3" = "Density Gradient",
+                  .default = variable)
+  )
+
+# Variance explained
+var_exp <- summary(dbrda_final)$cont$importance[2, 1:2] * 100
+
+# Create plot
+p_dbrda_final <- ggplot() +
+  
+  # Points
+  geom_point(data = plot_data,
+             aes(x = CAP1, y = CAP2, fill = cluster, shape = cluster),
+             size = 8,
+             alpha = 0.9,
+             color = "black", 
+             stroke = 1) +
+  
+  # Environmental arrows - slightly shorter to make room for labels
+  geom_segment(data = env_arrows,
+               aes(x = 0, y = 0, xend = CAP1 * 2.5, yend = CAP2 * 2.5),
+               arrow = arrow(length = unit(0.5, "cm"), type = "closed"),
+               color = "#2C5F8D", 
+               linewidth = 2) +
+  
+  # Environmental labels - shorter extension
+  geom_text(data = env_arrows,
+            aes(x = CAP1 * 2.9, y = CAP2 * 2.9, label = label),
+            color = "#2C5F8D", 
+            size = 7,
+            fontface = "bold") +
+  
+  # Shapes
+  scale_shape_manual(
+    values = c("1" = 21, "2" = 22, "3" = 23, "4" = 24),
+    labels = cluster_labels,
+    name = "Community Cluster"
+  ) +
+  
+  # Colors
+  scale_fill_manual(
+    values = cluster_colors, 
+    labels = cluster_labels,
+    name = "Community Cluster"
+  ) +
+  
+  # Expand plot limits to include labels
+  scale_x_continuous(expand = expansion(mult = 0.15)) +
+  scale_y_continuous(expand = expansion(mult = 0.15)) +
+  
+  labs(
+    title = "Environmental Drivers of Phytoplankton Community Composition",
+    x = paste0("CAP1 (", round(var_exp[1], 1), "%)"),
+    y = paste0("CAP2 (", round(var_exp[2], 1), "%)"),
+    caption = paste0("Distance-based RDA (Bray-Curtis) | R² = ", 
+                    round(RsquareAdj(dbrda_final)$adj.r.squared, 3),
+                    " | p < 0.001")
+  ) +
+  
+  # Theme
+  theme_minimal(base_size = 18) +
+  theme(
+    # Title
+    plot.title = element_text(size = 22, face = "bold", hjust = 0.5, 
+                             margin = margin(b = 15)),
+    
+    # Axis titles
+    axis.title.x = element_text(size = 20, face = "bold", margin = margin(t = 15)),
+    axis.title.y = element_text(size = 20, face = "bold", margin = margin(r = 15)),
+    
+    # Axis text
+    axis.text = element_text(size = 16, color = "black"),
+    
+    # Legend
+    legend.position = "right",
+    legend.title = element_text(size = 18, face = "bold"),
+    legend.text = element_text(size = 16),
+    legend.key.size = unit(1.5, "cm"),
+    
+    # Caption
+    plot.caption = element_text(size = 14, hjust = 1, color = "gray30",
+                               margin = margin(t = 10)),
+    
+    # Panel
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1.2),
+    panel.grid.major = element_line(color = "gray85", linewidth = 0.5),
+    panel.grid.minor = element_blank(),
+    
+    # Margins - BIGGER to prevent cutoff
+    plot.margin = margin(30, 30, 30, 30),
+    
+    # CRITICAL - allow drawing outside panel
+    plot.clip = "off"
+  ) +
+  
+  # Allow drawing outside plot area
+  coord_cartesian(clip = "off")
+
+print(p_dbrda_final)
+
+# Save
+ggsave(
+  here("figures", "dbrda_publication_final_2.png"),
+  plot = p_dbrda_final,
+  width = 15,      # Slightly wider
+  height = 11,     # Slightly taller
+  dpi = 400,
+  bg = "white"
+)
+
+```
+```{r}
+#------------------------------------------------------------------------------
+# db-RDA Plot - Colored by Season (FIXED - using color not fill)
+#------------------------------------------------------------------------------
+
+# Extract scores
+site_scores <- scores(dbrda_final, display = "sites", choices = 1:2)
+env_scores <- scores(dbrda_final, display = "bp", choices = 1:2)
+
+# Prepare data
+plot_data <- as.data.frame(site_scores) %>%
+  mutate(
+    cluster = factor(rda_data$abs_clust),
+    date = rda_data$date,
+    month_num = lubridate::month(date),
+    month_name = month(date, label = TRUE, abbr = TRUE),
+    season = case_when(
+      month_num %in% c(12, 1, 2) ~ "Winter",
+      month_num %in% 3:5 ~ "Spring",
+      month_num %in% 6:8 ~ "Summer",
+      month_num %in% 9:11 ~ "Fall"
+    ),
+    season = factor(season, levels = c("Winter", "Spring", "Summer", "Fall"))
+  )
+
+env_arrows <- as.data.frame(env_scores) %>%
+  mutate(
+    variable = rownames(env_scores),
+    label = recode(variable,
+                  "nitrate_5" = "Nitrate (5m)",
+                  "nitrate_5m" = "Nitrate (5m)",
+                  "NP_ratio_5m" = "N:P Ratio",
+                  "np_5m" = "N:P Ratio",
+                  "temp_5m" = "Temperature",
+                  "int_chla" = "Integrated Chl-a",
+                  "scm_depth" = "SCM Depth",
+                  "rd_b1" = "Density Gradient",
+                  "rd_b1_3" = "Density Gradient",
+                  .default = variable)
+  )
+
+var_exp <- summary(dbrda_final)$cont$importance[2, 1:2] * 100
+
+#------------------------------------------------------------------------------
+# Version 1: Colored by SEASON
+#------------------------------------------------------------------------------
+
+p_dbrda_season <- ggplot() +
+  
+  # Use COLOR for season, SHAPE for cluster
+  geom_point(data = plot_data,
+             aes(x = CAP1, y = CAP2, 
+                 color = season,    # COLOR not fill
+                 shape = cluster),
+             size = 8,
+             alpha = 0.85,
+             stroke = 1.5) +       # Thicker outline
+  
+  geom_segment(data = env_arrows,
+               aes(x = 0, y = 0, xend = CAP1 * 2.5, yend = CAP2 * 2.5),
+               arrow = arrow(length = unit(0.5, "cm"), type = "closed"),
+               color = "#2C5F8D", 
+               linewidth = 2) +
+  
+  geom_text(data = env_arrows,
+            aes(x = CAP1 * 2.9, y = CAP2 * 2.9, label = label),
+            color = "#2C5F8D", 
+            size = 7,
+            fontface = "bold") +
+  
+  # Shapes for clusters (open shapes work better with color)
+  scale_shape_manual(
+    values = c("1" = 16, "2" = 15, "3" = 17, "4" = 18),  # circle, square, triangle, diamond
+    labels = cluster_labels,
+    name = "Community\nCluster"
+  ) +
+  
+  # Colors for seasons
+  scale_color_manual(
+    values = c(
+      "Winter" = "#4575B4",   # Blue
+      "Spring" = "#7FBC41",   # Green
+      "Summer" = "#F46D43",   # Orange-red
+      "Fall" = "#A6611A"      # Brown
+    ),
+    name = "Season"
+  ) +
+  
+  scale_x_continuous(expand = expansion(mult = 0.15)) +
+  scale_y_continuous(expand = expansion(mult = 0.15)) +
+  
+  labs(
+    title = "Environmental Drivers - Colored by Season",
+    subtitle = "Do diatoms (squares) separate by season?",
+    x = paste0("CAP1 (", round(var_exp[1], 1), "%)"),
+    y = paste0("CAP2 (", round(var_exp[2], 1), "%)"),
+    caption = paste0("Distance-based RDA (Bray-Curtis) | R² = ", 
+                    round(RsquareAdj(dbrda_final)$adj.r.squared, 3))
+  ) +
+  
+  theme_minimal(base_size = 18) +
+  theme(
+    plot.title = element_text(size = 22, face = "bold", hjust = 0.5, 
+                             margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 14, hjust = 0.5, margin = margin(b = 15)),
+    axis.title.x = element_text(size = 20, face = "bold", margin = margin(t = 15)),
+    axis.title.y = element_text(size = 20, face = "bold", margin = margin(r = 15)),
+    axis.text = element_text(size = 16, color = "black"),
+    legend.position = "right",
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 14),
+    legend.key.size = unit(1.2, "cm"),
+    plot.caption = element_text(size = 14, hjust = 1, color = "gray30"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1.2),
+    panel.grid.major = element_line(color = "gray85", linewidth = 0.5),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(30, 30, 30, 30),
+    plot.clip = "off"
+  ) +
+  
+  coord_cartesian(clip = "off")
+
+print(p_dbrda_season)
+
+ggsave(
+  here("figures", "dbrda_colored_by_season.png"),
+  plot = p_dbrda_season,
+  width = 16,
+  height = 11,
+  dpi = 400,
+  bg = "white"
+)
+
+#------------------------------------------------------------------------------
+# Version 2: Colored by MONTH
+#------------------------------------------------------------------------------
+
+p_dbrda_month <- ggplot() +
+  
+  geom_point(data = plot_data,
+             aes(x = CAP1, y = CAP2, 
+                 color = month_name,
+                 shape = cluster),
+             size = 8,
+             alpha = 0.85,
+             stroke = 1.5) +
+  
+  geom_segment(data = env_arrows,
+               aes(x = 0, y = 0, xend = CAP1 * 2.5, yend = CAP2 * 2.5),
+               arrow = arrow(length = unit(0.5, "cm"), type = "closed"),
+               color = "#2C5F8D", 
+               linewidth = 2) +
+  
+  geom_text(data = env_arrows,
+            aes(x = CAP1 * 2.9, y = CAP2 * 2.9, label = label),
+            color = "#2C5F8D", 
+            size = 7,
+            fontface = "bold") +
+  
+  scale_shape_manual(
+    values = c("1" = 16, "2" = 15, "3" = 17, "4" = 18),
+    labels = cluster_labels,
+    name = "Community\nCluster"
+  ) +
+  
+  # Month colors - seasonal gradient
+  scale_color_viridis_d(
+    option = "turbo",
+    name = "Month"
+  ) +
+  
+  scale_x_continuous(expand = expansion(mult = 0.15)) +
+  scale_y_continuous(expand = expansion(mult = 0.15)) +
+  
+  labs(
+    title = "Environmental Drivers - Colored by Month",
+    subtitle = "Do diatoms (squares) separate by spring vs. summer bloom timing?",
+    x = paste0("CAP1 (", round(var_exp[1], 1), "%)"),
+    y = paste0("CAP2 (", round(var_exp[2], 1), "%)"),
+    caption = paste0("Distance-based RDA (Bray-Curtis) | R² = ", 
+                    round(RsquareAdj(dbrda_final)$adj.r.squared, 3))
+  ) +
+  
+  theme_minimal(base_size = 18) +
+  theme(
+    plot.title = element_text(size = 22, face = "bold", hjust = 0.5, 
+                             margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 14, hjust = 0.5, margin = margin(b = 15)),
+    axis.title.x = element_text(size = 20, face = "bold", margin = margin(t = 15)),
+    axis.title.y = element_text(size = 20, face = "bold", margin = margin(r = 15)),
+    axis.text = element_text(size = 16, color = "black"),
+    legend.position = "right",
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 14),
+    legend.key.size = unit(1.2, "cm"),
+    plot.caption = element_text(size = 14, hjust = 1, color = "gray30"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1.2),
+    panel.grid.major = element_line(color = "gray85", linewidth = 0.5),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(30, 30, 30, 30),
+    plot.clip = "off"
+  ) +
+  
+  coord_cartesian(clip = "off")
+
+print(p_dbrda_month)
+
+ggsave(
+  here("figures", "dbrda_colored_by_month.png"),
+  plot = p_dbrda_month,
+  width = 16,
+  height = 11,
+  dpi = 400,
+  bg = "white"
+)
+```
+
+
+
+```{r}
+#------------------------------------------------------------------------------
+# Test if axis 2 becomes significant with any method
+#------------------------------------------------------------------------------
+
+cat("\n=== AXIS SIGNIFICANCE COMPARISON ===\n")
+
+axis_sig <- data.frame(
+  Method = c("Regular RDA", "Hellinger + RDA", "db-RDA"),
+  
+  RDA1_p = c(
+    anova(rda_final, by = "axis", permutations = 999)$`Pr(>F)`[1],
+    anova(rda_hellinger_final, by = "axis", permutations = 999)$`Pr(>F)`[1],
+    anova(dbrda_final, by = "axis", permutations = 999)$`Pr(>F)`[1]
+  ),
+  
+  RDA2_p = c(
+    anova(rda_final, by = "axis", permutations = 999)$`Pr(>F)`[2],
+    anova(rda_hellinger_final, by = "axis", permutations = 999)$`Pr(>F)`[2],
+    anova(dbrda_final, by = "axis", permutations = 999)$`Pr(>F)`[2]
+  )
+)
+
+print(axis_sig)
+
+#------------------------------------------------------------------------------
+# Mantel tests to compare distance matrices
+#------------------------------------------------------------------------------
+
+cat("\n=== DISTANCE MATRIX CORRELATIONS ===\n")
+
+# Original RDA uses Euclidean distance
+dist_euclidean <- dist(phyto_response, method = "euclidean")
+
+# Hellinger uses Euclidean on transformed data
+dist_hellinger_eucl <- dist(phyto_hellinger, method = "euclidean")
+
+# db-RDA uses Bray-Curtis
+# (already calculated as phyto_dist_bray)
+
+# Compare distance matrices
+mantel_euc_bray <- mantel(dist_euclidean, phyto_dist_bray, permutations = 999)
+cat("\nEuclidean vs Bray-Curtis:\n")
+print(mantel_euc_bray)
+
+mantel_hell_bray <- mantel(dist_hellinger_eucl, phyto_dist_bray, permutations = 999)
+cat("\nHellinger-Euclidean vs Bray-Curtis:\n")
+print(mantel_hell_bray)
+
+mantel_euc_hell <- mantel(dist_euclidean, dist_hellinger_eucl, permutations = 999)
+cat("\nEuclidean vs Hellinger-Euclidean:\n")
+print(mantel_euc_hell)
+```
+```{r}
+#------------------------------------------------------------------------------
+# 1. Which variables were selected by each method?
+#------------------------------------------------------------------------------
+
+cat("\n=== SELECTED VARIABLES BY METHOD ===\n")
+
+vars_regular <- attr(terms(rda_final), "term.labels")
+vars_hellinger <- attr(terms(rda_hellinger_final), "term.labels")
+vars_dbrda <- attr(terms(dbrda_final), "term.labels")
+
+cat("\nRegular RDA:", paste(vars_regular, collapse = ", "), "\n")
+cat("Hellinger + RDA:", paste(vars_hellinger, collapse = ", "), "\n")
+cat("db-RDA:", paste(vars_dbrda, collapse = ", "), "\n")
+
+# Which variables are common to all?
+common_vars <- Reduce(intersect, list(vars_regular, vars_hellinger, vars_dbrda))
+cat("\nCommon to all methods:", paste(common_vars, collapse = ", "), "\n")
+
+#------------------------------------------------------------------------------
+# 2. Check if axis 2 is significant in any method
+#------------------------------------------------------------------------------
+
+cat("\n=== AXIS 2 SIGNIFICANCE ===\n")
+
+axis_tests <- data.frame(
+  Method = c("Regular RDA", "Hellinger + RDA", "db-RDA"),
+  
+  Axis1_pval = c(
+    anova(rda_final, by = "axis", permutations = 999)$`Pr(>F)`[1],
+    anova(rda_hellinger_final, by = "axis", permutations = 999)$`Pr(>F)`[1],
+    anova(dbrda_final, by = "axis", permutations = 999)$`Pr(>F)`[1]
+  ),
+  
+  Axis2_pval = c(
+    anova(rda_final, by = "axis", permutations = 999)$`Pr(>F)`[2],
+    anova(rda_hellinger_final, by = "axis", permutations = 999)$`Pr(>F)`[2],
+    anova(dbrda_final, by = "axis", permutations = 999)$`Pr(>F)`[2]
+  ),
+  
+  Axis1_var = c(
+    summary(rda_final)$cont$importance[2, 1] * 100,
+    summary(rda_hellinger_final)$cont$importance[2, 1] * 100,
+    summary(dbrda_final)$cont$importance[2, 1] * 100
+  ),
+  
+  Axis2_var = c(
+    summary(rda_final)$cont$importance[2, 2] * 100,
+    summary(rda_hellinger_final)$cont$importance[2, 2] * 100,
+    summary(dbrda_final)$cont$importance[2, 2] * 100
+  )
+)
+
+print(axis_tests)
+write_csv(axis_tests, here("outputs", "axis_significance_all_methods.csv"))
+
+#------------------------------------------------------------------------------
+# 3. Variable importance across methods
+#------------------------------------------------------------------------------
+
+cat("\n=== VARIABLE SIGNIFICANCE IN EACH MODEL ===\n")
+
+# Regular RDA
+cat("\nRegular RDA term significance:\n")
+print(anova(rda_final, by = "terms", permutations = 999))
+
+# Hellinger RDA
+cat("\nHellinger + RDA term significance:\n")
+print(anova(rda_hellinger_final, by = "terms", permutations = 999))
+
+# db-RDA
+cat("\ndb-RDA term significance:\n")
+print(anova(dbrda_final, by = "terms", permutations = 999))
+
+#------------------------------------------------------------------------------
+# 4. How well do clusters separate on Axis 1 in each method?
+#------------------------------------------------------------------------------
+
+# Extract axis 1 scores for each method
+rda1_scores <- data.frame(
+  cluster = factor(rda_data$abs_clust),
+  Regular_RDA1 = scores(rda_final, display = "sites", choices = 1)[, 1],
+  Hellinger_RDA1 = scores(rda_hellinger_final, display = "sites", choices = 1)[, 1],
+  dbRDA_CAP1 = scores(dbrda_final, display = "sites", choices = 1)[, 1]
+)
+
+# ANOVA: Does cluster explain variance on axis 1?
+cat("\n=== CLUSTER SEPARATION ON AXIS 1 ===\n")
+
+aov_regular <- aov(Regular_RDA1 ~ cluster, data = rda1_scores)
+cat("\nRegular RDA1 ~ Cluster:\n")
+print(summary(aov_regular))
+
+aov_hellinger <- aov(Hellinger_RDA1 ~ cluster, data = rda1_scores)
+cat("\nHellinger RDA1 ~ Cluster:\n")
+print(summary(aov_hellinger))
+
+aov_dbrda <- aov(dbRDA_CAP1 ~ cluster, data = rda1_scores)
+cat("\ndb-RDA CAP1 ~ Cluster:\n")
+print(summary(aov_dbrda))
+
+# Plot axis 1 scores by cluster for each method
+p_axis1_comparison <- rda1_scores %>%
+  pivot_longer(cols = -cluster, names_to = "Method", values_to = "Axis1_score") %>%
+  mutate(Method = recode(Method,
+                        "Regular_RDA1" = "Regular RDA",
+                        "Hellinger_RDA1" = "Hellinger + RDA",
+                        "dbRDA_CAP1" = "db-RDA")) %>%
+  ggplot(aes(x = cluster, y = Axis1_score, fill = cluster)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 1) +
+  facet_wrap(~Method, scales = "free_y") +
+  scale_fill_manual(values = cluster_colors, labels = cluster_labels) +
+  labs(
+    title = "Cluster Separation on Primary Axis",
+    subtitle = "Which method best separates clusters?",
+    x = "Cluster",
+    y = "Axis 1 Score"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+print(p_axis1_comparison)
+ggsave(here("figures", "axis1_cluster_separation_comparison.png"),
+       width = 12, height = 4, dpi = 300, bg = "white")
+
+#------------------------------------------------------------------------------
+# 5. Procrustes analysis - Are ordinations similar?
+#------------------------------------------------------------------------------
+
+cat("\n=== PROCRUSTES COMPARISON ===\n")
+
+# Compare configurations
+proc_reg_hell <- procrustes(
+  scores(rda_final, display = "sites", choices = 1:2),
+  scores(rda_hellinger_final, display = "sites", choices = 1:2)
+)
+
+proc_reg_db <- procrustes(
+  scores(rda_final, display = "sites", choices = 1:2),
+  scores(dbrda_final, display = "sites", choices = 1:2)
+)
+
+proc_hell_db <- procrustes(
+  scores(rda_hellinger_final, display = "sites", choices = 1:2),
+  scores(dbrda_final, display = "sites", choices = 1:2)
+)
+
+cat("\nRegular vs Hellinger: m² =", round(proc_reg_hell$ss, 3), "\n")
+cat("Regular vs db-RDA: m² =", round(proc_reg_db$ss, 3), "\n")
+cat("Hellinger vs db-RDA: m² =", round(proc_hell_db$ss, 3), "\n")
+cat("\n(Lower m² = more similar ordinations)\n")
+
+# Protest (significance test)
+cat("\n=== PROTEST (Procrustes + permutation test) ===\n")
+protest_reg_hell <- protest(
+  scores(rda_final, display = "sites", choices = 1:2),
+  scores(rda_hellinger_final, display = "sites", choices = 1:2),
+  permutations = 999
+)
+print(protest_reg_hell)
+
+#------------------------------------------------------------------------------
+# 6. Environmental gradients comparison
+#------------------------------------------------------------------------------
+
+# Extract environmental loadings on axis 1
+env_loadings_comparison <- data.frame(
+  Variable = rownames(scores(rda_final, display = "bp", choices = 1)),
+  Regular_RDA = scores(rda_final, display = "bp", choices = 1)[, 1],
+  Hellinger_RDA = scores(rda_hellinger_final, display = "bp", choices = 1)[, 1],
+  dbRDA = scores(dbrda_final, display = "bp", choices = 1)[, 1]
+) %>%
+  pivot_longer(-Variable, names_to = "Method", values_to = "Loading") %>%
+  arrange(Method, desc(abs(Loading)))
+
+cat("\n=== ENVIRONMENTAL LOADINGS ON AXIS 1 ===\n")
+print(env_loadings_comparison)
+```
+```{r}
+#------------------------------------------------------------------------------
+# Environmental loadings comparison (FIXED)
+#------------------------------------------------------------------------------
+
+# Extract environmental scores (only selected variables)
+env_regular <- as.data.frame(scores(rda_final, display = "bp", choices = 1)) %>%
+  mutate(Variable = rownames(.), Method = "Regular_RDA") %>%
+  rename(Loading_Axis1 = RDA1)
+
+env_hellinger <- as.data.frame(scores(rda_hellinger_final, display = "bp", choices = 1)) %>%
+  mutate(Variable = rownames(.), Method = "Hellinger_RDA") %>%
+  rename(Loading_Axis1 = RDA1)
+
+env_dbrda <- as.data.frame(scores(dbrda_final, display = "bp", choices = 1)) %>%
+  mutate(Variable = rownames(.), Method = "dbRDA") %>%
+  rename(Loading_Axis1 = CAP1)
+
+# Combine
+env_loadings_all <- bind_rows(env_regular, env_hellinger, env_dbrda) %>%
+  select(Method, Variable, Loading_Axis1) %>%
+  arrange(Method, desc(abs(Loading_Axis1)))
+
+cat("\n=== ENVIRONMENTAL LOADINGS ON AXIS 1 ===\n")
+print(env_loadings_all)
+
+# Plot comparison
+p_loadings <- env_loadings_all %>%
+  ggplot(aes(x = reorder(Variable, abs(Loading_Axis1)), 
+             y = Loading_Axis1, 
+             fill = Method)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("Regular_RDA" = "#E64B35", 
+                               "Hellinger_RDA" = "#4DBBD5", 
+                               "dbRDA" = "#00A087")) +
+  labs(
+    title = "Environmental Variable Loadings on Primary Axis",
+    subtitle = "Comparison across methods",
+    x = "Variable",
+    y = "Loading on Axis 1"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+print(p_loadings)
+ggsave(here("figures", "environmental_loadings_comparison.png"),
+       width = 10, height = 6, dpi = 300, bg = "white")
+
+#------------------------------------------------------------------------------
+# Simplified interpretation: What does each axis represent?
+#------------------------------------------------------------------------------
+
+cat("\n=== db-RDA AXIS INTERPRETATION ===\n")
+
+# Get environmental loadings for both axes
+env_dbrda_both <- as.data.frame(scores(dbrda_final, display = "bp", choices = 1:2)) %>%
+  mutate(Variable = rownames(.))
+
+cat("\nAxis 1 (CAP1) loadings:\n")
+print(env_dbrda_both %>% 
+        select(Variable, CAP1) %>% 
+        arrange(desc(abs(CAP1))))
+
+cat("\nAxis 2 (CAP2) loadings:\n")
+print(env_dbrda_both %>% 
+        select(Variable, CAP2) %>% 
+        arrange(desc(abs(CAP2))))
+
+# What correlates with each axis?
+cap_scores <- scores(dbrda_final, display = "sites", choices = 1:2)
+
+axis_correlations <- data.frame(
+  Variable = colnames(env_predictors),
+  CAP1_cor = cor(cap_scores[, 1], env_predictors)[1, ],
+  CAP2_cor = cor(cap_scores[, 2], env_predictors)[1, ]
+) %>%
+  arrange(desc(abs(CAP1_cor)))
+
+cat("\n=== CORRELATIONS: All Environmental Variables with db-RDA Axes ===\n")
+print(axis_correlations)
+
+write_csv(axis_correlations, here("outputs", "dbrda_axis_correlations.csv"))
+
+#------------------------------------------------------------------------------
+# Final Summary Statistics for db-RDA (YOUR FINAL MODEL)
+#------------------------------------------------------------------------------
+
+cat("\n=== db-RDA FINAL MODEL SUMMARY ===\n")
+
+# Variance explained
+variance_dbrda <- summary(dbrda_final)$cont$importance
+
+cat("\nVariance partitioning:\n")
+cat("Total inertia:", round(sum(variance_dbrda[1, ]), 3), "\n")
+cat("Constrained:", round(variance_dbrda[1, "Total"][1], 3), 
+    "(", round(variance_dbrda[3, "Total"][1] * 100, 1), "%)\n")
+cat("Unconstrained:", round(variance_dbrda[1, "Total"][2], 3), 
+    "(", round((1 - variance_dbrda[3, "Total"][1]) * 100, 1), "%)\n\n")
+
+cat("Axis 1 (CAP1):", round(variance_dbrda[2, 1] * 100, 1), 
+    "% of constrained variance\n")
+cat("Axis 2 (CAP2):", round(variance_dbrda[2, 2] * 100, 1), 
+    "% of constrained variance\n\n")
+
+# Model significance
+cat("=== MODEL SIGNIFICANCE ===\n")
+anova_dbrda_overall <- anova(dbrda_final, permutations = 999)
+print(anova_dbrda_overall)
+
+cat("\n=== AXIS SIGNIFICANCE ===\n")
+anova_dbrda_axes <- anova(dbrda_final, by = "axis", permutations = 999)
+print(anova_dbrda_axes)
+
+cat("\n=== VARIABLE SIGNIFICANCE ===\n")
+anova_dbrda_terms <- anova(dbrda_final, by = "terms", permutations = 999)
+print(anova_dbrda_terms)
+
+# Cluster means for selected variables
+selected_vars_dbrda <- attr(terms(dbrda_final), "term.labels")
+
+cluster_env_means <- rda_data %>%
+  group_by(abs_cluster) %>%
+  summarise(
+    n = n(),
+    across(all_of(selected_vars_dbrda), 
+           list(mean = ~mean(.x, na.rm = TRUE),
+                sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}"),
+    .groups = 'drop'
+  ) %>%
+  mutate(cluster_name = cluster_labels[as.character(abs_cluster)])
+
+cat("\n=== ENVIRONMENTAL CONDITIONS BY CLUSTER ===\n")
+print(cluster_env_means)
+
+write_csv(cluster_env_means, here("outputs", "dbrda_cluster_environmental_means.csv"))
+
+#------------------------------------------------------------------------------
+# Create publication-quality db-RDA plot
+#------------------------------------------------------------------------------
+
+# Extract scores
+site_scores <- scores(dbrda_final, display = "sites", choices = 1:2)
+species_scores <- scores(dbrda_final, display = "species", choices = 1:2)
+env_scores <- scores(dbrda_final, display = "bp", choices = 1:2)
+
+# Prepare data
+plot_data <- as.data.frame(site_scores) %>%
+  mutate(
+    cluster = factor(rda_data$abs_cluster),
+    date = rda_data$date,
+    season = case_when(
+      month(date) %in% c(12, 1, 2) ~ "Winter",
+      month(date) %in% 3:5 ~ "Spring",
+      month(date) %in% 6:8 ~ "Summer",
+      month(date) %in% 9:11 ~ "Fall"
+    )
+  )
+
+species_arrows <- as.data.frame(species_scores) %>%
+  mutate(taxon = rownames(species_scores))
+
+env_arrows <- as.data.frame(env_scores) %>%
+  mutate(
+    variable = rownames(env_scores),
+    label = recode(variable,
+                  "nitrate_5m" = "NO₃ (5m)",
+                  "NP_ratio_5m" = "N:P Ratio",
+                  "np_5m" = "N:P (5m)",
+                  .default = variable)
+  )
+
+# Variance for labels
+var_exp <- summary(dbrda_final)$cont$importance[2, 1:2] * 100
+
+# Final publication plot
+p_dbrda_final <- ggplot() +
+  # Points
+  geom_point(data = plot_data, 
+             aes(x = CAP1, y = CAP2, fill = cluster),
+             size = 3.5, alpha = 0.75, shape = 21, 
+             color = "black", stroke = 0.4) +
+  
+  # Species arrows
+  geom_segment(data = species_arrows,
+               aes(x = 0, y = 0, xend = MDS1 * 2, yend = MDS2 * 2),
+               arrow = arrow(length = unit(0.25, "cm")),
+               color = "#B8413C", linewidth = 0.8, alpha = 0.8) +
+  geom_text(data = species_arrows,
+            aes(x = MDS1 * 2.2, y = MDS2 * 2.2, label = taxon),
+            color = "#B8413C", size = 3.5, fontface = "italic") +
+  
+  # Environmental arrows
+  geom_segment(data = env_arrows,
+               aes(x = 0, y = 0, xend = CAP1 * 3, yend = CAP2 * 3),
+               arrow = arrow(length = unit(0.35, "cm"), type = "closed"),
+               color = "#2C5F8D", linewidth = 1.3) +
+  geom_text(data = env_arrows,
+            aes(x = CAP1 * 3.4, y = CAP2 * 3.4, label = label),
+            color = "#2C5F8D", size = 4.5, fontface = "bold") +
+  
+  scale_fill_manual(values = cluster_colors, labels = cluster_labels,
+                   name = "Community\nCluster") +
+  labs(
+    title = "Distance-Based RDA: Environmental Drivers of Phytoplankton Communities",
+    subtitle = paste0("Bray-Curtis distance | Adjusted R² = ", 
+                     round(RsquareAdj(dbrda_final)$adj.r.squared, 3)),
+    x = paste0("CAP1 (", round(var_exp[1], 1), "%)"),
+    y = paste0("CAP2 (", round(var_exp[2], 1), "%)"),
+    caption = "Two significant axes | Blue = environmental drivers | Red = phytoplankton groups"
+  ) +
+  coord_fixed() +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    plot.caption = element_text(size = 9, hjust = 1, color = "gray40"),
+    axis.text = element_text(size = 11),
+    axis.title = element_text(size = 13, face = "bold"),
+    legend.position = "right",
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.text = element_text(size = 10),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3)
+  )
+
+print(p_dbrda_final)
+ggsave(here("figures", "dbrda_final_publication.png"),
+       width = 11, height = 9, dpi = 300, bg = "white")
+```
+

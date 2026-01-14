@@ -52,7 +52,6 @@ fw <- read_csv(here("files", "Daily_flow_long_2014_2024_v2025_04_03.csv"))
 ```{r}
 # Download MEI directly
 mei_data <- download_mei()
-
 ```
 
 ```{r}
@@ -84,7 +83,9 @@ ctd_calc <- ctd %>%
          latitude = `Station Latitude`,
          pres = `Pressure (dbar)`,
          sal = `Salinity (PSU)`,
-         temp = `Temperature (deg C)`) %>%
+         temp = `Temperature (deg C)`,
+         turb = `Turbidity (FTU)`
+         ) %>%
   mutate(
     # Calculate absolute salinity from practical salinity
     sa = gsw_SA_from_SP(sal, pres, longitude, latitude),  # Adjust lat/lon for your study area
@@ -105,6 +106,8 @@ daily_ctd <- ctd_calc %>%
     sal_daily = mean(sal, na.rm = TRUE),
     temp_daily = mean(temp, na.rm = TRUE),
     sigma_theta_daily = mean(sigma_theta, na.rm = TRUE),
+    turb_daily = mean(turb, na.rm = TRUE),
+    # o2_daily = mean(o2, na.rm = TRUE),
     .groups = 'drop'
   )
 ```
@@ -195,6 +198,85 @@ interp_df <- expand.grid(date = date_seq, pres = pres_seq) %>%
   ) %>%
   filter(pres > 0 & pres < 30)
 ```
+
+```{r}
+# vertical_metrics <- ctd_fl %>%
+#   filter(pres >= 0 & pres <= 30) %>%  # or your euphotic zone depth
+#   group_by(id, date, station) %>%
+#   arrange(id, pres) %>%
+#   summarise(
+#     # Integrated chlorophyll (if you have fluor data)
+#     int_chla = pracma::trapz(pres, f_final),
+#     
+#     # SCM metrics
+#     scm_depth = pres[which.max(f_final)],
+#     scm_max = max(f_final, na.rm = TRUE),
+#     surface_chla = mean(f_final[pres >= 1 & pres <= 5], na.rm = TRUE),
+#     scm_enhancement = scm_max / surface_chla,
+#     scm_perc = scm_max/int_chla,
+#     
+#     # Distribution metrics
+#     centroid_depth = sum(pres * f_final) / sum(f_final),
+#     biomass_top10m = sum(f_final[pres <= 10]) / sum(f_final),
+#     .groups = 'drop'
+#   )
+
+vertical_metrics <- ctd_fl %>%
+  filter(pres >= 0 & pres <= 30) %>%
+  group_by(id, date, station) %>%
+  arrange(id, pres) %>%
+  summarise(
+    # Keep existing
+    int_chla = pracma::trapz(pres, f_final),
+    scm_depth = pres[which.max(f_final)],
+    centroid_depth = sum(pres * f_final) / sum(f_final),
+    
+    # ADD THESE THREE:
+    
+    # 1. Surface depletion (0 = no SCM, 1 = extreme SCM)
+    surface_chla = mean(f_final[pres >= 1 & pres <= 5], na.rm = TRUE),
+    scm_max = max(f_final, na.rm = TRUE),
+    surface_depletion = (scm_max - surface_chla) / scm_max,
+    
+    # 2. Profile shape (CV = coefficient of variation)
+    # High = peaked/concentrated, Low = uniform
+    profile_shape = sd(f_final) / mean(f_final),
+    
+    # 3. Vertical gradient strength (average rate of change)
+    # High = sharp transitions, Low = gradual/mixed
+    vertical_gradient = mean(abs(diff(f_final)) / diff(pres), na.rm = TRUE),
+    
+    .groups = 'drop'
+  )
+```
+
+
+```{r}
+vertical_export <- vertical_metrics %>% 
+  select(date,
+         station,
+         int_chla,
+         scm_depth,
+         centroid_depth,
+         surface_depletion,
+         profile_shape,
+         vertical_gradient) %>% 
+  distinct() %>% 
+  group_by(date) %>% 
+  summarise(int_chla = mean(int_chla),
+            scm_depth = mean(scm_depth),
+            centroid_depth = mean(centroid_depth),
+            surface_depletion = mean(centroid_depth),
+            profile_shape = mean(profile_shape),
+            vertical_gradient = mean(vertical_gradient),
+            .groups = "drop") 
+
+write_csv(vertical_export, here("outputs", "vertical_metrics.csv"))
+```
+
+
+
+
 
 ```{r}
 # Calculate integrated fluorescence (0-30m) by month

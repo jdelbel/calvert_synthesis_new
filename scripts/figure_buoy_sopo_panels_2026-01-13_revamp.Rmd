@@ -1,0 +1,1521 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Some new interpolation tutorials to consider:
+https://search.r-project.org/CRAN/refmans/rioja/html/interp.dataset.html
+https://github.com/hdugan/NTLlakeloads
+
+```{r}
+#Upload packages
+library(tidyverse)
+library(here)
+library(readxl)
+library(patchwork)
+library(lubridate)
+library(MBA)
+library(mgcv)
+library(FNN)
+library(zoo)
+library(reshape2)
+library(rioja)
+library(egg)
+library(palr)
+library(ggsci)
+library(gsw)
+
+```
+
+```{r}
+# ============================================
+# GAP-FILLING WITH DISCRETE SAMPLE
+# ============================================
+
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+
+fill_gap_with_discrete <- function(df, 
+                                   gap_start = as.Date("2025-04-27"),
+                                   gap_end = as.Date("2025-05-11"),
+                                   discrete_date = as.Date("2025-05-02"),
+                                   discrete_value = 11.61,
+                                   interpolation_method = "gaussian") {
+  
+  # Validate inputs
+  if (discrete_date <= gap_start || discrete_date >= gap_end) {
+    stop("Discrete sample date must be within the gap period")
+  }
+  
+  # Find boundary values (last before gap, first after gap)
+  before_gap <- df %>%
+    filter(date <= gap_start) %>%
+    arrange(desc(date)) %>%
+    slice(1) %>%
+    pull(fl_med_day)
+  
+  after_gap <- df %>%
+    filter(date >= gap_end) %>%
+    arrange(date) %>%
+    slice(1) %>%
+    pull(fl_med_day)
+  
+  # Create date sequence for gap
+  gap_dates <- seq(gap_start + days(1), gap_end - days(1), by = "day")
+  
+  if (interpolation_method == "gaussian") {
+    # Gaussian curve centered on discrete sample
+    # This mimics a bloom peak with asymmetric rise/fall
+    
+    # Days from gap start
+    days_from_start <- as.numeric(discrete_date - gap_start)
+    total_gap_days <- as.numeric(gap_end - gap_start)
+    
+    # Calculate standard deviations for asymmetric curve
+    # Rising phase is typically faster than declining phase for diatom blooms
+    sd_rise <- days_from_start * 0.5  # Faster rise
+    sd_fall <- (total_gap_days - days_from_start) * 0.6  # Slower decline
+    
+    # Generate values
+    gap_values <- sapply(gap_dates, function(d) {
+      days_from_discrete <- as.numeric(d - discrete_date)
+      
+      if (days_from_discrete <= 0) {
+        # Rising phase (before peak)
+        amplitude <- discrete_value - before_gap
+        gaussian <- amplitude * exp(-(days_from_discrete^2) / (2 * sd_rise^2))
+        return(before_gap + gaussian)
+      } else {
+        # Falling phase (after peak)
+        amplitude <- discrete_value - after_gap
+        gaussian <- amplitude * exp(-(days_from_discrete^2) / (2 * sd_fall^2))
+        return(after_gap + gaussian)
+      }
+    })
+    
+  } else if (interpolation_method == "spline") {
+    # Cubic spline through three points
+    x_points <- c(as.numeric(gap_start), 
+                  as.numeric(discrete_date), 
+                  as.numeric(gap_end))
+    y_points <- c(before_gap, discrete_value, after_gap)
+    
+    spline_fit <- spline(x_points, y_points, 
+                        xout = as.numeric(gap_dates),
+                        method = "natural")
+    gap_values <- spline_fit$y
+    
+  } else if (interpolation_method == "asymmetric") {
+    # Exponential rise, linear fall (typical diatom bloom)
+    
+    days_to_peak <- as.numeric(discrete_date - gap_start - 1)
+    days_from_peak <- as.numeric(gap_end - discrete_date - 1)
+    
+    gap_values <- sapply(gap_dates, function(d) {
+      if (d <= discrete_date) {
+        # Exponential rise
+        t <- as.numeric(d - gap_start) / days_to_peak
+        rise <- (discrete_value - before_gap) * (exp(2*t) - 1) / (exp(2) - 1)
+        return(before_gap + rise)
+      } else {
+        # Linear decline with slight curve
+        t <- as.numeric(d - discrete_date) / days_from_peak
+        fall <- (discrete_value - after_gap) * (1 - t^1.5)  # Slightly curved
+        return(after_gap + fall)
+      }
+    })
+  }
+  
+  # Create gap-filled dataframe
+  gap_filled_data <- data.frame(
+    date = gap_dates,
+    fl_med_day = gap_values,
+    gap_filled = TRUE,
+    discrete_anchor = gap_dates == discrete_date
+  )
+  
+  # Add discrete sample point
+  discrete_row <- data.frame(
+    date = discrete_date,
+    fl_med_day = discrete_value,
+    gap_filled = FALSE,
+    discrete_anchor = TRUE
+  )
+  
+  # Combine with original data
+  df_original <- df %>%
+    mutate(gap_filled = FALSE, discrete_anchor = FALSE)
+  
+  result <- bind_rows(df_original, gap_filled_data) %>%
+    filter(!(date > gap_start & date < gap_end & !gap_filled)) %>%  # Remove original gap
+    arrange(date)
+  
+  # Add the discrete point (overwrite interpolated value at that date)
+  result <- result %>%
+    filter(date != discrete_date) %>%
+    bind_rows(discrete_row) %>%
+    arrange(date)
+  
+  # Report summary
+  cat("\n=== GAP-FILLING SUMMARY ===\n")
+  cat(sprintf("Gap period: %s to %s (%d days)\n", 
+              gap_start, gap_end, length(gap_dates)))
+  cat(sprintf("Discrete sample: %s = %.2f mg/m³\n", 
+              discrete_date, discrete_value))
+  cat(sprintf("Before gap: %.2f | After gap: %.2f\n", 
+              before_gap, after_gap))
+  cat(sprintf("Interpolation method: %s\n", interpolation_method))
+  cat(sprintf("Days filled: %d\n\n", sum(result$gap_filled)))
+  
+  return(result)
+}
+```
+
+
+
+```{r}
+#QC'd Buoy fluorescence data
+#Put buoy QC pipline into Claude for suggestions.
+
+#Quality controlled nightly mean buoy flourescence from 2m depth
+b_f <- read.csv(here("outputs", "qc_buoy_2026-01-13_bug_test.csv"))
+
+#Buoy salinity data
+buoy_ts <- read.csv(here("files", "t_s_2026-01-13.1hourSamples.all.csv"))
+
+#Corrected CTD fluorescence data
+ctd_fl <- read_csv(here("outputs", "flu_qc_2025-11-25.csv"))
+
+#Downloading discrete chlorophyll samples - This could be done using the API
+cd <- read_csv(here("files", "2026-01-13_HakaiData_chlorophyll.csv"))
+
+#Not sure if used here so leaving for now.
+# ctd <- read_csv(here("files", "ctd_kc10_fzh01_2025-08-09.csv"))
+
+#cm = chlorophylly march - I think I folded this into my fluorometer QC
+# cm <- read_csv(here("files", "chl_2022-03-09.csv")) 
+# #cs = chlorophyll september
+# cs <- read_csv(here("files", "chl_2022-09-09.csv")) 
+
+#CHEMTAX outputs
+chem <- read_csv(here("files", "chemtax_single_2025-11-21.csv"))
+
+#I think here I am downloading all of the wind data from the lookout?
+wind <- read_csv(here("files", "wind_2026-01-13.1hourSamples.all.csv"))
+
+# weath <- read_csv(here("files", "enviro_weather_2025-04-14.csv"))
+```
+```{r}
+# ctd_calc <- ctd %>% 
+#   mutate(date = date(`Measurement time`)) %>%
+#   filter(`Cast Direction Flag` == "d") %>% 
+#   # filter(is.na(`Fluorometry Chlorophyll flag`)) %>% 
+#   select(castpk = `Cast PK`,
+#          ctd_num =`CTD serial number`,
+#          date, m_time = `Measurement time`,
+#          station = Station,
+#          longitude = `Station Longitude`,
+#          latitude = `Station Latitude`,
+#          pres = `Pressure (dbar)`,
+#          sal = `Salinity (PSU)`,
+#          temp = `Temperature (deg C)`) %>%
+#   mutate(
+#     # Calculate absolute salinity from practical salinity
+#     sa = gsw_SA_from_SP(sal, pres, longitude, latitude),  # Adjust lat/lon for your study area
+#     # Calculate conservative temperature from in-situ temperature
+#     ct = gsw_CT_from_t(sa, temp, pres),
+#     # Calculate in-situ density (kg/m³)
+#     density = gsw_rho(sa, ct, pres),
+#     # Calculate potential density anomaly (sigma-theta, kg/m³ - 1000)
+#     sigma_theta = gsw_sigma0(sa, ct)
+#   )
+# 
+# daily_ctd <- ctd_calc %>%
+#   filter(!is.na(sal), !is.na(temp), !is.na(sigma_theta)) %>%  # Remove missing values
+#   
+#   # Step 1: Calculate daily means by depth
+#   group_by(date, pres) %>%
+#   summarise(
+#     sal_daily = mean(sal, na.rm = TRUE),
+#     temp_daily = mean(temp, na.rm = TRUE),
+#     sigma_theta_daily = mean(sigma_theta, na.rm = TRUE),
+#     .groups = 'drop'
+#   )
+```
+
+```{r}
+#Pulling out discharge model outputs for each watershed type and pivoting to long format for plotting
+# q <- weath %>% 
+#   select(date, Q_GM, Q_SM, Q_RA) %>% 
+#   pivot_longer(c(Q_GM:Q_RA), names_to = "Watershed_group", values_to = "Q") %>% 
+#   drop_na() %>% 
+#   group_by(date) %>% 
+#   mutate(n = n()) %>% 
+#   ungroup() %>% 
+#   mutate(year = year(date))
+```
+
+```{r}
+#Pulling out the median nightly buoy fluorescence value from my QC process
+buoy_fl <- b_f %>% 
+  select(date = date_corr, fl_med_day, group) %>% 
+  distinct() %>% 
+  mutate(date = ymd(date),
+         year = year(date),
+         month = month(date),
+         yday = yday(date)) %>%
+  filter(year %in% c(2022, 2023, 2024, 2025)) %>% 
+  mutate(group = as.character(group))
+
+ctd_fl <- ctd_fl %>% 
+  mutate(year = year(date))
+
+# Step 2: Apply chosen method (gaussian recommended)
+buoy_fl_gapfilled <- fill_gap_with_discrete(
+  df = buoy_fl,
+  gap_start = as.Date("2025-04-27"),
+  gap_end = as.Date("2025-05-11"),
+  discrete_date = as.Date("2025-05-02"),
+  discrete_value = 11.61,
+  interpolation_method = "gaussian"
+)
+
+buoy_fl_gapfilled <- buoy_fl_gapfilled %>% 
+  mutate(date = ymd(date),
+         year = year(date),
+         month = month(date),
+         yday = yday(date)) 
+```
+
+```{r}
+#Pulling out buoy salinity data without flags for 2022 and 2024 and calculating daily mean
+buoy_ts <- buoy_ts %>% 
+  mutate(measurementTime = mdy_hm(measurementTime),
+         date = date(measurementTime)) %>% 
+  filter(year %in% c(2022, 2024, 2025)) %>% 
+  group_by(date) %>% 
+  summarise(mean_sal = mean(WaterSalinity[WaterSalinity_UQL == 2], na.rm = TRUE),
+            mean_temp = mean(WaterTemp[WaterTemp_UQL == 2], na.rm = TRUE),
+            .groups = "drop")
+
+# More general approach - remove any temp/sal data within the gap
+GAP_START <- as.Date("2025-04-27")
+GAP_END <- as.Date("2025-05-11")
+
+buoy_ts_clean <- buoy_ts %>%
+  filter(!(date > GAP_START & date < GAP_END))
+
+wind_dm <- wind %>% 
+  mutate(measurementTime = mdy_hm(measurementTime),
+         date = date(measurementTime)) %>% 
+  filter(year %in% c(2022, 2024, 2025)) %>% 
+  group_by(date) %>% 
+  summarise(WindSpd_Med = median(WindSpd_Avg[WindSpd_UQL == 2], na.rm = TRUE),
+            WindDir_Med = median(WindDir_Avg[WindDir_UQL == 2], na.rm = TRUE),
+            .groups = "drop") %>% 
+  mutate(year = year(date))
+  
+```
+
+
+```{r}
+#Pulling out the Bulk chlorophyll data for 2022, setting the 0m depth to 1m to join with the CTD fluorometer data and then changing an issue sample with the size-fractionated sum concentration
+cd <- cd %>% 
+  filter(filter_type == "Bulk GF/F" & line_out_depth == 0) %>% 
+  select(date, chla) %>% 
+  mutate(chla = case_when(date == "2022-05-05" ~ 1.41,
+                          TRUE ~ as.numeric(chla)))
+```
+
+```{r}
+#Wrangling the buoy fluorometer data and joining 2022 and 2024 with both
+buoy_fl <- buoy_fl_gapfilled %>% 
+  full_join(cd) %>% 
+  left_join(buoy_ts_clean)
+```
+
+```{r}
+#Working with chemtax data to make it easy to plot
+
+#Making the date column a date format
+chem <- chem %>% 
+  mutate(date = lubridate::mdy(Date)) %>%
+  select(date, cyan = Cyanobacteria, hapt = Hapto, 
+         GA = `Prasinophytes-3`, cryp = Cryptophytes,
+         dino = `Dinoflagellates-1`, raph = Raphido,
+         dict = Dictyo, diat = `Diatoms-1`) %>% #rename groups
+  pivot_longer(c(cyan:diat), names_to = "group",
+               values_to = "contribution") %>%  #pivot longer
+  group_by(date, group) %>% 
+  summarise(contribution = mean(contribution)) %>% #Calculating daily mean for duplicates.
+  ungroup() %>% 
+  group_by(date) %>% 
+  mutate(tchla = sum(contribution)) %>% #Calculating TChla concentrations for each day
+  ungroup()
+
+
+#checking to see if there are any duplicates - there were replicates taken for DFO comparisons. None found because I already averaged these for the manuscript.
+chem_dup <- chem%>%
+  distinct(date, tchla) %>% 
+  group_by(date) %>% 
+  mutate(dup = n()) %>% 
+  ungroup() %>% 
+  filter(dup > 1)
+
+#Good to move forward
+```
+
+
+
+```{r}
+#Creating the 2022 wind speed cubed plot - what if i added wind direction or vector here?
+f_wind_22 <- wind_dm %>%
+  filter(year == 2022) %>%
+  ggplot() +
+  geom_line(aes(x = date, y = WindSpd_Med^3),
+            size = 2) +
+  ylim(0, 6000) +
+  labs(y = bquote(Wind~"("*m^3*s^3*")")) +
+  scale_x_date(limits = as_date(c("2022-01-01", "2022-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  theme(text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+
+print(f_wind_22)
+```
+
+```{r}
+#Creating the 2022 wind speed cubed plot - what if i added wind direction or vector here?
+f_wind_24 <- wind_dm %>%
+  filter(year == 2024) %>%
+  ggplot() +
+  geom_line(aes(x = date, y = WindSpd_Med^3),
+            size = 2) +
+  ylim(0, 6000) +
+  labs(y = bquote(Wind~"("*m^3*s^-3*")")) +
+  scale_x_date(limits = as_date(c("2024-01-01", "2024-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  theme(text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+
+print(f_wind_24)
+```
+
+```{r}
+#Creating the 2022 wind speed cubed plot - what if i added wind direction or vector here?
+f_wind_25 <- wind_dm %>%
+  filter(year == 2025) %>%
+  ggplot() +
+  geom_line(aes(x = date, y = WindSpd_Med^3),
+            size = 2) +
+  ylim(0, 6000) +
+  labs(y = bquote(Wind~"("*m^3*s^-3*")")) +
+  scale_x_date(limits = as_date(c("2025-01-01", "2025-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  theme(text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+
+print(f_wind_25)
+```
+
+```{r}
+#Setting up the joined buoy surface discrete chlorophyll 2m nightly median fluorescence and 2m daily mean salinity/temperature for plotting - pivoting long.
+
+buoy_fl_long <- buoy_fl %>%
+  select(date, chla, fl_med_day, mean_sal, mean_temp) %>% 
+  pivot_longer(c(chla, fl_med_day, mean_sal, mean_temp),
+              names_to = "par", values_to = "val") %>% 
+  mutate(date = date(date),
+         year = year(date))  
+```
+
+```{r}
+#Creating buoy figure for 2022 - discrete surface chlorophyll, daily fluorescence/temp/sal
+f_buoy_22 <- buoy_fl_long %>% 
+  filter(year == 2022) %>% 
+  ggplot(aes(x = date, y = val, color = par)) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "fl_med_day"),
+            size = 2) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "mean_sal"),
+            size = 2) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "mean_temp"),
+            size = 2) +
+  geom_point(data = filter(buoy_fl_long,
+                          par == "chla"),
+            size = 4, pch = 8, stroke = 2) +
+  ggsci::scale_color_jama(labels = c(expression(Chl[Discrete]),
+                                         expression(Chl[BUOY]),
+                                         expression(Salinity[BUOY]),
+                                     expression(Temp[BUOY]))) +
+  scale_x_date(limits = as_date(c("2022-01-01", "2022-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  ylab(expression(atop(Chl~"(mg" ~ m^-3*")",
+                       paste("Salinity,"~"Temp")))) +
+  labs(color = NULL) +
+  theme_bw() +
+  theme(legend.position = "right",
+        text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+
+print(f_buoy_22)
+```
+
+```{r}
+#Creating buoy figure for 2022 - discrete surface chlorophyll, daily fluorescence/temp/sal
+f_buoy_24 <- buoy_fl_long %>% 
+  filter(year == 2024) %>% 
+  ggplot(aes(x = date, y = val, color = par)) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "fl_med_day"),
+            size = 2) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "mean_sal"),
+            size = 2) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "mean_temp"),
+            size = 2) +
+  geom_point(data = filter(buoy_fl_long,
+                          par == "chla"),
+            size = 4, pch = 8, stroke = 2) +
+  ggsci::scale_color_jama(labels = c(expression(Chl[Discrete]),
+                                         expression(Chl[BUOY]),
+                                         expression(Salinity[BUOY]),
+                                     expression(Temp[BUOY]))) +
+  scale_x_date(limits = as_date(c("2024-01-01", "2024-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  ylab(expression(atop(Chl~"(mg" ~ m^-3*")",
+                       paste("Salinity,"~"Temp")))) +
+  labs(color = NULL) +
+  theme_bw() +
+  theme(legend.position = "right",
+        text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+
+print(f_buoy_24)
+```
+```{r}
+#Creating buoy figure for 2022 - discrete surface chlorophyll, daily fluorescence/temp/sal
+f_buoy_25 <- buoy_fl_long %>% 
+  filter(year == 2025) %>% 
+  ggplot(aes(x = date, y = val, color = par)) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "fl_med_day"),
+            size = 2) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "mean_sal"),
+            size = 2) +
+  geom_line(data = filter(buoy_fl_long,
+                          par == "mean_temp"),
+            size = 2) +
+  geom_point(data = filter(buoy_fl_long,
+                          par == "chla"),
+            size = 4, pch = 8, stroke = 2) +
+  ggsci::scale_color_jama(labels = c(expression(Chl[Discrete]),
+                                         expression(Chl[BUOY]),
+                                         expression(Salinity[BUOY]),
+                                     expression(Temp[BUOY]))) +
+  scale_x_date(limits = as_date(c("2025-01-01", "2025-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  ylab(expression(atop(Chl~"(mg" ~ m^-3*")",
+                       paste("Salinity,"~"Temp")))) +
+  labs(color = NULL) +
+  theme_bw() +
+  theme(legend.position = "right",
+        text = element_text(size = 35), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+
+print(f_buoy_25)
+```
+
+
+
+```{r}
+#Adding in 2022 interpolated CTD fluorescence profiles to fill gap of bad data
+
+ctd_fl <- ctd_fl %>% 
+  mutate(year = year(date)) %>% 
+  filter(year %in% c(2022, 2024, 2025)) %>% 
+  filter(station == "KC10") %>% 
+  select(date, station, year, pres, f_final)
+```
+
+```{r}
+#Setting color palette
+
+# Option 3: Viridis-inspired but with dark blue start
+fluor_palette_v3 <- colorRampPalette(c(
+  "#08306b",  # Deep navy blue
+  "#1f4e7a",  # Dark blue
+  "#2e6b89",  # Medium blue
+  "#4d8fc7",  # Bright blue
+  "#2fb3d4",  # Vivid cyan-blue (bloom threshold)
+  "#00a693",  # Bright teal
+  "#4daf4a",  # Vibrant green
+  "#8cc152",  # Lime green
+  "#ffd23f",  # Bright yellow
+  "#ff8c42",  # Vivid orange
+  "#e74c3c"   # Bold red-orange
+))
+
+# Generate color vectors (50 colors for smooth gradients)
+colors_v3 <- fluor_palette_v3(50)
+
+# Function to create breaks that emphasize bloom threshold
+create_fluor_breaks <- function(max_val = 50, bloom_threshold = 5) {
+  # More breaks in the 0-10 range to capture bloom dynamics
+  c(0, 1, 2, 3, 4, bloom_threshold, 7, 10, 15, 20, 30, 40, max_val)
+}
+
+overall_range <- ctd_fl %>% 
+  filter(pres < 51) %>% 
+  summarise(min_val = min(f_final, na.rm = TRUE),
+            max_val = max(f_final, na.rm = TRUE))
+```
+
+```{r}
+#Creating CTD profile plot for each year.
+
+f_ctd_fl_22 <- ctd_fl %>% 
+  filter(pres < 51 & year == 2022) %>% 
+  ggplot(aes(x = date)) +
+  geom_tile(aes(y = pres, fill = f_final)) +
+  geom_hline(yintercept = 5,
+             linetype = "dashed", size = 1, color = "white") +
+  scale_y_reverse(breaks = seq(0, 50, by = 10)) +
+
+  scale_fill_gradientn(colors = colors_v3,
+                     values = scales::rescale(c(0, 2, 5, 10, 20, 50)),
+                     limits = c(overall_range$min_val, overall_range$max_val)) +
+  labs(fill = bquote(CTD[FLU]~"(mg" ~ m^-3*")"),
+       y = "Depth") +
+  scale_x_date(limits = as_date(c("2022-01-01", "2022-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  theme(text = element_text(size = 38), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        # axis.text.x = element_blank(),
+        legend.position = "right",
+        legend.key.height = unit(1.8, "cm"),
+        legend.title = element_text(size = 30, angle = 270),
+        legend.title.align = 0.5,
+        legend.direction = "vertical",
+        axis.text.x = element_blank()
+        ) +
+    guides(fill = guide_colourbar(title.position = "right"))
+
+print(f_ctd_fl_22)
+```
+
+```{r}
+#Creating CTD profile plot for each year.
+
+f_ctd_fl_24 <- ctd_fl %>% 
+  filter(pres < 51 & year == 2024) %>% 
+  ggplot(aes(x = date)) +
+  geom_tile(aes(y = pres, fill = f_final)) +
+
+  geom_hline(yintercept = 5,
+             linetype = "dashed", size = 1, color = "white") +
+  scale_y_reverse(breaks = seq(0, 50, by = 10)) +
+  scale_fill_gradientn(colors = colors_v3,
+                     values = scales::rescale(c(0, 2, 5, 10, 20, 50)),
+                     limits = c(overall_range$min_val, overall_range$max_val)) +
+  labs(fill = bquote(CTD[FLU]~"(mg" ~ m^-3*")"),
+       y = "Depth") +
+  scale_x_date(limits = as_date(c("2024-01-01", "2024-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  theme(text = element_text(size = 38), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        # axis.text.x = element_blank(),
+        legend.position = "right",
+        legend.key.height = unit(1.8, "cm"),
+        legend.title = element_text(size = 30, angle = 270),
+        legend.title.align = 0.5,
+        legend.direction = "vertical",
+        axis.text.x = element_blank()
+        ) +
+    guides(fill = guide_colourbar(title.position = "right"))
+
+print(f_ctd_fl_24)
+```
+```{r}
+#Creating CTD profile plot for each year.
+
+f_ctd_fl_25 <- ctd_fl %>% 
+  filter(pres < 51 & year == 2025) %>% 
+  ggplot(aes(x = date)) +
+  geom_tile(aes(y = pres, fill = f_final), width = 20) +
+  geom_hline(yintercept = 5,
+             linetype = "dashed", size = 1, color = "white") +
+  scale_y_reverse(breaks = seq(0, 50, by = 10)) +
+  scale_fill_gradientn(colors = colors_v3,
+                     values = scales::rescale(c(0, 2, 5, 10, 20, 50)),
+                     limits = c(overall_range$min_val, overall_range$max_val)) +
+  labs(fill = bquote(CTD[FLU]~"(mg" ~ m^-3*")"),
+       y = "Depth") +
+  scale_x_date(limits = as_date(c("2025-01-01", "2025-12-31")),
+               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  theme(text = element_text(size = 38), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank(),
+        # axis.text.x = element_blank(),
+        legend.position = "right",
+        legend.key.height = unit(1.8, "cm"),
+        legend.title = element_text(size = 30, angle = 270),
+        legend.title.align = 0.5,
+        legend.direction = "vertical",
+        axis.text.x = element_blank()
+        ) +
+    guides(fill = guide_colourbar(title.position = "right"))
+
+print(f_ctd_fl_25)
+```
+
+
+```{r}
+
+
+# First, modify plots to remove redundant axes and legends
+# Wind plots - only leftmost gets y-axis, only bottom row gets x-axis
+f_wind_22_mod <- f_wind_22 + 
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+f_wind_24_mod <- f_wind_24 + 
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank())
+
+f_wind_25_mod <- f_wind_25 + 
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank())
+
+# Buoy plots - only leftmost gets y-axis and legend
+f_buoy_22_mod <- f_buoy_22 + 
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        legend.position = "none")
+
+f_buoy_24_mod <- f_buoy_24 + 
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        legend.position = "none")
+
+f_buoy_25_mod <- f_buoy_25 + 
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank())
+
+# CTD plots - only leftmost gets y-axis, only rightmost gets legend, bottom row gets x-axis
+f_ctd_fl_22_mod <- f_ctd_fl_22 + 
+  theme(axis.text.x = element_text(color = "black"),
+        legend.position = "none")
+
+f_ctd_fl_24_mod <- f_ctd_fl_24 + 
+  theme(axis.text.x = element_text(color = "black"),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        legend.position = "none")
+
+f_ctd_fl_25_mod <- f_ctd_fl_25 + 
+  theme(axis.text.x = element_text(color = "black"),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank()) # Keep legend on rightmost
+
+# Combine plots
+combined_plot <- (f_wind_22_mod | f_wind_24_mod | f_wind_25_mod) /
+                 (f_buoy_22_mod | f_buoy_24_mod | f_buoy_25_mod) /
+                 (f_ctd_fl_22_mod | f_ctd_fl_24_mod | f_ctd_fl_25_mod)
+
+# Add column titles
+combined_plot <- combined_plot + 
+  plot_annotation(
+    title = NULL,
+    theme = theme(plot.title = element_text(size = 40))
+  )
+
+# Add year labels at the top
+combined_plot_final <- wrap_elements(
+  grid::textGrob("2022", gp = grid::gpar(fontsize = 35))) |
+  wrap_elements(
+  grid::textGrob("2024", gp = grid::gpar(fontsize = 35))) |
+  wrap_elements(
+  grid::textGrob("2025", gp = grid::gpar(fontsize = 35))) 
+
+combined_plot_final <- combined_plot_final / combined_plot + 
+  plot_layout(heights = c(0.05, 1))
+
+test <- ggarrange(f_wind_22_mod, f_wind_24_mod, f_wind_25_mod,
+                  f_buoy_22_mod, f_buoy_24_mod, f_buoy_25_mod,
+                  f_ctd_fl_22_mod, f_ctd_fl_24_mod, f_ctd_fl_25_mod,
+                        ncol = 3)
+
+print(combined_plot_final)
+
+ggsave(here("figures", "panel_kc10_buoy_2022_2024_2025.png"),
+       test,
+        width = 35, height = 12, dpi = 300)
+```
+
+```{r}
+#Setting plotting order phytoplankton groups
+
+#Order phytoplankton groups roughly from smallest to largest - create order list
+order_chem <- c("cyan", "hapt", "GA", "cryp",
+                   "dino", "raph", "dict", "diat")
+
+#Chemtax full data - Specify order of phyto groups for figures
+chem <- arrange(mutate(chem,
+                                group = factor(group,
+                                levels = order_chem)))
+```
+
+```{r}
+f_chem_22 <- chem %>%
+  ggplot() +
+  geom_bar(aes(date, contribution, fill = fct_rev(group)),
+           position = "stack", stat = "identity",
+           alpha = 1, color = "black", size = 1) +
+  ggsci::scale_fill_npg() +
+  scale_x_date(limits = as.Date(c("2022-01-01", "2022-12-31")),
+               expand = c(0, 0),
+               date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  labs(y = bquote("Phyto. (mg" ~ m^-3*")"),
+       fill = "Group") +
+  theme(
+        legend.position = "right",
+        legend.key.height = unit(0.5, "cm"),
+        legend.title = element_blank(),
+        text = element_text(size = 38), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank())
+
+print(f_chem_22)
+```
+```{r}
+f_chem_24 <- chem %>%
+  ggplot() +
+  geom_bar(aes(date, contribution, fill = fct_rev(group)),
+           position = "stack", stat = "identity",
+           alpha = 1, color = "black", size = 1) +
+  ggsci::scale_fill_npg() +
+  scale_x_date(limits = as.Date(c("2024-01-01", "2024-12-31")),
+               expand = c(0, 0),
+               date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  labs(y = bquote("Phyto. (mg" ~ m^-3*")"),
+       fill = "Group") +
+  theme(
+        legend.position = "right",
+        legend.key.height = unit(0.5, "cm"),
+        legend.title = element_blank(),
+        text = element_text(size = 38), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank())
+
+print(f_chem_24)
+```
+```{r}
+f_chem_25 <- chem %>%
+  ggplot() +
+  geom_bar(aes(date, contribution, fill = fct_rev(group)),
+           position = "stack", stat = "identity",
+           alpha = 1, color = "black", size = 1,
+           width = 16) +
+  ggsci::scale_fill_npg() +
+  scale_x_date(limits = as.Date(c("2025-01-01", "2025-12-31")),
+               expand = c(0, 0),
+               date_breaks = "months", date_labels = "%b") +
+  theme_bw() +
+  labs(y = bquote("Phyto. (mg" ~ m^-3*")"),
+       fill = "Group") +
+  theme(
+        legend.position = "right",
+        legend.key.height = unit(0.5, "cm"),
+        legend.title = element_blank(),
+        text = element_text(size = 38), #35
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank())
+
+print(f_chem_25)
+```
+
+
+
+```{r}
+f_22_panel <- ggarrange(f_wind_22, f_buoy_22, f_ctd_fl_22, f_chem_22,
+                        ncol = 1)
+
+ggsave(here("figures", "panel_kc10_2022_buoy_discrete.png"), f_22_panel,
+        width = 16, height = 16, dpi = 300)
+
+f_24_panel <- ggarrange(f_wind_24, f_buoy_24, f_ctd_fl_24, f_chem_24,
+                        ncol = 1)
+
+ggsave(here("figures", "panel_kc10_2024_buoy_discrete.png"), f_24_panel,
+        width = 16, height = 16, dpi = 300)
+
+f_25_panel <- ggarrange(f_wind_25, f_buoy_25, f_ctd_fl_25, f_chem_25,
+                        ncol = 1)
+
+ggsave(here("figures", "panel_kc10_2025_buoy_discrete.png"), f_25_panel,
+        width = 16, height = 16, dpi = 300)
+```
+
+```{r}
+# ============================================
+# PHYTOPLANKTON BLOOM DETECTION & VISUALIZATION
+# ============================================
+
+library(dplyr)
+library(lubridate)
+library(zoo)
+library(ggplot2)
+library(gridExtra)
+library(here)
+
+# ============================================
+# CONFIGURATION
+# ============================================
+SMOOTHING_ENABLED <- FALSE
+SMOOTHING_PERIOD <- 0
+SMOOTHING_TYPE <- "median"
+MIN_BLOOM_DAYS <- 7
+THRESHOLD_PERCENT <- 1.15     # 5% above median
+GAP_TOLERANCE <- 0            # Bridge gaps between blooms (0 = strict)
+USE_TIMESERIES_MEDIAN <- TRUE # TRUE = time-series median, FALSE = annual median
+EXCLUDE_YEARS <- c(2023)      # Years with incomplete data to exclude
+
+# ============================================
+# BLOOM DETECTION FUNCTION
+# ============================================
+calculate_bloom_metrics <- function(df, 
+                                  gap_tolerance = GAP_TOLERANCE, 
+                                  smoothing = SMOOTHING_ENABLED,
+                                  min_bloom_days = MIN_BLOOM_DAYS,
+                                  threshold_percent = THRESHOLD_PERCENT,
+                                  smoothing_period = SMOOTHING_PERIOD,
+                                  smoothing_type = SMOOTHING_TYPE,
+                                  use_timeseries_median = USE_TIMESERIES_MEDIAN,
+                                  exclude_years = EXCLUDE_YEARS) {
+  
+  if (!smoothing_type %in% c("mean", "median")) {
+    stop("smoothing_type must be either 'mean' or 'median'")
+  }
+  
+  # Remove excluded years
+  if (!is.null(exclude_years) && length(exclude_years) > 0) {
+    df <- df %>% filter(!year %in% exclude_years)
+    message(paste("Excluded years:", paste(exclude_years, collapse = ", ")))
+  }
+  
+  # Calculate time-series median if requested
+  if (use_timeseries_median) {
+    timeseries_median <- median(df$fl_med_day, na.rm = TRUE)
+    timeseries_threshold <- timeseries_median * threshold_percent
+    message(sprintf("Using time-series median: %.2f (threshold: %.2f)", 
+                   timeseries_median, timeseries_threshold))
+  }
+  
+  all_bloom_events <- data.frame()
+  bloom_summary <- data.frame()
+  
+  for (yr in unique(df$year)) {
+    
+    year_data <- df %>% 
+      filter(year == yr) %>%
+      arrange(date)
+    
+    if (nrow(year_data) < 30) {
+      warning(paste("Insufficient data for year", yr, "(<30 observations) - skipping"))
+      next
+    }
+    
+    # Apply smoothing if requested
+    if (smoothing && smoothing_period > 1) {
+      smooth_fn <- if (smoothing_type == "mean") zoo::rollmean else zoo::rollmedian
+      year_data$fl_smoothed <- smooth_fn(year_data$fl_med_day, 
+                                         k = smoothing_period, 
+                                         fill = NA, 
+                                         align = "center")
+      year_data$fl_smoothed[is.na(year_data$fl_smoothed)] <- 
+        year_data$fl_med_day[is.na(year_data$fl_smoothed)]
+      comparison_var <- year_data$fl_smoothed
+    } else {
+      comparison_var <- year_data$fl_med_day
+    }
+    
+    # Define bloom threshold (time-series or annual)
+    if (use_timeseries_median) {
+      reference_median <- timeseries_median
+      bloom_threshold <- timeseries_threshold
+    } else {
+      reference_median <- median(year_data$fl_med_day, na.rm = TRUE)
+      bloom_threshold <- reference_median * threshold_percent
+    }
+    
+    # Identify periods above threshold
+    year_data$above_threshold <- comparison_var > bloom_threshold
+    
+    # Bridge short gaps if requested
+    if (gap_tolerance > 0) {
+      rle_result <- rle(year_data$above_threshold)
+      
+      for (i in 2:(length(rle_result$lengths) - 1)) {
+        if (!rle_result$values[i] && 
+            rle_result$lengths[i] <= gap_tolerance &&
+            rle_result$values[i-1] && 
+            rle_result$values[i+1]) {
+          rle_result$values[i] <- TRUE
+        }
+      }
+      year_data$above_threshold <- inverse.rle(rle_result)
+    }
+    
+    # Identify bloom periods
+    year_data$group <- cumsum(c(1, diff(year_data$above_threshold) != 0))
+    
+    bloom_periods <- year_data %>%
+      group_by(group, above_threshold) %>%
+      summarise(
+        start_date = min(date),
+        end_date = max(date),
+        duration = n(),
+        max_fl = max(fl_med_day, na.rm = TRUE),
+        max_fl_date = date[which.max(fl_med_day)],
+        mean_fl = mean(fl_med_day, na.rm = TRUE),
+        .groups = 'drop'
+      ) %>%
+      filter(above_threshold & duration >= min_bloom_days)
+    
+    # Calculate annual metrics
+    annual_median <- median(year_data$fl_med_day, na.rm = TRUE)
+    annual_peak_fl <- max(year_data$fl_med_day, na.rm = TRUE)
+    annual_peak_date <- year_data$date[which.max(year_data$fl_med_day)]
+    
+    if (nrow(bloom_periods) > 0) {
+      bloom_events <- bloom_periods %>%
+        mutate(
+          year = yr,
+          bloom_number = row_number(),
+          start_yday = yday(start_date),
+          end_yday = yday(end_date)
+        ) %>%
+        select(year, bloom_number, start_date, end_date, start_yday, end_yday,
+               duration, max_fl, max_fl_date, mean_fl)
+      
+      all_bloom_events <- bind_rows(all_bloom_events, bloom_events)
+      
+      year_summary <- tibble(
+        year = yr,
+        n_bloom_events = nrow(bloom_periods),
+        spring_bloom_start = min(bloom_periods$start_date),
+        spring_bloom_yday = yday(min(bloom_periods$start_date)),
+        total_bloom_days = sum(bloom_periods$duration),
+        annual_median = annual_median,
+        reference_median = reference_median,
+        bloom_threshold = bloom_threshold,
+        annual_peak_fl = annual_peak_fl,
+        annual_peak_yday = yday(annual_peak_date)
+      )
+    } else {
+      year_summary <- tibble(
+        year = yr,
+        n_bloom_events = 0,
+        spring_bloom_start = as.Date(NA),
+        spring_bloom_yday = NA_integer_,
+        total_bloom_days = 0,
+        annual_median = annual_median,
+        reference_median = reference_median,
+        bloom_threshold = bloom_threshold,
+        annual_peak_fl = annual_peak_fl,
+        annual_peak_yday = yday(annual_peak_date)
+      )
+    }
+    
+    bloom_summary <- bind_rows(bloom_summary, year_summary)
+  }
+  
+  return(list(
+    annual_summary = bloom_summary,
+    bloom_events = all_bloom_events,
+    parameters = list(
+      gap_tolerance = gap_tolerance,
+      smoothing = smoothing,
+      smoothing_period = smoothing_period,
+      min_bloom_days = min_bloom_days,
+      threshold_percent = threshold_percent,
+      use_timeseries_median = use_timeseries_median,
+      timeseries_median = if(use_timeseries_median) timeseries_median else NA,
+      excluded_years = exclude_years
+    )
+  ))
+}
+
+# ============================================
+# VISUALIZATION FUNCTION
+# ============================================
+plot_bloom_detection <- function(bloom_results, data, 
+                                problematic_dates = NULL,
+                                save_path = NULL) {
+  
+  annual_summary <- bloom_results$annual_summary
+  bloom_events <- bloom_results$bloom_events
+  params <- bloom_results$parameters
+  
+  # Filter data to years with results
+  plot_data <- data %>% 
+    filter(year %in% unique(annual_summary$year))
+  
+  # Remove problematic dates if specified
+  if (!is.null(problematic_dates)) {
+    plot_data <- plot_data %>% filter(!date %in% problematic_dates)
+  }
+  
+  # Calculate global y-axis limits
+  global_y_max <- max(plot_data$fl_med_day, na.rm = TRUE) * 1.05
+  
+  # Create individual year plot
+  create_year_plot <- function(yr) {
+    
+    year_data <- plot_data %>% filter(year == yr)
+    year_blooms <- bloom_events %>% filter(year == yr)
+    year_summary <- annual_summary %>% filter(year == yr)
+    
+    if (nrow(year_data) == 0) return(NULL)
+    
+    # Determine which median to show
+    if (params$use_timeseries_median) {
+      median_val <- year_summary$reference_median
+      median_label <- "Time-series median"
+      median_color <- "#4169E1"
+    } else {
+      median_val <- year_summary$annual_median
+      median_label <- "Annual median"
+      median_color <- "#4169E1"
+    }
+    
+    # Build plot
+    p <- ggplot(year_data, aes(x = date, y = fl_med_day)) +
+      # Bloom periods
+      {if (nrow(year_blooms) > 0) {
+        list(
+          geom_rect(data = year_blooms, 
+                    aes(xmin = start_date, xmax = end_date, 
+                        ymin = -Inf, ymax = Inf),
+                    fill = "red", alpha = 0.15, inherit.aes = FALSE),
+          geom_text(data = year_blooms,
+                    aes(x = start_date + (end_date - start_date)/2, 
+                        y = global_y_max * 0.95,
+                        label = paste0("B", bloom_number)),
+                    size = 3, fontface = "bold", color = "darkred",
+                    inherit.aes = FALSE)
+        )
+      }} +
+      # Fluorescence line
+      geom_line(color = "#2E8B57", linewidth = 1, alpha = 0.8) +
+      # Threshold lines
+      geom_hline(yintercept = median_val, 
+                 linetype = "dashed", color = median_color, linewidth = 0.8) +
+      geom_hline(yintercept = year_summary$bloom_threshold, 
+                 linetype = "solid", color = "#DC143C", linewidth = 0.8) +
+      # Formatting
+      scale_x_date(date_breaks = "1 month", date_labels = "%b",
+                   limits = c(as.Date(paste0(yr, "-01-01")), 
+                             as.Date(paste0(yr, "-12-31")))) +
+      scale_y_continuous(limits = c(0, global_y_max)) +
+      labs(
+        title = yr,
+        x = "",
+        y = "Fluorescence",
+        subtitle = sprintf("Blooms: %d | Threshold: %.2f | %s: %.2f",
+                          year_summary$n_bloom_events,
+                          year_summary$bloom_threshold,
+                          if(params$use_timeseries_median) "TS Median" else "Annual Median",
+                          median_val)
+      ) +
+      theme_bw() +
+      theme(
+        plot.title = element_text(size = 16, hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(size = 10, hjust = 0.5, color = "gray40"),
+        axis.text = element_text(size = 11),
+        axis.title.y = element_text(size = 12),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(linewidth = 0.3),
+        plot.margin = margin(5, 10, 5, 5)
+      )
+    
+    return(p)
+  }
+  
+  # Generate all year plots
+  year_plots <- lapply(sort(unique(annual_summary$year)), create_year_plot)
+  year_plots <- year_plots[!sapply(year_plots, is.null)]
+  
+  if (length(year_plots) == 0) {
+    stop("No valid plots generated")
+  }
+  
+  # Determine grid layout
+  n_years <- length(year_plots)
+  ncol <- if (n_years <= 2) 1 else 2
+  nrow <- ceiling(n_years / ncol)
+  
+  # Create combined plot
+  combined_plot <- do.call(grid.arrange, c(
+    year_plots, 
+    ncol = ncol, 
+    nrow = nrow,
+    top = "Phytoplankton Bloom Detection Results"
+  ))
+  
+  # Print summary
+  cat("\n=== BLOOM DETECTION SUMMARY ===\n")
+  cat("Method Configuration:\n")
+  cat(sprintf("  - Median type: %s\n", 
+              if(params$use_timeseries_median) "Time-series" else "Annual"))
+  if (params$use_timeseries_median) {
+    cat(sprintf("  - Time-series median: %.2f\n", params$timeseries_median))
+  }
+  cat(sprintf("  - Threshold: %.0f%% above median\n", 
+              (params$threshold_percent - 1) * 100))
+  cat(sprintf("  - Minimum bloom duration: %d days\n", params$min_bloom_days))
+  cat(sprintf("  - Gap tolerance: %d days\n", params$gap_tolerance))
+  cat(sprintf("  - Smoothing: %s", ifelse(params$smoothing, "YES", "NO")))
+  if (params$smoothing && params$smoothing_period > 1) {
+    cat(sprintf(" (%d-day %s)", params$smoothing_period, params$smoothing_type))
+  }
+  cat("\n")
+  if (!is.null(params$excluded_years) && length(params$excluded_years) > 0) {
+    cat(sprintf("  - Excluded years: %s\n", paste(params$excluded_years, collapse = ", ")))
+  }
+  cat("\n")
+  
+  summary_table <- annual_summary %>%
+    select(year, n_bloom_events, spring_bloom_yday, annual_peak_yday, 
+           total_bloom_days, annual_median, reference_median, bloom_threshold) %>%
+    mutate(
+      spring_bloom_yday = ifelse(is.na(spring_bloom_yday), 
+                                "No bloom", 
+                                paste("Day", spring_bloom_yday)),
+      annual_peak_yday = paste("Day", annual_peak_yday),
+      across(c(annual_median, reference_median, bloom_threshold), ~round(.x, 2))
+    )
+  
+  print(summary_table)
+  
+  cat("\n=== PLOT LEGEND ===\n")
+  cat("Green line: Daily fluorescence measurements\n")
+  cat(sprintf("Blue dashed: %s fluorescence\n", 
+              if(params$use_timeseries_median) "Time-series median" else "Annual median"))
+  cat(sprintf("Red solid: Bloom threshold (+%.0f%% above median)\n", 
+              (params$threshold_percent - 1) * 100))
+  cat("Red shading: Detected bloom periods\n")
+  cat("B1, B2, etc.: Bloom event numbers\n")
+  
+  # Save if path provided
+  if (!is.null(save_path)) {
+    ggsave(save_path, combined_plot,
+           width = 16, height = 8, dpi = 300, bg = "white")
+    cat(sprintf("\nPlot saved to: %s\n", save_path))
+  }
+  
+  return(combined_plot)
+}
+
+# ============================================
+# RUN BLOOM DETECTION
+# ============================================
+
+# Run with time-series median (recommended)
+bloom_metrics <- calculate_bloom_metrics(buoy_fl_gapfilled)
+
+# Generate plots
+combined_plot <- plot_bloom_detection(
+  bloom_results = bloom_metrics,
+  data = buoy_fl_gapfilled,
+  save_path = here("figures", "bloom_detection_timeseries.png")
+)
+
+# ============================================
+# OPTIONAL: COMPARE METHODS
+# ============================================
+
+# Compare time-series vs annual median approaches
+compare_methods <- function(data) {
+  
+  cat("\n========================================")
+  cat("\nCOMPARISON: Time-Series vs Annual Median")
+  cat("\n========================================\n")
+  
+  # Time-series approach
+  cat("\n--- TIME-SERIES MEDIAN APPROACH ---\n")
+  bloom_ts <- calculate_bloom_metrics(data, use_timeseries_median = TRUE)
+  
+  # Annual approach
+  cat("\n--- ANNUAL MEDIAN APPROACH ---\n")
+  bloom_annual <- calculate_bloom_metrics(data, use_timeseries_median = FALSE)
+  
+  # Compare results
+  comparison <- bloom_ts$annual_summary %>%
+    select(year, n_bloom_events) %>%
+    rename(blooms_timeseries = n_bloom_events) %>%
+    left_join(
+      bloom_annual$annual_summary %>%
+        select(year, n_bloom_events) %>%
+        rename(blooms_annual = n_bloom_events),
+      by = "year"
+    ) %>%
+    mutate(difference = blooms_timeseries - blooms_annual)
+  
+  cat("\n=== BLOOM COUNT COMPARISON ===\n")
+  print(comparison)
+  
+  cat("\n=== THRESHOLD COMPARISON ===\n")
+  threshold_comparison <- bloom_ts$annual_summary %>%
+    select(year, reference_median, bloom_threshold) %>%
+    rename(ts_median = reference_median, ts_threshold = bloom_threshold) %>%
+    left_join(
+      bloom_annual$annual_summary %>%
+        select(year, reference_median, bloom_threshold) %>%
+        rename(annual_median = reference_median, annual_threshold = bloom_threshold),
+      by = "year"
+    ) %>%
+    mutate(across(where(is.numeric), ~round(.x, 2)))
+  
+  print(threshold_comparison)
+  
+  return(list(timeseries = bloom_ts, annual = bloom_annual))
+}
+
+# Run comparison (optional)
+# comparison_results <- compare_methods(buoy_fl)
+```
+```{r}
+# Time-series median (recommended for climate studies)
+USE_TIMESERIES_MEDIAN <- TRUE
+bloom_metrics <- calculate_bloom_metrics(buoy_fl_gapfilled)
+plot_bloom_detection(bloom_metrics, buoy_fl_gapfilled)
+
+# Annual median (traditional approach)
+USE_TIMESERIES_MEDIAN <- FALSE
+bloom_metrics_annual <- calculate_bloom_metrics(buoy_fl)
+plot_bloom_detection(bloom_metrics_annual, buoy_fl)
+
+# Compare both methods side-by-side
+comparison_results <- compare_methods(buoy_fl)
+```
+
+```{r}
+
+
+# ============================================
+# VISUALIZATION OF GAP-FILLING
+# ============================================
+
+plot_gap_filling <- function(original_data, filled_data, 
+                            gap_start, gap_end, 
+                            zoom_days = 40,
+                            save_path = NULL) {
+  
+  # Create zoom window around gap
+  zoom_start <- gap_start - days(zoom_days/2)
+  zoom_end <- gap_end + days(zoom_days/2)
+  
+  plot_data <- filled_data %>%
+    filter(date >= zoom_start, date <= zoom_end)
+  
+  p <- ggplot(plot_data, aes(x = date, y = fl_med_day)) +
+    # Gap region
+    annotate("rect", 
+             xmin = gap_start, xmax = gap_end,
+             ymin = -Inf, ymax = Inf,
+             fill = "gray90", alpha = 0.5) +
+    # Original data
+    geom_line(data = plot_data %>% filter(!gap_filled),
+              aes(color = "Original data"), 
+              linewidth = 1) +
+    geom_point(data = plot_data %>% filter(!gap_filled),
+               aes(color = "Original data"),
+               size = 2, alpha = 0.6) +
+    # Interpolated data
+    geom_line(data = plot_data %>% filter(gap_filled),
+              aes(color = "Interpolated"), 
+              linewidth = 1, linetype = "dashed") +
+    geom_point(data = plot_data %>% filter(gap_filled),
+               aes(color = "Interpolated"),
+               size = 2, alpha = 0.6) +
+    # Discrete sample
+    geom_point(data = plot_data %>% filter(discrete_anchor),
+               aes(color = "Discrete sample"),
+               size = 5, shape = 18) +
+    # Styling
+    scale_color_manual(
+      name = "",
+      values = c("Original data" = "#2E8B57",
+                 "Interpolated" = "#FF8C00",
+                 "Discrete sample" = "#DC143C"),
+      breaks = c("Original data", "Interpolated", "Discrete sample")
+    ) +
+    labs(
+      title = "Gap-Filling with Discrete Chlorophyll Sample",
+      subtitle = sprintf("Gap: %s to %s", gap_start, gap_end),
+      x = "Date",
+      y = "Fluorescence (mg/m³)"
+    ) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      legend.position = "bottom",
+      legend.text = element_text(size = 11),
+      axis.text = element_text(size = 11),
+      panel.grid.minor = element_blank()
+    )
+  
+  if (!is.null(save_path)) {
+    ggsave(save_path, p, width = 10, height = 6, dpi = 300, bg = "white")
+    cat(sprintf("Gap-filling plot saved to: %s\n", save_path))
+  }
+  
+  return(p)
+}
+
+# ============================================
+# COMPARE INTERPOLATION METHODS
+# ============================================
+
+compare_interpolation_methods <- function(data, gap_start, gap_end, 
+                                         discrete_date, discrete_value,
+                                         save_path = NULL) {
+  
+  methods <- c("gaussian", "spline", "asymmetric")
+  results <- list()
+  
+  cat("\n=== COMPARING INTERPOLATION METHODS ===\n")
+  for (method in methods) {
+    cat(sprintf("\nTesting: %s\n", method))
+    results[[method]] <- fill_gap_with_discrete(
+      df = data,
+      gap_start = gap_start,
+      gap_end = gap_end,
+      discrete_date = discrete_date,
+      discrete_value = discrete_value,
+      interpolation_method = method
+    )
+  }
+  
+  # Plot comparison
+  zoom_start <- gap_start - days(15)
+  zoom_end <- gap_end + days(15)
+  
+  comparison_data <- bind_rows(
+    results$gaussian %>% 
+      filter(date >= zoom_start, date <= zoom_end) %>%
+      mutate(method = "Gaussian (recommended)"),
+    results$spline %>% 
+      filter(date >= zoom_start, date <= zoom_end) %>%
+      mutate(method = "Cubic Spline"),
+    results$asymmetric %>% 
+      filter(date >= zoom_start, date <= zoom_end) %>%
+      mutate(method = "Asymmetric (exp rise)")
+  )
+  
+  p <- ggplot(comparison_data, aes(x = date, y = fl_med_day, color = method)) +
+    annotate("rect", 
+             xmin = gap_start, xmax = gap_end,
+             ymin = -Inf, ymax = Inf,
+             fill = "gray90", alpha = 0.3) +
+    geom_line(linewidth = 1.2, alpha = 0.8) +
+    geom_point(data = comparison_data %>% filter(discrete_anchor),
+               size = 4, shape = 18, color = "black") +
+    scale_color_brewer(palette = "Set1", name = "Interpolation Method") +
+    labs(
+      title = "Comparison of Gap-Filling Methods",
+      subtitle = sprintf("Discrete sample: %s = %.2f mg/m³", 
+                        discrete_date, discrete_value),
+      x = "Date",
+      y = "Fluorescence (mg/m³)"
+    ) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      legend.position = "bottom",
+      legend.text = element_text(size = 10)
+    )
+  
+  if (!is.null(save_path)) {
+    ggsave(save_path, p, width = 10, height = 6, dpi = 300, bg = "white")
+    cat(sprintf("\nComparison plot saved to: %s\n", save_path))
+  }
+  
+  print(p)
+  return(results)
+}
+
+# ============================================
+# USAGE EXAMPLE
+# ============================================
+
+# Step 1: Compare methods to choose best fit
+interpolation_comparison <- compare_interpolation_methods(
+  data = buoy_fl,
+  gap_start = as.Date("2025-04-27"),
+  gap_end = as.Date("2025-05-11"),
+  discrete_date = as.Date("2025-05-02"),
+  discrete_value = 11.61,
+  save_path = here("figures", "interpolation_comparison.png")
+)
+
+
+
+# Step 3: Visualize the gap-filling
+gap_plot <- plot_gap_filling(
+  original_data = buoy_fl,
+  filled_data = buoy_fl_gapfilled,
+  gap_start = as.Date("2025-04-27"),
+  gap_end = as.Date("2025-05-11"),
+  zoom_days = 40,
+  save_path = here("figures", "gap_filling_2025.png")
+)
+
+# Step 4: Run bloom detection on gap-filled data
+bloom_metrics_gapfilled <- calculate_bloom_metrics(buoy_fl_gapfilled)
+
+combined_plot <- plot_bloom_detection(
+  bloom_results = bloom_metrics_gapfilled,
+  data = buoy_fl_gapfilled,
+  save_path = here("figures", "bloom_detection_gapfilled.png")
+)
+```
+
+
