@@ -1616,6 +1616,58 @@ ggsave(here("figures", "phytoplankton_community_composition_combined_clusters_in
 ```
 
 ```{r}
+test <- chem_c_tchla_combined %>% 
+  group_by(date) %>% 
+  summarise(tchla = sum(contribution)) %>% 
+  ungroup() %>% 
+  distinct() %>% 
+  left_join(vert_filtered) %>% 
+  left_join(cluster_points)
+
+# Add season and cluster columns to test
+test <- test %>%
+  mutate(
+    season = case_when(
+      format(date, "%m-%d") >= "03-20" & format(date, "%m-%d") <= "06-20" ~ "Spring",
+      format(date, "%m-%d") >= "06-21" & format(date, "%m-%d") <= "09-21" ~ "Summer",
+      format(date, "%m-%d") >= "09-22" & format(date, "%m-%d") <= "12-20" ~ "Fall",
+      TRUE ~ "Winter"
+    ),
+    season = factor(season, levels = c("Winter", "Spring", "Summer", "Fall")),
+    community_cluster = factor(community_cluster)
+  )
+
+# Create plot
+test %>% 
+  ggplot(aes(x = tchla, y = int_chla, 
+             color = community_cluster, 
+             shape = season)) +
+  geom_point(size = 4, alpha = 0.8) +
+  scale_color_manual(values = cluster_colors,
+                     labels = cluster_labels,
+                     name = "Community Cluster") +
+  scale_shape_manual(values = c(16, 17, 15, 18),  # circle, triangle, square, diamond
+                     name = "Season") +
+  labs(x = "5m Total Chlorophyll-a (mg/m³)",
+       y = "Integrated Chlorophyll-a (mg/m²)") +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 15, face = "bold"),
+    axis.title = element_text(size = 15, face = "bold"),
+    axis.text = element_text(size = 13),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(here("figures", "tchla_int_scatter.png"),
+       width = 9,
+       height = 6)
+```
+
+
+
+
+```{r}
 #------------------------------------------------------------------------------
 # Calculate stratification index for dates in the figure
 #------------------------------------------------------------------------------
@@ -1691,6 +1743,8 @@ vertical_concentration <- stratification_metrics %>%
       TRUE ~ concentration_category
     )
   )
+
+
 
 #------------------------------------------------------------------------------
 # Create 4-panel stratification analysis figure
@@ -1922,220 +1976,245 @@ write.csv(vertical_metrics_export,
 
 ```
 
+```{r}
+library(patchwork)
+library(here)
+library(dplyr)
+library(ggplot2)
 
+# Calculate the comprehensive metrics
+comprehensive_metrics <- ctd_fl_filtered %>%
+  group_by(date) %>%
+  summarise(
+    # Basic metrics
+    f_max = max(f_final, na.rm = TRUE),
+    f_median = median(f_final, na.rm = TRUE),
+    depth_max = pres[which.max(f_final)],
+    depth_range = max(pres) - min(pres),
+    
+    # Integration
+    f_integrated = pracma::trapz(pres, f_final),
+    
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    # Peakiness (robust concentration metric)
+    peakiness = f_max / f_median,
+    
+    # Depth classification
+    depth_category = case_when(
+      depth_max <= 5 ~ "surface",
+      depth_max > 5 & depth_max <= 20 ~ "subsurface",
+      TRUE ~ "deep"
+    ),
+    
+    # Peakiness categories for plotting
+    peakiness_category = case_when(
+      peakiness < 2 ~ "Well-mixed",
+      peakiness >= 2 & peakiness < 3.5 ~ "Moderately peaked",
+      peakiness >= 3.5 ~ "Highly peaked"
+    )
+  )
 
+#------------------------------------------------------------------------------
+# Panel 1: CTD fluorescence section
+#------------------------------------------------------------------------------
 
+colors_v3 <- c("#08519c", "#3182bd", "#6baed6", "#9ecae1", 
+               "#c6dbef", "#ffffcc", "#ffeda0", "#fed976", 
+               "#feb24c", "#fd8d3c", "#fc4e2a", "#e31a1c", "#bd0026")
+
+p1_ctd <- ggplot(ctd_fl_filtered, aes(x = date, y = pres, fill = f_final)) +
+  geom_tile() +
+  geom_hline(yintercept = 5, size = 1, color = "black") +
+  geom_hline(yintercept = 20, size = 1, linetype = "dashed", color = "black") +
+  scale_x_date(
+    limits = as.Date(c("2016-01-01", "2025-12-31")),
+    expand = c(0, 0),
+    date_breaks = "1 year",
+    date_labels = "%Y"
+  ) +
+  scale_y_reverse(
+    expand = c(0, 0),
+    breaks = seq(0, 30, by = 10)
+  ) +
+  scale_fill_gradientn(
+    colors = colors_v3,
+    values = scales::rescale(c(0, 2, 5, 10, 20, 30)),
+    na.value = "grey90",
+    name = "CTD Fluorescence"
+  ) +
+  labs(
+    y = "Depth (m)",
+    title = "(a) CTD Fluorescence Profiles"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.key.width = unit(1.5, "cm"),
+    legend.key.height = unit(0.4, "cm"),
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 14),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    text = element_text(size = 20, color = "black"),
+    plot.title = element_text(hjust = 0, size = 20, face = "bold"),
+    plot.margin = margin(5.5, 5.5, 5.5, 5.5)
+  )
+
+#------------------------------------------------------------------------------
+# Panel 2: Integrated chlorophyll time series
+#------------------------------------------------------------------------------
+
+p2_intchla <- ggplot(comprehensive_metrics, aes(x = date, y = f_integrated)) +
+  geom_line(color = "black", linewidth = 0.8) +
+  geom_point(shape = 21, size = 2.5, fill = "white", color = "black", stroke = 1) +
+  scale_x_date(
+    limits = as.Date(c("2016-01-01", "2025-12-31")),
+    expand = c(0, 0),
+    date_breaks = "1 year",
+    date_labels = "%Y"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0.05, 0.1))
+  ) +
+  labs(
+    y = expression(paste("Integrated Chl ", italic("a"), " (mg ", m^{-2}, ")")),
+    title = "(b) Integrated Chlorophyll (0-30m)"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 20, color = "black"),
+    plot.title = element_text(hjust = 0, size = 20, face = "bold"),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.margin = margin(5.5, 5.5, 5.5, 5.5)
+  )
+
+#------------------------------------------------------------------------------
+# Panel 3: Peakiness time series
+#------------------------------------------------------------------------------
+
+p3_peakiness <- ggplot(comprehensive_metrics, aes(x = date, y = peakiness)) +
+  geom_hline(yintercept = 2, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+  geom_hline(yintercept = 3.5, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+  geom_line(color = "black", linewidth = 0.8) +
+  geom_point(aes(fill = peakiness_category), 
+             shape = 21, size = 2.5, color = "black", stroke = 0.8) +
+  scale_fill_manual(
+    values = c("Well-mixed" = "#d7191c", 
+               "Moderately peaked" = "#fdae61", 
+               "Highly peaked" = "#2b83ba"),
+    name = "Vertical Concentration"
+  ) +
+  scale_x_date(
+    limits = as.Date(c("2016-01-01", "2025-12-31")),
+    expand = c(0, 0),
+    date_breaks = "1 year",
+    date_labels = "%Y"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0.05, 0.1))
+  ) +
+  labs(
+    y = "Peakiness\n(max / median fluorescence)",
+    title = "(c) Peakiness Index"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.key.height = unit(0.4, "cm"),
+    legend.key.width = unit(0.8, "cm"),
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 14),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 20, color = "black"),
+    plot.title = element_text(hjust = 0, size = 20, face = "bold"),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.margin = margin(5.5, 5.5, 5.5, 5.5)
+  )
+
+#------------------------------------------------------------------------------
+# Panel 4: Depth of maximum fluorescence
+#------------------------------------------------------------------------------
+
+p4_depth_max <- ggplot(comprehensive_metrics, aes(x = date, y = depth_max)) +
+  geom_hline(yintercept = 5, linetype = "solid", color = "gray70", linewidth = 0.8) +
+  geom_hline(yintercept = 20, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+  geom_line(color = "black", linewidth = 0.8) +
+  geom_point(aes(fill = depth_category), 
+             shape = 21, size = 2.5, color = "black", stroke = 0.8) +
+  scale_fill_manual(
+    values = c("surface" = "#fee0d2",
+               "subsurface" = "#fc9272", 
+               "deep" = "#2b83ba"),
+    labels = c("surface" = "Surface (0-5m)",
+               "subsurface" = "Subsurface (5-20m)",
+               "deep" = "Deep (>20m)"),
+    name = "Depth Category"
+  ) +
+  scale_x_date(
+    limits = as.Date(c("2016-01-01", "2025-12-31")),
+    expand = c(0, 0),
+    date_breaks = "1 year",
+    date_labels = "%Y"
+  ) +
+  scale_y_reverse(
+    limits = c(30, 0),
+    breaks = seq(0, 30, by = 5),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  labs(
+    x = "Year",
+    y = "Depth of Maximum (m)",
+    title = "(d) Depth of Fluorescence Maximum"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.key.height = unit(0.4, "cm"),
+    legend.key.width = unit(0.8, "cm"),
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 14),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 20, color = "black"),
+    plot.title = element_text(hjust = 0, size = 20, face = "bold"),
+    plot.margin = margin(5.5, 5.5, 5.5, 5.5)
+  )
+
+#------------------------------------------------------------------------------
+# Combine all four panels
+#------------------------------------------------------------------------------
+
+p_combined_simple <- p1_ctd / p2_intchla / p3_peakiness / p4_depth_max +
+  plot_layout(heights = c(1, 1, 1, 1))
+
+print(p_combined_simple)
+
+ggsave(here("figures", "vertical_structure_simple_4panel.png"), 
+       width = 16, height = 16, dpi = 300)
+
+# # Save the metrics for further analysis
+# write_csv(comprehensive_metrics, here("data", "comprehensive_vertical_metrics.csv"))
+```
 
 ```{r}
-#==============================================================================
-# INTERANNUAL VARIABILITY ANALYSIS (2016-2023 ONLY)
-#==============================================================================
-
-library(vegan)
-library(tidyverse)
-library(here)
-library(patchwork)
-
-#------------------------------------------------------------------------------
-# Filter to 2016-2023 only
-#------------------------------------------------------------------------------
-
-abs_output_filtered <- abs_output$clusters %>%
-  mutate(year = year(date)) %>%
-  filter(year >= 2016 & year <= 2023)
-
-#------------------------------------------------------------------------------
-# 1. ANNUAL CLUSTER COMPOSITION (STACKED BARS)
-#------------------------------------------------------------------------------
-
-cluster_stats <- abs_output_filtered %>%
-  group_by(year) %>%
-  summarise(
-    n_samples = n(),
-    cluster1_prop = sum(community_cluster == "1") / n(),
-    cluster2_prop = sum(community_cluster == "2") / n(),
-    cluster3_prop = sum(community_cluster == "3") / n(),
-    cluster4_prop = sum(community_cluster == "4") / n(),
-    .groups = "drop"
-  )
-
-# Plot stacked bar chart
-p_annual <- cluster_stats %>%
-  pivot_longer(cluster1_prop:cluster4_prop, 
-               names_to = "cluster", values_to = "proportion") %>%
-  mutate(
-    cluster = str_remove(cluster, "_prop"),
-    cluster = str_replace(cluster, "cluster", ""),
-    cluster = factor(cluster, levels = c("1", "2", "3", "4"))
-  ) %>%
-  ggplot(aes(x = factor(year), y = proportion, fill = cluster)) +
-  geom_col(width = 0.7) +
-  geom_text(data = cluster_stats, 
-            aes(x = factor(year), y = 1.05, label = paste0("n=", n_samples), fill = NULL),
-            size = 4.5, fontface = "bold") +
-  scale_fill_manual(
-    values = cluster_colors,
-    labels = cluster_labels,
-    name = "Community\nCluster"
-  ) +
-  scale_y_continuous(labels = scales::percent, 
-                    expand = expansion(mult = c(0, 0.12))) +
-  labs(
-    title = "Interannual Variation in Community Cluster Composition (2016-2023)",
-    x = "Year",
-    y = "Proportion of Samples"
-  ) +
-  theme_minimal(base_size = 16) +
-  theme(
-    legend.position = "right",
-    legend.text = element_text(size = 14),
-    legend.title = element_text(size = 15, face = "bold"),
-    panel.grid.major.x = element_blank(),
-    axis.text = element_text(size = 14),
-    axis.title = element_text(size = 16, face = "bold"),
-    plot.title = element_text(size = 18, face = "bold", hjust = 0.5)
-  )
-
-print(p_annual)
-ggsave(here("figures", "annual_cluster_composition_2016_2023.png"),
-       width = 12, height = 7, dpi = 300, bg = "white")
-
-#------------------------------------------------------------------------------
-# 2. NMDS TRAJECTORY ANALYSIS
-#------------------------------------------------------------------------------
-
-annual_clusters <- abs_output_filtered %>%
-  count(year, community_cluster) %>%
-  group_by(year) %>%
-  mutate(prop = n / sum(n)) %>%
-  ungroup()
-
-annual_wide <- annual_clusters %>%
-  pivot_wider(
-    id_cols = year,
-    names_from = community_cluster,
-    values_from = prop,
-    values_fill = 0
-  ) %>%
-  arrange(year)
-
-# NMDS ordination
-set.seed(123)
-nmds_years <- metaMDS(annual_wide %>% select(-year), 
-                      distance = "bray", 
-                      k = 2, 
-                      trymax = 100)
-
-# Extract scores
-nmds_scores <- data.frame(
-  NMDS1 = nmds_years$points[, 1],
-  NMDS2 = nmds_years$points[, 2],
-  year = annual_wide$year
-)
-
-# NMDS plot
-p_nmds <- ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2)) +
-  geom_path(arrow = arrow(length = unit(0.3, "cm"), type = "closed"),
-            linewidth = 1, alpha = 0.5, color = "gray40") +
-  geom_point(aes(fill = year), size = 7, shape = 21, color = "black", stroke = 1.5) +
-  geom_text(aes(label = year), size = 4.5, fontface = "bold") +
-  scale_fill_gradient(low = "#3B4CC0", high = "#F46D43", name = "Year") +
-  labs(
-    title = "Interannual Trajectory of Community Composition (2016-2023)",
-    subtitle = paste0("NMDS Stress = ", round(nmds_years$stress, 3)),
-    caption = "Arrows show temporal progression; distance = compositional dissimilarity"
-  ) +
-  theme_minimal(base_size = 16) +
-  theme(
-    legend.position = "none",
-    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
-    plot.subtitle = element_text(size = 14, hjust = 0.5),
-    plot.caption = element_text(size = 11, hjust = 0),
-    axis.text = element_text(size = 14),
-    axis.title = element_text(size = 16, face = "bold"),
-    panel.border = element_rect(color = "black", fill = NA, linewidth = 1)
-  )
-
-print(p_nmds)
-ggsave(here("figures", "nmds_interannual_trajectory_2016_2023.png"),
-       width = 10, height = 9, dpi = 300, bg = "white")
-
-#------------------------------------------------------------------------------
-# 3. STATISTICAL TESTS
-#------------------------------------------------------------------------------
-
-# Chi-square test
-cluster_year_table <- table(
-  abs_output_filtered$year,
-  abs_output_filtered$community_cluster
-)
-
-cat("\n=== CHI-SQUARE TEST (2016-2023) ===\n")
-chisq_result <- chisq.test(cluster_year_table)
-print(chisq_result)
-
-# PERMANOVA
-cat("\n=== PERMANOVA (2016-2023) ===\n")
-permanova_result <- adonis2(
-  annual_wide %>% select(-year) ~ year,
-  data = annual_wide,
-  method = "bray",
-  permutations = 999
-)
-print(permanova_result)
-
-# Specific contrast: 2020-2021 vs others
-years_2020_2021 <- annual_wide %>%
-  mutate(period = if_else(year %in% c(2020, 2021), "2020-2021", "Other"))
-
-perm_2020_2021 <- adonis2(
-  years_2020_2021 %>% select(-year, -period) ~ period,
-  data = years_2020_2021,
-  method = "bray",
-  permutations = 999
-)
-
-cat("\n=== 2020-2021 vs Other Years (2016-2023) ===\n")
-print(perm_2020_2021)
-
-#------------------------------------------------------------------------------
-# 4. COMBINED FIGURE
-#------------------------------------------------------------------------------
-
-p_combined <- p_annual / p_nmds +
-  plot_layout(heights = c(1, 1.2))
-
-print(p_combined)
-ggsave(here("figures", "interannual_variability_2016_2023.png"),
-       width = 14, height = 14, dpi = 300, bg = "white")
-
-#------------------------------------------------------------------------------
-# 5. SUMMARY STATISTICS
-#------------------------------------------------------------------------------
-
-# Sample sizes and cluster diversity
-summary_table <- cluster_stats %>%
-  mutate(
-    dominant_cluster = case_when(
-      cluster1_prop == pmax(cluster1_prop, cluster2_prop, cluster3_prop, cluster4_prop) ~ "1 (Mixed)",
-      cluster2_prop == pmax(cluster1_prop, cluster2_prop, cluster3_prop, cluster4_prop) ~ "2 (Diatoms)",
-      cluster3_prop == pmax(cluster1_prop, cluster2_prop, cluster3_prop, cluster4_prop) ~ "3 (Dinoflagellates)",
-      cluster4_prop == pmax(cluster1_prop, cluster2_prop, cluster3_prop, cluster4_prop) ~ "4 (Winter)"
-    ),
-    diversity = -1 * (
-      cluster1_prop * log(cluster1_prop + 0.001) +
-      cluster2_prop * log(cluster2_prop + 0.001) +
-      cluster3_prop * log(cluster3_prop + 0.001) +
-      cluster4_prop * log(cluster4_prop + 0.001)
-    )
-  ) %>%
-  select(year, n_samples, dominant_cluster, diversity)
-
-cat("\n=== ANNUAL SUMMARY (2016-2023) ===\n")
-print(summary_table)
-
-write_csv(summary_table, here("outputs", "annual_cluster_summary_2016_2023.csv"))
+write_csv(comprehensive_metrics, here("outputs", "vert_fl_metrics_2026-01-14.csv"))
 ```
+
+
+
+
 
 
 

@@ -1,0 +1,304 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Some new interpolation tutorials to consider:
+https://search.r-project.org/CRAN/refmans/rioja/html/interp.dataset.html
+https://github.com/hdugan/NTLlakeloads
+
+```{r}
+#Upload packages
+library(tidyverse)
+library(here)
+library(readxl)
+library(patchwork)
+library(lubridate)
+library(gsw)
+```
+
+```{r}
+#Corrected CTD fluorescence data
+ctd_fl <- read_csv(here("outputs",
+                        "flu_qc_2025-11-25.csv"))
+
+ctd <- read_csv(here("files", "ctd_kc10_fzh01_2025-08-09.csv"))
+
+ctd_spat <- read_xlsx(here("files", "8_binAvg-1768430177795.xlsx"),
+                      "Data")
+
+#Downloading discrete chlorophyll samples - This could be done using the API
+cd <- read_csv(here("files", "chl_kc10_fzh01_2025-09-08.csv"))
+
+```
+
+```{r}
+ctd_calc <- ctd %>% 
+  mutate(date = date(`Measurement time`)) %>%
+  filter(`Cast Direction Flag` == "d") %>% 
+  # filter(is.na(`Fluorometry Chlorophyll flag`)) %>% 
+  select(castpk = `Cast PK`,
+         ctd_num =`CTD serial number`,
+         date, m_time = `Measurement time`,
+         station = Station,
+         longitude = `Station Longitude`,
+         latitude = `Station Latitude`,
+         pres = `Pressure (dbar)`,
+         sal = `Salinity (PSU)`,
+         temp = `Temperature (deg C)`,
+         turb = `Turbidity (FTU)`
+         ) %>%
+  mutate(
+    # Calculate absolute salinity from practical salinity
+    sa = gsw_SA_from_SP(sal, pres, longitude, latitude),  # Adjust lat/lon for your study area
+    # Calculate conservative temperature from in-situ temperature
+    ct = gsw_CT_from_t(sa, temp, pres),
+    # Calculate in-situ density (kg/m³)
+    density = gsw_rho(sa, ct, pres),
+    # Calculate potential density anomaly (sigma-theta, kg/m³ - 1000)
+    sigma_theta = gsw_sigma0(sa, ct)
+  )
+
+daily_ctd <- ctd_calc %>%
+  filter(!is.na(sal), !is.na(temp), !is.na(sigma_theta)) %>%  # Remove missing values
+  
+  # Step 1: Calculate daily means by depth
+  group_by(date, pres, station) %>%
+  summarise(
+    sal_daily = mean(sal, na.rm = TRUE),
+    temp_daily = mean(temp, na.rm = TRUE),
+    sigma_theta_daily = mean(sigma_theta, na.rm = TRUE),
+    turb_daily = mean(turb, na.rm = TRUE),
+    # o2_daily = mean(o2, na.rm = TRUE),
+    .groups = 'drop'
+  )
+```
+
+```{r}
+ctd_spat2 <- ctd_spat %>% 
+  select(station = Station,
+         cruise = Cruise,
+         pres = `Pressure (dbar)`,
+         mt = `Measurement time`,
+         fl = `Fluorometry Chlorophyll (ug/L)`) %>% 
+  mutate(date = date(mt))  
+
+cruise_list = c("GLIDER DEPLOY", "BRK,DEAN", "DEAN")
+
+ctd_spat2 <- ctd_spat2 %>% 
+  filter(cruise %in% cruise_list)
+
+stat <- ctd_spat2 %>% 
+  distinct(station)
+```
+
+
+```{r}
+# Filter for May profiles, depth <= 50m - FLUORESCENCE
+may_profiles_fl <- ctd_fl %>%
+  filter(month(date) == 5, pres <= 50) %>%
+  filter(station == "KC10") %>% 
+  mutate(
+    year = year(date),
+    highlight = ifelse(year == 2023, "May 2023", "Other May")
+  )
+
+# Filter for May profiles, depth <= 50m - TEMPERATURE & SALINITY
+may_profiles_ctd <- daily_ctd %>%
+  filter(month(date) == 5, pres <= 50) %>%
+  filter(station == "KC10") %>% 
+  mutate(
+    year = year(date),
+    highlight = ifelse(year == 2023, "May 2023", "Other May")
+  )
+
+# Panel 1: Fluorescence
+p1_fluorescence <- ggplot(may_profiles_fl, aes(x = f_final, y = pres, group = date)) +
+  geom_line(data = filter(may_profiles_fl, highlight == "Other May"),
+            aes(color = highlight), 
+            linewidth = 1, 
+            alpha = 0.3,
+            orientation = "y") +
+  geom_line(data = filter(may_profiles_fl, highlight == "May 2023"),
+            aes(color = highlight), 
+            linewidth = 1.5,
+            orientation = "y") +
+  scale_color_manual(
+    values = c("Other May" = "gray50", "May 2023" = "#e31a1c"),
+    name = NULL
+  ) +
+  scale_y_reverse(
+    limits = c(50, 0),
+    expand = c(0, 0),
+    breaks = seq(0, 50, by = 10)
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0.05, 0.1))
+  ) +
+  labs(
+    x = "Fluorescence",
+    y = "Depth (m)",
+    title = "(a) Fluorescence Profiles"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.text = element_text(size = 14),
+    text = element_text(size = 16, color = "black"),
+    plot.title = element_text(hjust = 0, size = 18, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# Panel 2: Temperature
+p2_temperature <- ggplot(may_profiles_ctd, aes(x = temp_daily, y = pres, group = date)) +
+  geom_line(data = filter(may_profiles_ctd, highlight == "Other May"),
+            aes(color = highlight), 
+            linewidth = 1, 
+            alpha = 0.3,
+            orientation = "y") +
+  geom_line(data = filter(may_profiles_ctd, highlight == "May 2023"),
+            aes(color = highlight), 
+            linewidth = 1.5,
+            orientation = "y") +
+  scale_color_manual(
+    values = c("Other May" = "gray50", "May 2023" = "#e31a1c"),
+    name = NULL
+  ) +
+  scale_y_reverse(
+    limits = c(50, 0),
+    expand = c(0, 0),
+    breaks = seq(0, 50, by = 10)
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0.05, 0.1))
+  ) +
+  labs(
+    x = "Temperature (°C)",
+    y = "Depth (m)",
+    title = "(b) Temperature Profiles"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.text = element_text(size = 14),
+    text = element_text(size = 16, color = "black"),
+    plot.title = element_text(hjust = 0, size = 18, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# Panel 3: Salinity
+p3_salinity <- ggplot(may_profiles_ctd, aes(x = sal_daily, y = pres, group = date)) +
+  geom_line(data = filter(may_profiles_ctd, highlight == "Other May"),
+            aes(color = highlight), 
+            linewidth = 1, 
+            alpha = 0.3,
+            orientation = "y") +
+  geom_line(data = filter(may_profiles_ctd, highlight == "May 2023"),
+            aes(color = highlight), 
+            linewidth = 1.5,
+            orientation = "y") +
+  scale_color_manual(
+    values = c("Other May" = "gray50", "May 2023" = "#e31a1c"),
+    name = NULL
+  ) +
+  scale_y_reverse(
+    limits = c(50, 0),
+    expand = c(0, 0),
+    breaks = seq(0, 50, by = 10)
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0.05, 0.1))
+  ) +
+  labs(
+    x = "Salinity (PSU)",
+    y = "Depth (m)",
+    title = "(c) Salinity Profiles"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.text = element_text(size = 14),
+    text = element_text(size = 16, color = "black"),
+    plot.title = element_text(hjust = 0, size = 18, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# Panel 4: Density (assumes you have dens_daily in daily_ctd)
+p4_density <- ggplot(may_profiles_ctd, aes(x = sigma_theta_daily,
+                                           y = pres, group = date)) +
+  geom_line(data = filter(may_profiles_ctd, highlight == "Other May"),
+            aes(color = highlight), 
+            linewidth = 1, 
+            alpha = 0.3,
+            orientation = "y") +
+  geom_line(data = filter(may_profiles_ctd, highlight == "May 2023"),
+            aes(color = highlight), 
+            linewidth = 1.5,
+            orientation = "y") +
+  scale_color_manual(
+    values = c("Other May" = "gray50", "May 2023" = "#e31a1c"),
+    name = NULL
+  ) +
+  scale_y_reverse(
+    limits = c(50, 0),
+    expand = c(0, 0),
+    breaks = seq(0, 50, by = 10)
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0.05, 0.1))
+  ) +
+  labs(
+    x = expression(paste("Density (kg ", m^{-3}, ")")),
+    y = "Depth (m)",
+    title = "(d) Density Profiles"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.text = element_text(size = 14),
+    text = element_text(size = 16, color = "black"),
+    plot.title = element_text(hjust = 0, size = 18, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# Combine all four panels
+p_combined_may <- p1_fluorescence | p2_temperature | p3_salinity | p4_density
+
+ggsave(here("figures", "may_2023_profiles_4panel.png"), 
+       width = 24, height = 8, dpi = 300)
+
+```
+
+```{r}
+# Filter to top 50m and plot fluorescence profiles colored by station
+ctd_spat2 %>%
+  filter(pres <= 50) %>%
+  ggplot(aes(x = fl, y = pres, group = station, color = station)) +
+  geom_line(linewidth = 1, orientation = "y") +
+  scale_y_reverse(
+    limits = c(50, 0),
+    expand = c(0, 0),
+    breaks = seq(0, 50, by = 10)
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0.05, 0.1))
+  ) +
+  scale_color_viridis_d(option = "turbo") +  # Good for many categories
+  labs(
+    x = "Fluorescence",
+    y = "Depth (m)",
+    title = "Fluorescence Profiles by Station (0-50m)",
+    color = "Station"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    text = element_text(size = 14, color = "black"),
+    plot.title = element_text(hjust = 0, size = 16, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(here("figures", "fluorescence_profiles_by_station_50m.png"), 
+       width = 10, height = 8, dpi = 300)
+```
+

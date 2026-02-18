@@ -12,15 +12,17 @@ library(ggrepel)
 # 1. LOAD DATA
 #==============================================================================
 env <- read_csv(here("outputs", "enviro_2025-12-19.csv"))
-vert <- read_csv(here("outputs", "vertical_structure_metrics.csv"))
+vert <- read_csv(here("outputs", "vert_fl_metrics_2026-01-14.csv"))
 
 #==============================================================================
 # 2. DATA PREPARATION
 #==============================================================================
 env_clean <- env %>% select(-contains("..."))
 
-vert <- vert %>% select(date, int_chla, vertical_concentration_index,
-                        scm_intensity)
+vert <- vert %>% select(date, int_chla = f_integrated,
+                        peakiness,
+                        depth_max,
+                        f_max)
 
 env_averaged <- env_clean %>%
   group_by(date) %>%
@@ -52,9 +54,14 @@ cat("After joining and dropping NA:", nrow(pca_data), "\n\n")
 # 3. SELECT ENVIRONMENTAL VARIABLES FOR PCA
 #==============================================================================
 env_vars <- pca_data %>%
-
+  mutate(temp_diff = temp_1m/temp_30m,
+         sal_diff = sal_1m/sal_30m,
+         n_diff = nitrate_1m/nitrate_30m) %>% 
   select(
     # Surface conditions
+    # temp_diff,
+    # sal_diff,
+    # n_diff,
     temp_5m,
     sal_5m,
     # nitrate_1m,
@@ -64,11 +71,11 @@ env_vars <- pca_data %>%
     # Stratification
     stratification_index,
     
-    
     # Vertical structure
     int_chla,
-    vertical_concentration_index,
-    scm_intensity,
+    # peakiness,
+    depth_max,
+    # f_max,
     
     # Wind/mixing/discharge
     qsm_10,
@@ -196,7 +203,7 @@ p_pca_season <- ggplot() +
   coord_fixed()
 
 print(p_pca_season)
-ggsave(here("figures", "pca_environmental_season.png"), 
+ggsave(here("figures", "pca_environmental_season_new_vert.png"), 
        width = 10, height = 8, dpi = 300, bg = "white")
 
 #==============================================================================
@@ -236,7 +243,7 @@ p_pca_year <- ggplot() +
   coord_fixed()
 
 print(p_pca_year)
-ggsave(here("figures", "pca_environmental_year.png"), 
+ggsave(here("figures", "pca_environmental_year_new_vert.png"), 
        width = 10, height = 8, dpi = 300, bg = "white")
 
 #==============================================================================
@@ -265,8 +272,8 @@ p_scree <- ggplot(scree_data[1:min(10, nrow(scree_data)), ],
   )
 
 print(p_scree)
-ggsave(here("figures", "pca_scree.png"), 
-       width = 8, height = 6, dpi = 300, bg = "white")
+# ggsave(here("figures", "pca_scree.png"), 
+#        width = 8, height = 6, dpi = 300, bg = "white")
 
 #==============================================================================
 # 9. HIERARCHICAL CLUSTERING
@@ -315,8 +322,8 @@ print(p_gap)
 
 # Combine plots
 p_cluster_diagnostics <- p_elbow + p_silhouette
-ggsave(here("figures", "cluster_diagnostics.png"), p_cluster_diagnostics,
-       width = 12, height = 5, dpi = 300, bg = "white")
+# ggsave(here("figures", "cluster_diagnostics.png"), p_cluster_diagnostics,
+#        width = 12, height = 5, dpi = 300, bg = "white")
 
 # Cut tree into k clusters (adjust k based on diagnostics above)
 k <- 4  # Change based on optimal k
@@ -367,13 +374,151 @@ print(p_pca_cluster)
 ggsave(here("figures", "pca_clusters.png"), 
        width = 10, height = 8, dpi = 300, bg = "white")
 
+# Define a nice 4-cluster color palette
+cluster_colors_4 <- c(
+  "1" = "#E64B35",  # Red
+  "2" = "#4DBBD5",  # Light blue
+  "3" = "#00A087",  # Teal
+  "4" = "#3C5488"   # Dark blue
+)
+
+# Add year to plot data for highlighting
+plot_data <- plot_data %>%
+  mutate(year = year(date),
+         is_2023 = year == 2023)
+
+# PCA biplot colored by cluster
+p_pca_cluster <- ggplot() +
+  # Regular points (not 2023)
+  geom_point(data = plot_data %>% filter(!is_2023),
+             aes(x = PC1, y = PC2, fill = cluster),
+             shape = 21, size = 5, alpha = 0.7, color = "black", stroke = 0.8) +
+  
+  # 2023 points (larger with thick border)
+  geom_point(data = plot_data %>% filter(is_2023),
+             aes(x = PC1, y = PC2, fill = cluster),
+             shape = 21, size = 7, alpha = 0.9, color = "black", stroke = 2) +
+  
+  # Environmental arrows
+  geom_segment(data = var_arrows,
+               aes(x = 0, y = 0, xend = PC1, yend = PC2),
+               arrow = arrow(length = unit(0.4, "cm"), type = "closed"),
+               color = "black", linewidth = 1.2) +
+  
+  # Environmental labels
+  geom_text_repel(data = var_arrows,
+                  aes(x = label_x, y = label_y, label = label),
+                  color = "black", size = 6, fontface = "bold",
+                  box.padding = 0, point.padding = 0,
+                  min.segment.length = 0) +
+  
+  # 4-cluster color scheme
+  scale_fill_manual(
+    values = cluster_colors_4,
+    name = "Cluster"
+  ) +
+  
+  labs(
+    subtitle = "2023 samples shown with thick black border",
+    x = paste0("PC1 (", round(variance_explained[1], 1), "%)"),
+    y = paste0("PC2 (", round(variance_explained[2], 1), "%)")
+  ) +
+  
+  theme_bw(base_size = 18) +
+  theme(
+    plot.title = element_text(size = 22, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 16, hjust = 0.5, color = "gray30"),
+    axis.title = element_text(size = 18, face = "bold"),
+    axis.text = element_text(size = 16),
+    legend.position = "right",
+    legend.title = element_text(size = 18, face = "bold"),
+    legend.text = element_text(size = 16),
+    legend.key.size = unit(1, "cm"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1.5),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90")
+  ) +
+  coord_fixed()
+
+print(p_pca_cluster)
+ggsave(here("figures", "pca_clusters.png"), 
+       width = 12, height = 10, dpi = 300, bg = "white")
+
+
+#------------------------------------------------------------------------------
+# Boxplots of environmental variables by cluster
+#------------------------------------------------------------------------------
+
+# Prepare long-format data for plotting
+env_long <- pca_data_clean %>%
+  select(cluster, temp_5m, sal_5m, nitrate_5m, stratification_index, 
+         int_chla, depth_max, qsm_10, wind_b1_3) %>%
+  pivot_longer(cols = -cluster, names_to = "variable", values_to = "value")
+
+# Create nice variable labels
+variable_labels <- c(
+  "temp_5m" = "Temp at 5m",
+  "sal_5m" = "Salinity at 5m",
+  "nitrate_5m" = "Nitrate at 5m",
+  "stratification_index" = "Stratification Index",
+  "int_chla" = "Integrated Chl-a",
+  "depth_max" = "SCM Depth",
+  "qsm_10" = "Discharge",
+  "wind_b1_3" = "Wind speed"
+)
+
+env_long <- env_long %>%
+  mutate(variable = factor(variable, 
+                           levels = names(variable_labels),
+                           labels = variable_labels))
+
+# Create boxplot panel
+p_boxplots <- ggplot(env_long, aes(x = cluster, y = value, fill = cluster)) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 2, 
+               outlier.fill = "white", outlier.stroke = 0.5,
+               linewidth = 0.8) +
+  facet_wrap(~variable, scales = "free_y", ncol = 3,
+             labeller = label_value) +
+  scale_fill_manual(
+    values = cluster_colors_4,
+    name = "Community\nCluster"
+  ) +
+  labs(
+    title = "Environmental Conditions by Cluster",
+    x = "Cluster",
+    y = "Value"
+  ) +
+  theme_bw(base_size = 18) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold", hjust = 0.5, 
+                              margin = margin(b = 10)),
+    axis.title = element_text(size = 18, face = "bold"),
+    axis.text = element_text(size = 18),
+    axis.title.y = element_blank(),
+    strip.text = element_text(size = 18, face = "bold", margin = margin(3, 3, 3, 3)),
+    strip.background = element_rect(fill = "gray95", color = "black", linewidth = 1),
+    legend.position = "right",
+    legend.title = element_text(size = 18, face = "bold"),
+    legend.text = element_text(size = 18),
+    legend.key.size = unit(1, "cm"),
+    panel.grid.major.x = element_blank(),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+print(p_boxplots)
+ggsave(here("figures", "cluster_environmental_boxplots.png"),
+       width = 16, height = 11, dpi = 300, bg = "white")
+
 # Characterize clusters by environmental variables
 cluster_summary <- pca_data_clean %>%
   group_by(cluster) %>%
   summarise(
     n = n(),
     across(c(temp_5m, sal_5m, nitrate_1m, stratification_index, 
-             int_chla, vertical_concentration_index, scm_intensity,
+             int_chla,
+             peakiness,
+             depth_max,
+             f_max,
              qsm_10, wind_b1_3),
            list(mean = ~mean(.x, na.rm = TRUE),
                 sd = ~sd(.x, na.rm = TRUE))),
@@ -426,8 +571,11 @@ print(sort(abs(pc2_loadings), decreasing = TRUE))
 # Prepare data for plotting - combine cluster assignments with environmental data
 cluster_env_data <- pca_data_clean %>%
   select(cluster, temp_5m, sal_5m, nitrate_1m, nitrate_10m, nitrate_30m,
-         stratification_index, int_chla, vertical_concentration_index, 
-         scm_intensity, qsm_10, wind_b1_3)
+         stratification_index, int_chla,
+         peakiness,
+         depth_max,
+         f_max,
+         qsm_10, wind_b1_3)
 
 # Pivot to long format for faceted plotting
 cluster_env_long <- cluster_env_data %>%

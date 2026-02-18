@@ -52,14 +52,18 @@ cat("After joining and dropping NA:", nrow(pca_data), "\n\n")
 # 3. SELECT ENVIRONMENTAL VARIABLES FOR PCA
 #==============================================================================
 env_vars <- pca_data %>%
-
+  mutate(sal_diff = sal_30m/sal_1m,
+         temp_diff = temp_30m/temp_1m,
+         n_diff = nitrate_30m/nitrate_1m) %>% 
   select(
     # Surface conditions
-    temp_5m,
-    sal_5m,
+    sal_diff,
+    temp_diff,
+    # temp_5m,
+    # sal_5m,
     # nitrate_1m,
     # nitrate_30m,
-    nitrate_5m,
+    n_diff,
     
     # Stratification
     stratification_index,

@@ -1,0 +1,82 @@
+
+
+```{r}
+library(tidyverse)
+library(here)
+library(lubridate)
+library(readxl)
+```
+
+```{r}
+ctd <- read_xlsx(here("files", "dean_2023.xlsx"), "Data")
+```
+
+```{r}
+ctd <- ctd %>% 
+  filter(`Cast Direction Flag` == "d") %>% 
+  select(castpk = `Cast PK`,
+         mt = `Measurement time`,
+         pres = `Pressure (dbar)`,
+         fl = `Fluorometry Chlorophyll (ug/L)`,
+         tu = `Turbidity (FTU)`) %>% 
+  mutate(date = date(mt))
+```
+
+```{r}
+# Prepare data with month factor
+ctd_plot <- ctd %>%
+  filter(pres <= 50) %>%
+  mutate(month = month(date, label = TRUE, abbr = FALSE),
+         month2 = month(date)) %>% 
+  filter(month2 >=5)
+
+# Create fluorescence profile
+p_fl <- ggplot(ctd_plot, aes(x = fl, y = pres, color = month, group = castpk)) +
+  geom_line(orientation = "y", linewidth = 1.2, alpha = 0.7) +
+  scale_y_reverse(limits = c(50, 0), expand = c(0, 0)) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+  scale_color_viridis_d(option = "turbo") +
+  labs(x = "Chlorophyll (µg/L)", 
+       y = "Pressure (dbar)",
+       color = "Month") +
+  theme_classic(base_size = 18) +
+  theme(
+    axis.text = element_text(size = 16, color = "black"),
+    axis.title = element_text(size = 20, face = "bold"),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.key.size = unit(1.2, "cm"),
+    panel.border = element_rect(fill = NA, linewidth = 1.2)
+  )
+
+# Create turbidity profile
+p_tu <- ggplot(ctd_plot, aes(x = tu, y = pres, color = month, group = castpk)) +
+  geom_line(orientation = "y", linewidth = 1.2, alpha = 0.7) +
+  scale_y_reverse(limits = c(50, 0), expand = c(0, 0)) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+  scale_color_viridis_d(option = "turbo") +
+  labs(x = "Turbidity (FTU)", 
+       y = "Pressure (dbar)",
+       color = "Month") +
+  theme_classic(base_size = 18) +
+  theme(
+    axis.text = element_text(size = 16, color = "black"),
+    axis.title = element_text(size = 20, face = "bold"),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.key.size = unit(1.2, "cm"),
+    panel.border = element_rect(fill = NA, linewidth = 1.2)
+  )
+
+# Display
+p_fl
+p_tu
+
+# Or combine with patchwork if you want them side-by-side
+p_fl + p_tu + plot_layout(guides = "collect")
+
+ggsave(here("figures", "dean_2023.png"),
+       height = 12,
+       width = 14)
+```
+
