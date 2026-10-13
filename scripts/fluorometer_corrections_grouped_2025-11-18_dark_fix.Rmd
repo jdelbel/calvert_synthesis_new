@@ -190,7 +190,7 @@ plot_cast_detailed <- function(cast_id) {
 #Portal file of all KC10 and FZH01 profiles - raw data
 f <- read_csv(here("files", "8_binAvg-1762199720021.csv"))
 
-#CTD fluorescence profiles flags, determined using my visual profile QC tool
+#CTD fluorescence profiles flags, determined using my visual profile QC tool - need to be flagged in the portal.
 flags <- read_csv(here("outputs","fluorescence_QC_flags_20251103.csv"))
 
 #Chlorophyll data downloaded from the Portal for KC10/FZH01
@@ -250,8 +250,6 @@ f <- f %>%
 ```
 
 ```{r}
-
-
 #Plotting the removed profiles.
 ggplot(f_issue %>% filter(pres < 100), aes(x = flu, y = pres)) +
   geom_line(orientation = "y") +
@@ -564,7 +562,7 @@ f_dm <- f_offset %>%
 #Working with the discrete chlorophyll dataset
 
 #Pulling out bulk data with appropriate flags and running a daily mean in case there are duplicates
-#For both Bulk and size-fractionated, I am allowing SVC and ADL and not flagged. Usually with SVC the data look OK, but had a about something that happened with the sample. ADL is trickier - this is for samples from before we started diluting when the raw value exceeded the max value from the calibration, which were done spanning the instrument range. In theory, these should skew low, but it's not apparent. 
+#For both Bulk and size-fractionated, I am allowing SVC and ADL and not flagged. Usually with SVC the data look OK, but had a metatdata comment saying something happened with the filter etc. ADL is trickier - this is for samples from before we started diluting when the raw value exceeded the max value from the calibration, which were done spanning the instrument range. In theory, these should skew low, but it's not apparent. 
 
 #Filtering out the bulk samples meeting the thresholds
 c_qc <- c %>% 
@@ -593,7 +591,7 @@ c_sf <- c %>%
   filter(!filter_type == "Bulk GF/F") %>% 
   filter(chla_flag == "AV" | chla_flag == "SVC" | chla_flag == "ADL" | is.na(chla_flag))
 
-#Calculating a daily mean value, making sure all three filters types are available to complete the set and then calculating the sum. We switched the middle filter size from 2-3um, but shouldn't matter here. 
+#Calculating a daily mean value, making sure all three filters types are available to complete the set and then calculating the sum. We switched the middle filter size from 2-3um, but shouldn't matter here.
 c_sf_dm <- c_sf %>% 
   filter(!is.na(chla)) %>%
   filter(chla > 0) %>% 
@@ -772,8 +770,6 @@ f_dm <- f_dm %>%
 #Using HPLC would be better, but not nearly as many samples and only goes back to 2017ish.
 ```
 
-
-
 ```{r}
 #Creating a dataset to apply linear fits between the chlorophyll and fluorometry data to derive a slope correction.
 
@@ -789,7 +785,7 @@ f_fit <- f_dm %>%
 # Separate into multi-sample (>=3) and few-sample (1-2) casts (generally earlier)
 # The filtered out data are large outliers that were identified via visual inspection and judgement calls.
 # Notes on these outlier removals are in excel sheet and f_flag dataframe under comments
-# Not sure if they should be flagged as bad data as they aren't necessarily bad 
+# Not sure if they should be flagged as bad data as they aren't necessarily bad, more likely mismatches
 f_fit_multi <- f_fit %>%
   filter(!is.na(chl_comb) & !is.na(f_dm)) %>%
   group_by(date, station, ctdNum) %>%
@@ -934,7 +930,6 @@ sensor_medians <- f_fit_with_model %>%
 
 ```{r}
 # Creating scatter plots of fluorescence versus discrete concentrations by CTD/sensor using all available data
-
 f_fit_with_model <- f_fit_with_model %>%
   left_join(sensor_medians, by = "ctdNum")
 
@@ -1052,6 +1047,7 @@ f_fit_av %>%
 ggsave(here("figures", "fluorescence_calibration_by_sensor_dark.png"),
        width = 12, height = 10, dpi = 300)
 ```
+This approach worked pretty well and suggests when you remove questionable data, the sensor wide comparison is appropriate for calibration, But, it required a lot of judgement calls and tweaking and it would be good to see if we can get close slopes with a more systematic approach.
 
 ```{r}
 f_fit_av %>% 

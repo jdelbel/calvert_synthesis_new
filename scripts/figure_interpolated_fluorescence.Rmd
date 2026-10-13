@@ -33,7 +33,7 @@ library(metR)
 ```{r}
 #Corrected CTD fluorescence data
 ctd_fl <- read_csv(here("outputs",
-                        "flu_qc_2025-11-25.csv"))
+                        "flu_qc_2026-10-13.csv"))
 
 ctd <- read_csv(here("files", "ctd_kc10_fzh01_2025-08-09.csv"))
 
@@ -164,6 +164,43 @@ ctd_fl_plot <- ctd_fl_phys %>%
 
 
 ```{r}
+# # Create regular grid for interpolation
+# date_seq <- seq(min(ctd_fl_plot$date), max(ctd_fl_plot$date), length.out = 300)
+# pres_seq <- seq(0, 30, length.out = 200)
+# 
+# # Interpolate fluorescence to regular grid
+# ctd_interp <- with(ctd_fl_plot, 
+#                    interp(x = as.numeric(date), y = pres, z = f_corrected,
+#                           xo = as.numeric(date_seq), yo = pres_seq))
+# 
+# # Interpolate temperature
+# temp_interp <- with(ctd_fl_plot, 
+#                     interp(x = as.numeric(date), y = pres, z = temp,
+#                            xo = as.numeric(date_seq), yo = pres_seq))
+# 
+# # Interpolate salinity
+# sal_interp <- with(ctd_fl_plot, 
+#                    interp(x = as.numeric(date), y = pres, z = sal,
+#                           xo = as.numeric(date_seq), yo = pres_seq))
+# 
+# # Interpolate sigma theta
+# sigma_interp <- with(ctd_fl_plot, 
+#                      interp(x = as.numeric(date), y = pres, z = sigma_theta,
+#                             xo = as.numeric(date_seq), yo = pres_seq))
+# 
+# # Convert to data frame
+# interp_df <- expand.grid(date = date_seq, pres = pres_seq) %>%
+#   mutate(
+#     f_npq = as.vector(ctd_interp$z),
+#     temp = as.vector(temp_interp$z),
+#     sal = as.vector(sal_interp$z),
+#     sigma_theta = as.vector(sigma_interp$z)
+#   ) %>%
+#   filter(pres > 0 & pres < 30)
+```
+
+```{r}
+
 # Create regular grid for interpolation
 date_seq <- seq(min(ctd_fl_plot$date), max(ctd_fl_plot$date), length.out = 300)
 pres_seq <- seq(0, 30, length.out = 200)
@@ -197,7 +234,9 @@ interp_df <- expand.grid(date = date_seq, pres = pres_seq) %>%
     sigma_theta = as.vector(sigma_interp$z)
   ) %>%
   filter(pres > 0 & pres < 30)
+
 ```
+
 
 ```{r}
 # vertical_metrics <- ctd_fl %>%
@@ -315,12 +354,12 @@ common_x_limits <- range(c(interp_df$date, ctd_integrated$year_month), na.rm = T
 p1 <- ggplot(interp_df, aes(x = date, y = pres, fill = f_npq)) +
   geom_raster() +
   # Add sigma_theta = 21 contour line
-  geom_contour(aes(z = sigma_theta), breaks = 24, 
-               color = "white", size = 1, alpha = 0.9) +
-  geom_text_contour(aes(z = sigma_theta), breaks = 24,
-                    color = "white", size = 4,
-                    stroke = 0.3, stroke.color = "black",
-                    skip = 10) +
+  # geom_contour(aes(z = sigma_theta), breaks = 24, 
+  #              color = "white", size = 1, alpha = 0.9) +
+  # geom_text_contour(aes(z = sigma_theta), breaks = 24,
+  #                   color = "white", size = 4,
+  #                   stroke = 0.3, stroke.color = "black",
+  #                   skip = 10) +
   scale_x_date(expand = c(0, 0), 
                breaks = common_x_breaks,
                labels = common_x_labels,
@@ -349,10 +388,6 @@ p1 <- ggplot(interp_df, aes(x = date, y = pres, fill = f_npq)) +
 
 print(p1)
 ```
-
-
-
-
 
 ```{r}
 # Create bottom panel with line and bars
@@ -447,9 +482,84 @@ combined_plot <- p1 / p2   # Top panel twice as tall
 
 print(combined_plot)
 
-ggsave(here("figures", "panel_kc10_interp_2025-11-25.png"), combined_plot,
+ggsave(here("figures", "panel_kc10_interp_2025-11-25_no-density.png"), combined_plot,
        width = 16, height = 8)
 ```
+```{r}
+# ── Common x-axis settings extended to end of 2025 ───────────────────────────
+
+common_x_limits <- as_date(c(min(interp_df$date, na.rm = TRUE), "2025-12-31"))
+common_x_breaks <- scales::date_breaks("1 year")
+common_x_labels <- scales::date_format("%Y")
+
+# ── p1: Hovmöller with smoother interpolation ─────────────────────────────────
+# Use geom_tile with explicit width/height for smoother appearance
+# and increase interpolation resolution if interp_df allows
+
+p1 <- ggplot(interp_df, aes(x = date, y = pres, fill = f_npq)) +
+  geom_raster(interpolate = TRUE) +   # interpolate = TRUE smooths the raster
+  scale_x_date(expand  = c(0, 0),
+               breaks  = common_x_breaks,
+               labels  = common_x_labels,
+               limits  = common_x_limits) +
+  scale_y_reverse(expand = c(0, 0),
+                  breaks = seq(0, 50, by = 5),
+                  labels = seq(0, 50, by = 5)) +
+  scale_fill_gradientn(
+    colors = colors_v3,
+    values = scales::rescale(c(0, 2, 5, 10, 20, 50)),
+    na.value = "white",
+    name = expression(Fluorescence~(mg~m^-3)),
+    guide = guide_colorbar(
+      title.position = "right",
+      title.theme    = element_text(angle = 270, hjust = 0.5, size = 28)
+    )
+  ) +
+  labs(y = "Depth (m)") +
+  theme_bw() +
+  theme(
+    panel.border   = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    text           = element_text(color = "black", size = 30),
+    axis.text      = element_text(color = "black", size = 28),
+    legend.position = "right",
+    legend.key.height = unit(2, "cm"),
+    axis.text.x    = element_blank(),
+    axis.title.x   = element_blank()
+  )
+
+# ── p2: Integrated fluorescence + anomaly bars ────────────────────────────────
+
+p2 <- ggplot(ctd_integrated, aes(x = year_month)) +
+  geom_col(aes(y = anomaly, fill = anomaly > 0),
+           alpha = 0.7, width = 25) +
+  geom_line(aes(y = integrated_fl), color = "black", linewidth = 1) +
+  geom_point(aes(y = integrated_fl), color = "black", size = 3) +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "blue")) +
+  scale_x_date(expand = c(0, 0),
+               breaks = common_x_breaks,
+               labels = common_x_labels,
+               limits = common_x_limits) +
+  labs(x = NULL,
+       y = expression(atop("Integrated Fluorescence",
+                           (mg~m^-2~"\u00d7"~m)))) +
+  theme_bw() +
+  theme(
+    panel.border    = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    text            = element_text(color = "black", size = 30),
+    axis.text       = element_text(color = "black", size = 28),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+# ── Combine and save ──────────────────────────────────────────────────────────
+
+p1 / p2 + plot_layout(heights = c(1, 1))
+
+ggsave(here("figures", "kc10_fluorescence_integrated.png"),
+       width = 18, height = 9, dpi = 300)
+```
+
+
 ```{r}
 # Calculate integrated fluorescence (0-30m) by station, date, and cast
 ctd_integrated_by_cast <- ctd_fl %>%

@@ -199,13 +199,15 @@ cd <- read_csv(here("files", "2026-01-13_HakaiData_chlorophyll.csv"))
 # cs <- read_csv(here("files", "chl_2022-09-09.csv")) 
 
 #CHEMTAX outputs
-chem <- read_csv(here("files", "chemtax_single_2025-11-21.csv"))
+chem <- read_csv(here("files", "chemtax_single_2026-02-26.csv"))
 
 #I think here I am downloading all of the wind data from the lookout?
 wind <- read_csv(here("files", "wind_2026-01-13.1hourSamples.all.csv"))
 
 # weath <- read_csv(here("files", "enviro_weather_2025-04-14.csv"))
 ```
+
+
 ```{r}
 # ctd_calc <- ctd %>% 
 #   mutate(date = date(`Measurement time`)) %>%
@@ -255,6 +257,63 @@ wind <- read_csv(here("files", "wind_2026-01-13.1hourSamples.all.csv"))
 #   ungroup() %>% 
 #   mutate(year = year(date))
 ```
+
+```{r}
+# ── 1. Process new hourly wind data ──────────────────────────────────────────
+
+wind_new_processed <- wind %>%
+  mutate(
+    time       = mdy_hm(measurementTime),   # "mm/dd/yyyy hh:mm"
+    date       = date(time),
+    wind_speed = WindSpd_Avg,               # already in m/s - verify units!
+    wind_dir   = WindDir_Avg
+  ) %>%
+  filter(!is.na(wind_speed), !is.na(wind_dir)) %>%
+  select(time, date, wind_speed, wind_dir) %>%
+  arrange(time)
+
+cat("Date range:", as.character(min(wind_new_processed$date)), "to",
+    as.character(max(wind_new_processed$date)), "\n")
+cat("Records:", nrow(wind_new_processed), "\n")
+
+# ── 2. Wind stress + speed cubed ─────────────────────────────────────────────
+
+calculate_drag_coefficient_colleague <- function(wind_speed) {
+  cd <- (1.11 + 0.036 * wind_speed) * 1e-3
+  return(cd)
+}
+
+RHO_AIR <- 1.22  # kg/m³
+
+wind_hourly <- wind_new_processed %>%
+  mutate(
+    wind_south_north  = -wind_speed * cos(wind_dir * pi / 180),
+    Cd                = calculate_drag_coefficient_colleague(wind_speed),
+    wind_stress       = wind_speed * wind_south_north * Cd * RHO_AIR,
+    wind_speed_cubed  = wind_speed^3
+  )
+
+# ── 3. Daily aggregation (no rolling windows) ─────────────────────────────────
+
+wind_daily <- wind_hourly %>%
+  group_by(date) %>%
+  summarise(
+    mean_wind_speed        = mean(wind_speed, na.rm = TRUE),
+    daily_wind_speed_cubed = mean(wind_speed_cubed, na.rm = TRUE),
+    daily_wind_stress      = sum(wind_stress, na.rm = TRUE),
+    n_hours                = n(),
+    .groups                = "drop"
+  ) %>%
+  arrange(date) %>%
+  mutate(year = year(date))
+
+cat("\n=== WIND DAILY SUMMARY ===\n")
+cat("Date range:", as.character(min(wind_daily$date)), "to",
+    as.character(max(wind_daily$date)), "\n")
+cat("Days with < 24 hours of data:\n")
+print(wind_daily %>% filter(n_hours < 24) %>% select(date, n_hours))
+```
+
 
 ```{r}
 #Pulling out the median nightly buoy fluorescence value from my QC process
@@ -410,12 +469,15 @@ print(f_wind_24)
 
 ```{r}
 #Creating the 2022 wind speed cubed plot - what if i added wind direction or vector here?
-f_wind_25 <- wind_dm %>%
+f_wind_25 <- wind_daily %>%
   filter(year == 2025) %>%
   ggplot() +
-  geom_line(aes(x = date, y = WindSpd_Med^3),
+  geom_line(aes(x = date, y = daily_wind_speed_cubed),
             size = 2) +
-  ylim(0, 6000) +
+  geom_vline(xintercept = as.Date("2025-03-25"),
+             size = 2,
+             color = "darkgreen") + 
+  ylim(0, 5000) +
   labs(y = bquote(Wind~"("*m^3*s^-3*")")) +
   scale_x_date(limits = as_date(c("2025-01-01", "2025-12-31")),
                expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
@@ -432,11 +494,12 @@ print(f_wind_25)
 #Setting up the joined buoy surface discrete chlorophyll 2m nightly median fluorescence and 2m daily mean salinity/temperature for plotting - pivoting long.
 
 buoy_fl_long <- buoy_fl %>%
-  select(date, chla, fl_med_day, mean_sal, mean_temp) %>% 
+  select(date, chla, fl_med_day, mean_sal, mean_temp, gap_filled) %>% 
   pivot_longer(c(chla, fl_med_day, mean_sal, mean_temp),
-              names_to = "par", values_to = "val") %>% 
+               names_to = "par", values_to = "val") %>% 
   mutate(date = date(date),
-         year = year(date))  
+         year = year(date),
+         gap_filled = if_else(par == "fl_med_day", gap_filled, FALSE)) 
 ```
 
 ```{r}
@@ -511,40 +574,408 @@ f_buoy_24 <- buoy_fl_long %>%
 print(f_buoy_24)
 ```
 ```{r}
-#Creating buoy figure for 2022 - discrete surface chlorophyll, daily fluorescence/temp/sal
-f_buoy_25 <- buoy_fl_long %>% 
-  filter(year == 2025) %>% 
+sb_timing <- tibble(
+  date = as.Date(c("2015-04-09", "2016-04-08", "2017-04-08", "2018-03-28", 
+                   "2019-05-11", "2020-04-30", "2021-04-10", "2022-03-05", 
+                   "2023-04-01", "2024-03-18", "2025-03-25")),
+  # tchla = c(5.27, 7.69, 4.27, 7.40, 4.98, 9.27, 9.18, 12.20, 10.31, 20.39, 7.05),
+  type = c("Chl", "CTD", "HPLC", "Chl", "HPLC", "HPLC", "HPLC", 
+           "Buoy", "Buoy", "Buoy", "Buoy")
+)
+
+sb_timing <- sb_timing %>% 
+  mutate(year = year(date),
+         yday = yday(date)) %>% 
+  mutate(median_doy = median(yday))
+```
+
+
+
+
+
+```{r}
+# ── Compute bloom timing reference dates mapped to 2025 ──────────────────────
+
+bloom_min  <- as_date(paste0("2025-", format(as_date(min(sb_timing$yday) - 1, 
+                              origin = "2025-01-01"), "%m-%d")))
+bloom_max  <- as_date(paste0("2025-", format(as_date(max(sb_timing$yday) - 1, 
+                              origin = "2025-01-01"), "%m-%d")))
+bloom_mean <- as_date(mean(sb_timing$yday) - 1, origin = "2025-01-01")
+bloom_2025 <- sb_timing %>% filter(year == 2025) %>% pull(date)
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+
+f_buoy_25 <- buoy_fl_long %>%
+  filter(year == 2025) %>%
   ggplot(aes(x = date, y = val, color = par)) +
-  geom_line(data = filter(buoy_fl_long,
-                          par == "fl_med_day"),
-            size = 2) +
-  geom_line(data = filter(buoy_fl_long,
-                          par == "mean_sal"),
-            size = 2) +
-  geom_line(data = filter(buoy_fl_long,
-                          par == "mean_temp"),
-            size = 2) +
-  geom_point(data = filter(buoy_fl_long,
-                          par == "chla"),
-            size = 4, pch = 8, stroke = 2) +
+  # ── Bloom timing annotations (add first so they sit behind data) ──
+  annotate("rect",
+           xmin = bloom_min, xmax = bloom_max,
+           ymin = -Inf, ymax = Inf,
+           fill = "darkgreen", alpha = 0.12) +
+  geom_vline(xintercept = bloom_mean,
+             linetype = "dashed", color = "darkgreen", linewidth = 1) +
+  geom_vline(xintercept = bloom_2025,
+             linetype = "solid", color = "darkgreen", linewidth = 2) +
+  # ── Buoy data ──
+  geom_line(data = filter(buoy_fl_long, year == 2025, par == "fl_med_day"),
+            linewidth = 2) +
+  geom_line(data = filter(buoy_fl_long, year == 2025, par == "mean_sal"),
+            linewidth = 2) +
+  # geom_line(data = filter(buoy_fl_long, year == 2025, par == "mean_temp"),
+  #           linewidth = 2) +
+  geom_point(data = filter(buoy_fl_long, year == 2025, par == "chla"),
+             size = 4, pch = 8, stroke = 2) +
+  # ── Scales ──
   ggsci::scale_color_jama(labels = c(expression(Chl[Discrete]),
-                                         expression(Chl[BUOY]),
-                                         expression(Salinity[BUOY]),
-                                     expression(Temp[BUOY]))) +
-  scale_x_date(limits = as_date(c("2025-01-01", "2025-12-31")),
-               expand = c(0, 0),date_breaks = "months", date_labels = "%b") +
+                                      expression(Chl[BUOY]),
+                                      expression(Salinity[BUOY])
+                                     # ,
+                                      # expression(Temp[BUOY]))
+                                     )) +
+  scale_x_date(limits     = as_date(c("2025-01-01", "2025-12-31")),
+               expand      = c(0, 0),
+               date_breaks = "months",
+               date_labels = "%b") +
   ylab(expression(atop(Chl~"(mg" ~ m^-3*")",
                        paste("Salinity,"~"Temp")))) +
   labs(color = NULL) +
   theme_bw() +
-  theme(legend.position = "right",
-        text = element_text(size = 35), #35
-        axis.text = element_text(color = "black"),
-        axis.title.x = element_blank(),
-        axis.text.x = element_blank())
+  theme(legend.position  = "right",
+        text             = element_text(size = 35),
+        axis.text        = element_text(color = "black"),
+        axis.title.x     = element_blank(),
+        axis.text.x      = element_blank())
 
 print(f_buoy_25)
+
+ggsave(here("figures", "buoy_2025_bloom_timing.png"),
+       plot = f_buoy_25, width = 14, height = 7, dpi = 300)
 ```
+```{r}
+# ── Compute bloom timing reference dates mapped to 2025 ──────────────────────
+bloom_min  <- as_date(paste0("2025-", format(as_date(min(sb_timing$yday) - 1,
+                              origin = "2025-01-01"), "%m-%d")))
+bloom_max  <- as_date(paste0("2025-", format(as_date(max(sb_timing$yday) - 1,
+                              origin = "2025-01-01"), "%m-%d")))
+bloom_mean <- as_date(mean(sb_timing$yday) - 1, origin = "2025-01-01")
+bloom_2025 <- sb_timing %>% filter(year == 2025) %>% pull(date)
+
+# ── Prepare data ──────────────────────────────────────────────────────────────
+
+# NA boundary rows for May gap-filled period (breaks solid line)
+may_gap_na <- buoy_fl_long %>%
+  filter(year == 2025, par == "fl_med_day", gap_filled == TRUE) %>%
+  slice(1, n()) %>%
+  mutate(val = NA_real_)
+
+# NA boundary rows for July gap
+july_gap_na_fl <- buoy_fl_long %>%
+  filter(year == 2025, par == "fl_med_day") %>%
+  filter(date == as.Date("2025-07-09") | date == as.Date("2025-07-14")) %>%
+  mutate(val = NA_real_)
+
+july_gap_na_sal <- buoy_fl_long %>%
+  filter(year == 2025, par == "mean_sal") %>%
+  filter(date == as.Date("2025-07-09") | date == as.Date("2025-07-14")) %>%
+  mutate(val = NA_real_)
+
+# fl_med_day solid: non-gap-filled rows + NA boundaries for both gaps
+fl_solid <- buoy_fl_long %>%
+  filter(year == 2025, par == "fl_med_day", gap_filled == FALSE) %>%
+  bind_rows(may_gap_na) %>%
+  bind_rows(july_gap_na_fl) %>%
+  arrange(date)
+
+# fl_med_day dashed: gap-filled rows + neighbouring solid points for connectivity
+fl_dashed <- buoy_fl_long %>%
+  filter(year == 2025, par == "fl_med_day", gap_filled == TRUE) %>%
+  bind_rows(
+    buoy_fl_long %>%
+      filter(year == 2025, par == "fl_med_day", gap_filled == FALSE) %>%
+      filter(
+        date == max(date[date < min(buoy_fl_long$date[buoy_fl_long$year == 2025 &
+                                                       buoy_fl_long$par == "fl_med_day" &
+                                                       buoy_fl_long$gap_filled == TRUE])]) |
+        date == min(date[date > max(buoy_fl_long$date[buoy_fl_long$year == 2025 &
+                                                       buoy_fl_long$par == "fl_med_day" &
+                                                       buoy_fl_long$gap_filled == TRUE])])
+      )
+  ) %>%
+  arrange(date)
+
+# Salinity with July gap NA boundaries
+sal_data <- buoy_fl_long %>%
+  filter(year == 2025, par == "mean_sal") %>%
+  bind_rows(july_gap_na_sal) %>%
+  arrange(date)
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+f_buoy_25 <- buoy_fl_long %>%
+  filter(year == 2025) %>%
+  ggplot(aes(x = date, y = val, color = par)) +
+  # ── Bloom timing annotations ──
+  annotate("rect",
+           xmin = bloom_min, xmax = bloom_max,
+           ymin = -Inf, ymax = Inf,
+           fill = "darkgreen", alpha = 0.12) +
+  geom_vline(xintercept = bloom_mean,
+             linetype = "dashed", color = "darkgreen", linewidth = 1) +
+  geom_vline(xintercept = bloom_2025,
+             linetype = "solid", color = "darkgreen", linewidth = 2) +
+  # ── fl_med_day solid ──
+  geom_line(data = fl_solid, aes(x = date, y = val),
+            linewidth = 2) +
+  # ── fl_med_day dashed (gap-filled) ──
+  geom_line(data = fl_dashed, aes(x = date, y = val),
+            linewidth = 2, linetype = "dashed") +
+  # ── Salinity ──
+  geom_line(data = sal_data, aes(x = date, y = val),
+            linewidth = 2) +
+  # ── Discrete chla ──
+  geom_point(data = filter(buoy_fl_long, year == 2025, par == "chla"),
+             size = 4, pch = 8, stroke = 2) +
+  # ── Scales ──
+  ggsci::scale_color_jama(labels = c(expression(Chl[Discrete]),
+                                     expression(Chl[BUOY]),
+                                     expression(Salinity[BUOY]))) +
+  scale_x_date(limits     = as_date(c("2025-01-01", "2025-12-31")),
+               expand      = c(0, 0),
+               date_breaks = "months",
+               date_labels = "%b") +
+  ylab(expression(atop(Chl~"(mg"~m^-3*")", "Salinity"))) +
+  labs(color = NULL) +
+  theme_bw() +
+  theme(legend.position = "right",
+        text            = element_text(size = 35),
+        axis.text       = element_text(color = "black"),
+        axis.title.x    = element_blank(),
+        axis.text.x     = element_blank())
+
+print(f_buoy_25)
+
+ggsave(here("figures", "buoy_2025_bloom_timing.png"),
+       plot = f_buoy_25, width = 14, height = 7, dpi = 300)
+```
+```{r}
+buoy_fl_long %>%
+  filter(year == 2025, par == "fl_med_day") %>%
+  filter(date >= as.Date("2025-05-02"), date <= as.Date("2025-05-20")) %>%
+  select(date, val, gap_filled) %>%
+  print(n = 30)
+```
+
+
+
+
+```{r}
+buoy_fl_gapfilled %>% 
+  filter(year(date) == 2025, gap_filled == TRUE) %>%
+  select(date, fl_med_day, gap_filled)
+
+buoy_fl_gapfilled %>%
+  filter(year(date) == 2025,
+         date >= as.Date("2025-05-02"),
+         date <= as.Date("2025-05-20")) %>%
+  select(date, fl_med_day, gap_filled)
+```
+
+
+```{r}
+# # ── Scale factor to map salinity onto chl axis ────────────────────────────────
+# # Get ranges from 2025 data
+# chl_max <- buoy_fl_long %>%
+#   filter(year == 2025, par %in% c("fl_med_day", "chla")) %>%
+#   pull(val) %>% max(na.rm = TRUE)
+# 
+# sal_data <- buoy_fl_long %>%
+#   filter(year == 2025, par == "mean_sal")
+# 
+# sal_min <- min(sal_data$val, na.rm = TRUE)
+# sal_max <- max(sal_data$val, na.rm = TRUE)
+# 
+# # Scale salinity to fit within chl axis range
+# sal_scale <- chl_max / (sal_max - sal_min)
+# sal_offset <- sal_min
+# 
+# sal_data <- sal_data %>%
+#   mutate(val_scaled = (val - sal_offset) * sal_scale)
+# 
+# # ── Plot ──────────────────────────────────────────────────────────────────────
+# f_buoy_25 <- buoy_fl_long %>%
+#   filter(year == 2025, par %in% c("fl_med_day", "chla")) %>%
+#   ggplot(aes(x = date)) +
+#   # ── Bloom timing annotations ──
+#   annotate("rect",
+#            xmin = bloom_min, xmax = bloom_max,
+#            ymin = -Inf, ymax = Inf,
+#            fill = "darkgreen", alpha = 0.12) +
+#   geom_vline(xintercept = bloom_mean,
+#              linetype = "dashed", color = "darkgreen", linewidth = 1) +
+#   geom_vline(xintercept = bloom_2025,
+#              linetype = "solid", color = "darkgreen", linewidth = 2) +
+#   # ── Buoy fluorescence ──
+#   geom_line(data = filter(buoy_fl_long, year == 2025, par == "fl_med_day"),
+#             aes(y = val), color = "cyan4", linewidth = 2) +
+#   # ── Discrete chl ──
+#   geom_point(data = filter(buoy_fl_long, year == 2025, par == "chla"),
+#              aes(y = val), color = "black", size = 4, pch = 8, stroke = 2) +
+#   # ── Salinity (scaled to chl axis) ──
+#   geom_line(data = sal_data,
+#             aes(y = val_scaled), color = "#e07b2a", linewidth = 2) +
+#   # ── Scales ──
+#   scale_x_date(limits     = as_date(c("2025-01-01", "2025-12-31")),
+#                expand      = c(0, 0),
+#                date_breaks = "months",
+#                date_labels = "%b") +
+#   scale_y_continuous(
+#     name = expression(Chl~"(mg" ~ m^-3*")"),
+#     sec.axis = sec_axis(
+#       transform = ~ . / sal_scale + sal_offset,
+#       name = "Salinity"
+#     )
+#   ) +
+#   # ── Legend via dummy data ──
+#   annotate("segment", x = as_date("2025-01-05"), xend = as_date("2025-01-20"),
+#            y = chl_max * 0.97, yend = chl_max * 0.97,
+#            color = "cyan4", linewidth = 2) +
+#   annotate("text", x = as_date("2025-01-22"), y = chl_max * 0.97,
+#            label = expression(Chl[BUOY]), hjust = 0, size = 10, color = "cyan4") +
+#   annotate("point", x = as_date("2025-01-12"), y = chl_max * 0.88,
+#            shape = 8, size = 4, stroke = 2, color = "black") +
+#   annotate("text", x = as_date("2025-01-22"), y = chl_max * 0.88,
+#            label = expression(Chl[Discrete]), hjust = 0, size = 10, color = "black") +
+#   annotate("segment", x = as_date("2025-01-05"), xend = as_date("2025-01-20"),
+#            y = chl_max * 0.79, yend = chl_max * 0.79,
+#            color = "#e07b2a", linewidth = 2) +
+#   annotate("text", x = as_date("2025-01-22"), y = chl_max * 0.79,
+#            label = "Salinity", hjust = 0, size = 10, color = "#e07b2a") +
+#   theme_bw() +
+#   theme(text             = element_text(size = 35),
+#         axis.text        = element_text(color = "black"),
+#         axis.title.x     = element_blank(),
+#         axis.text.x      = element_blank(),
+#         axis.title.y.right = element_text(color = "#e07b2a"),
+#         axis.text.y.right  = element_text(color = "#e07b2a"))
+# 
+# print(f_buoy_25)
+# 
+# ggsave(here("figures", "buoy_2025_bloom_timing.png"),
+#        plot = f_buoy_25, width = 14, height = 7, dpi = 300)
+```
+```{r}
+# # ── Background fluorescence for 2022 and 2023 ────────────────────────────────
+# buoy_bg <- buoy_fl_long %>%
+#   filter(year %in% c(2022, 2024), par == "fl_med_day") %>%
+#   mutate(date_2025 = as_date(paste0("2025-", format(date, "%m-%d"))),
+#          year = factor(year))
+# 
+# # ── Plot ──────────────────────────────────────────────────────────────────────
+# f_buoy_25 <- buoy_fl_long %>%
+#   filter(year == 2025, par %in% c("fl_med_day", "chla")) %>%
+#   ggplot(aes(x = date)) +
+#   # ── Bloom timing annotations ──
+#   annotate("rect",
+#            xmin = bloom_min, xmax = bloom_max,
+#            ymin = -Inf, ymax = Inf,
+#            fill = "darkgreen", alpha = 0.12) +
+#   geom_vline(xintercept = bloom_mean,
+#              linetype = "dashed", color = "darkgreen", linewidth = 1) +
+#   geom_vline(xintercept = bloom_2025,
+#              linetype = "solid", color = "darkgreen", linewidth = 2) +
+#   # ── Background years ──
+#   geom_line(data = buoy_bg,
+#             aes(x = date_2025, y = val, group = year, color = year),
+#             linewidth = 0.8, alpha = 0.5) +
+#   scale_color_manual(values = c("2022" = "steelblue", "2024" = "goldenrod"),
+#                      name = NULL) +
+#   # ── Buoy fluorescence 2025 ──
+#   geom_line(data = filter(buoy_fl_long, year == 2025, par == "fl_med_day"),
+#             aes(y = val), color = "cyan4", linewidth = 2) +
+#   # ── Discrete chl ──
+#   geom_point(data = filter(buoy_fl_long, year == 2025, par == "chla"),
+#              aes(y = val), color = "black", size = 4, pch = 8, stroke = 2) +
+#   # ── Scales ──
+#   scale_x_date(limits     = as_date(c("2025-01-01", "2025-12-31")),
+#                expand      = c(0, 0),
+#                date_breaks = "months",
+#                date_labels = "%b") +
+#   scale_y_continuous(name = expression(Chl~"(mg" ~ m^-3*")")) +
+#   # ── Legend ──
+#   annotate("segment", x = as_date("2025-01-05"), xend = as_date("2025-01-20"),
+#            y = chl_max * 0.97, yend = chl_max * 0.97,
+#            color = "cyan4", linewidth = 2) +
+#   annotate("text", x = as_date("2025-01-22"), y = chl_max * 0.97,
+#            label = expression(Chl[BUOY]~2025), hjust = 0, size = 10, color = "cyan4") +
+#   annotate("point", x = as_date("2025-01-12"), y = chl_max * 0.88,
+#            shape = 8, size = 4, stroke = 2, color = "black") +
+#   annotate("text", x = as_date("2025-01-22"), y = chl_max * 0.88,
+#            label = expression(Chl[Discrete]), hjust = 0, size = 10, color = "black") +
+#   annotate("segment", x = as_date("2025-01-05"), xend = as_date("2025-01-20"),
+#            y = chl_max * 0.79, yend = chl_max * 0.79,
+#            color = "steelblue", linewidth = 0.8) +
+#   annotate("text", x = as_date("2025-01-22"), y = chl_max * 0.79,
+#            label = "2022", hjust = 0, size = 10, color = "steelblue") +
+#   annotate("segment", x = as_date("2025-01-05"), xend = as_date("2025-01-20"),
+#            y = chl_max * 0.70, yend = chl_max * 0.70,
+#            color = "goldenrod", linewidth = 0.8) +
+#   annotate("text", x = as_date("2025-01-22"), y = chl_max * 0.70,
+#            label = "2024", hjust = 0, size = 10, color = "goldenrod") +
+#   theme_bw() +
+#   theme(text             = element_text(size = 35),
+#         axis.text        = element_text(color = "black"),
+#         axis.title.x     = element_blank(),
+#         axis.text.x      = element_blank())
+# 
+# print(f_buoy_25)
+# 
+# ggsave(here("figures", "buoy_2025_bloom_timing.png"),
+#        plot = f_buoy_25, width = 14, height = 7, dpi = 300)
+```
+
+
+```{r}
+buoy_fl_long %>%
+  filter(year == 2025) %>%
+  pivot_wider(names_from = par, values_from = val) %>%
+  filter(month(date) %in% 6:7) %>%
+  summarise(
+    cor_fl_sal  = cor(fl_med_day, mean_sal,  use = "complete.obs"),
+    cor_fl_temp = cor(fl_med_day, mean_temp, use = "complete.obs")
+  )
+```
+```{r}
+# ── Scatter: same-day temp vs fluorescence, 2025 Jun-Jul ─────────────────────
+
+scatter_2025 <- buoy_fl_long %>%
+  filter(year == 2025) %>%
+  pivot_wider(names_from = par, values_from = val) %>%
+  filter(month(date) %in% 6:7) %>%
+  filter(!is.na(fl_med_day), !is.na(mean_temp)) %>%
+  mutate(log_fl = log(fl_med_day + 0.1))
+
+lm_log <- lm(log_fl ~ mean_temp, data = scatter_2025)
+r2   <- round(summary(lm_log)$r.squared, 2)
+pval <- format.pval(summary(lm_log)$coefficients[2, 4], digits = 2)
+
+ggplot(scatter_2025, aes(x = mean_temp, y = log_fl)) +
+  geom_point(color = "black", alpha = 0.6, size = 4) +
+  geom_smooth(method = "lm", se = TRUE,
+              color = "black", fill = "grey70", alpha = 0.3, linewidth = 1.5) +
+  annotate("text", x = -Inf, y = Inf,
+           label = paste0("R\u00b2 = ", r2, "\np = ", pval),
+           hjust = -0.1, vjust = 1.3, size = 10) +
+  labs(x     = expression(Temperature~(degree*C)),
+       y     = expression(log(Chl)~(mg~m^-3)),
+       title = "2025: cold conditions associated with bloom pulses (Jun\u2013Jul)") +
+  theme_bw(base_size = 35) +
+  theme(panel.grid.minor = element_blank())
+
+ggsave(here("figures", "scatter_temp_fl_2025_junjul.png"),
+       width = 10, height = 9, dpi = 300)
+```
+
+
 
 
 
@@ -669,6 +1100,9 @@ f_ctd_fl_25 <- ctd_fl %>%
   geom_tile(aes(y = pres, fill = f_final), width = 20) +
   geom_hline(yintercept = 5,
              linetype = "dashed", size = 1, color = "white") +
+  geom_vline(xintercept = as.Date("2025-03-25"),
+             size = 2,
+             color = "darkgreen") +
   scale_y_reverse(breaks = seq(0, 50, by = 10)) +
   scale_fill_gradientn(colors = colors_v3,
                      values = scales::rescale(c(0, 2, 5, 10, 20, 50)),
@@ -789,17 +1223,48 @@ ggsave(here("figures", "panel_kc10_buoy_2022_2024_2025.png"),
 ```{r}
 #Setting plotting order phytoplankton groups
 
-#Order phytoplankton groups roughly from smallest to largest - create order list
-order_chem <- c("cyan", "hapt", "GA", "cryp",
-                   "dino", "raph", "dict", "diat")
+# PHYTOPLANKTON TAXON COLORS (for composition plots)
+taxon_order <- c("diat", "dict", "dino", "raph", "cryp", "GA", "hapt", "cyan")
 
-#Chemtax full data - Specify order of phyto groups for figures
-chem <- arrange(mutate(chem,
-                                group = factor(group,
-                                levels = order_chem)))
+taxon_colors <- c(
+  "diat" = "#E64B35",  # Red
+  "dict" = "#00A087",  # Teal
+  "dino" = "#3C5488",  # Dark blue
+  "raph" = "#7E9C3A",  # Olive green
+  "cryp" = "#F39B7F",  # Salmon/orange
+  "GA"   = "#8491B4",  # Purple
+  "hapt" = "#91D1C2",  # Light teal
+  "cyan" = "#FFC107"   # Golden yellow
+)
+
+taxon_colors <- setNames(taxon_colors[1:length(taxon_order)], taxon_order)
+
+# 
+# #Order phytoplankton groups roughly from smallest to largest - create order list
+# order_chem <- c("cyan", "hapt", "GA", "cryp",
+#                    "dino", "raph", "dict", "diat")
+# 
+# #Chemtax full data - Specify order of phyto groups for figures
+# chem <- arrange(mutate(chem,
+#                                 group = factor(group,
+#                                 levels = order_chem)))
+# 
+# 
+# taxon_colors <- setNames(taxon_colors[1:length(taxon_order)], taxon_order)
 ```
 
 ```{r}
+# taxon_colors <- c(
+#   "diat" = "#E64B35",  # Red
+#   "dict" = "#00A087",  # Teal
+#   "dino" = "#3C5488",  # Dark blue
+#   "cryp" = "#F39B7F",  # Orange
+#   "GA" = "#8491B4",    # Purple
+#   "hapt" = "#91D1C2",  # Light teal
+#   "cyan" = "#FFC107"   # Golden yellow
+# )
+
+
 f_chem_22 <- chem %>%
   ggplot() +
   geom_bar(aes(date, contribution, fill = fct_rev(group)),
@@ -846,13 +1311,27 @@ f_chem_24 <- chem %>%
 print(f_chem_24)
 ```
 ```{r}
+# Set factor levels so diatoms are on top (last in stack = on top)
+stack_order <- c("cyan", "hapt", "GA", "cryp", "raph", "dino", "dict", "diat")
+
+chem <- chem %>%
+  mutate(group = factor(group, levels = stack_order))
+
 f_chem_25 <- chem %>%
   ggplot() +
   geom_bar(aes(date, contribution, fill = fct_rev(group)),
            position = "stack", stat = "identity",
            alpha = 1, color = "black", size = 1,
            width = 16) +
-  ggsci::scale_fill_npg() +
+  geom_vline(xintercept = as.Date("2025-03-25"),
+             size = 2,
+             color = "darkgreen") +
+  # ggsci::scale_fill_npg() +
+  scale_fill_manual(
+    values = taxon_colors,
+    breaks = names(taxon_colors),
+    name = NULL
+  ) +
   scale_x_date(limits = as.Date(c("2025-01-01", "2025-12-31")),
                expand = c(0, 0),
                date_breaks = "months", date_labels = "%b") +
@@ -889,8 +1368,20 @@ f_25_panel <- ggarrange(f_wind_25, f_buoy_25, f_ctd_fl_25, f_chem_25,
                         ncol = 1)
 
 ggsave(here("figures", "panel_kc10_2025_buoy_discrete.png"), f_25_panel,
-        width = 16, height = 16, dpi = 300)
+        width = 19, height = 16, dpi = 300)
 ```
+
+```{r}
+f_25_panel <- ggarrange(f_wind_25, f_buoy_25, f_chem_25,
+                        ncol = 1)
+
+ggsave(here("figures", "panel_kc10_2025_buoy_discrete3.png"), f_25_panel,
+        width = 16, height = 12, dpi = 300)
+```
+
+
+
+
 
 ```{r}
 # ============================================

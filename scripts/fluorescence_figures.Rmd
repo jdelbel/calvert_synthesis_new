@@ -1,0 +1,217 @@
+---
+title: "Fluorescence figures: time series and station comparison"
+output: html_notebook
+---
+
+Makes two figures from the corrected fluorescence product
+(`fluorescence_correction_pipeline.Rmd`):
+
+1. **Time series** (`panel_kc10_interp_2025-11-25_no-density.png`): a Hovmöller
+   of monthly-median fluorescence (0-30 m) above monthly 0-30 m integrated
+   chlorophyll with anomalies from the monthly climatology.
+2. **Station comparison** (`integrated_comparison_station.png`): 0-30 m
+   integrated chlorophyll at KC10 vs FZH01 on dates both were sampled.
+
+**Integration method.** Each profile is integrated over 0-30 m with the
+trapezoidal rule. Profiles are averaged to one value per station per day, then
+per month for the time series. Profiles that don't cover the 0-30 m layer are
+excluded (`min_top`, `min_bottom` below) so shallow or partial casts don't bias
+the integrals low.
+
+**Changes from the earlier plotting notebook** (these change the figures):
+
+- **Monthly integrals were wrong.** The old code sorted all of a month's
+  profiles together by depth before summing, so each month's value was
+  effectively one profile (the last listed at each depth), not a monthly mean.
+  Now each profile is integrated, then averaged.
+- **Stations were pooled.** The old time series mixed KC10 and FZH01 (both in
+  the Hovmöller medians and the integrals) despite the KC10 file name. It now
+  uses `ts_station`; set it to `c("KC10", "FZH01")` to pool deliberately.
+- **Units.** Depth-integrated chlorophyll is mg m⁻² (the old label said
+  mg m⁻² × m).
+- **Colour scale.** The breakpoints at 2, 5, 10, 20 mg m⁻³ are now fixed
+  (`limits = c(0, 50)`). Before, they were relative to each plot's data range,
+  so they only matched those values when the data happened to span 0-50.
+
+```{r setup}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+library(patchwork)
+library(here)
+library(akima) # interp() for the Hovmöller grid
+
+ctd_fl <- read_csv(here("outputs", "flu_qc_2026-10-13.csv")) # pipeline output
+
+ts_station <- "KC10"  # station(s) for the time series
+int_depth  <- 30      # integrate 0 to this depth (dbar)
+min_top    <- 2       # profile must start at or above this depth...
+min_bottom <- 29      # ...and reach at least this depth to be integrated
+```
+
+## Integrated chlorophyll
+
+```{r integrate}
+# Trapezoidal integral over the non-missing points of one profile
+integrate_profile <- function(pres, value) {
+  o <- order(pres)
+  pres <- pres[o]
+  value <- value[o]
+  if (length(pres) < 2) return(NA_real_)
+  sum(diff(pres) * (head(value, -1) + tail(value, -1)) / 2)
+}
+
+profile_int <- ctd_fl %>%
+  filter(pres <= int_depth, !is.na(f_final)) %>%
+  group_by(id, date, station) %>%
+  summarise(int_chla = integrate_profile(pres, f_final),
+            top = min(pres),
+            bottom = max(pres),
+            .groups = "drop") %>%
+  mutate(complete = top <= min_top & bottom >= min_bottom)
+
+cat("Profiles excluded for incomplete 0-", int_depth, " m coverage: ",
+    sum(!profile_int$complete), " of ", nrow(profile_int), "\n", sep = "")
+
+# One value per station per day (averages sensors if more than one that day)
+station_daily <- profile_int %>%
+  filter(complete) %>%
+  group_by(date, station) %>%
+  summarise(int_chla = mean(int_chla), n_profiles = n(), .groups = "drop")
+
+monthly_int <- station_daily %>%
+  filter(station %in% ts_station) %>%
+  mutate(year_month = floor_date(date, "month"),
+         month = month(date)) %>%
+  group_by(year_month, month) %>%
+  summarise(int_chla = mean(int_chla), n_days = n(), .groups = "drop") %>%
+  group_by(month) %>%
+  mutate(climatology = mean(int_chla),
+         anomaly = int_chla - climatology) %>%
+  ungroup()
+```
+
+## Figure 1: time series
+
+```{r hovmoller-grid}
+# Monthly median profile, placed on the 15th of the month
+hov_monthly <- ctd_fl %>%
+  filter(station %in% ts_station, pres <= int_depth, !is.na(f_final)) %>%
+  mutate(year_month = floor_date(date, "month")) %>%
+  group_by(year_month, pres) %>%
+  summarise(f_final = median(f_final), .groups = "drop") %>%
+  mutate(date = year_month + days(14))
+
+# Linear interpolation onto a regular date x depth grid. Gaps between sampled
+# months are filled linearly, so long gaps will look smoother than the data.
+date_seq <- seq(min(hov_monthly$date), max(hov_monthly$date), length.out = 300)
+pres_seq <- seq(0, int_depth, length.out = 200)
+
+grid <- with(hov_monthly,
+             interp(x = as.numeric(date), y = pres, z = f_final,
+                    xo = as.numeric(date_seq), yo = pres_seq))
+
+interp_df <- expand.grid(date = date_seq, pres = pres_seq) %>%
+  mutate(f_final = as.vector(grid$z)) %>%
+  filter(pres > 0, pres < int_depth)
+```
+
+```{r fig-timeseries}
+fluor_colours <- colorRampPalette(c(
+  "#08306b", "#1f4e7a", "#2e6b89", "#4d8fc7", "#2fb3d4", "#00a693",
+  "#4daf4a", "#8cc152", "#ffd23f", "#ff8c42", "#e74c3c"
+))(50)
+
+x_limits <- range(c(interp_df$date, monthly_int$year_month), na.rm = TRUE)
+x_scale <- scale_x_date(expand = c(0, 0), date_breaks = "1 year",
+                        date_labels = "%Y", limits = x_limits)
+
+panel_theme <- theme_bw() +
+  theme(panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+        text = element_text(color = "black", size = 25),
+        axis.text = element_text(color = "black"),
+        axis.title.x = element_blank())
+
+p_hov <- ggplot(interp_df, aes(x = date, y = pres, fill = f_final)) +
+  geom_raster() +
+  x_scale +
+  scale_y_reverse(expand = c(0, 0), breaks = seq(0, 50, by = 5)) +
+  scale_fill_gradientn(
+    colors = fluor_colours,
+    values = scales::rescale(c(0, 2, 5, 10, 20, 50)),
+    limits = c(0, 50), oob = scales::squish,
+    na.value = "white",
+    name = expression(Chl~(mg~m^-3)),
+    guide = guide_colorbar(title.position = "right",
+                           title.theme = element_text(angle = 270, hjust = 0.5, size = 20))
+  ) +
+  labs(y = "Depth (m)") +
+  panel_theme +
+  theme(legend.position = "right",
+        legend.key.height = unit(1.5, "cm"),
+        axis.text.x = element_blank())
+
+p_int <- ggplot(monthly_int, aes(x = year_month)) +
+  geom_col(aes(y = anomaly, fill = anomaly > 0), alpha = 0.7, width = 20) +
+  geom_line(aes(y = int_chla), color = "black", linewidth = 0.8) +
+  geom_point(aes(y = int_chla), color = "black", size = 1.5) +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "blue"), guide = "none") +
+  x_scale +
+  labs(y = expression(atop("0-30 m integrated", Chl~(mg~m^-2)))) +
+  panel_theme
+
+timeseries_plot <- p_hov / p_int
+timeseries_plot
+
+ggsave(here("figures", "panel_kc10_interp_2026-10-13.png"),
+       timeseries_plot, width = 16, height = 8)
+```
+
+## Figure 2: station comparison
+
+```{r fig-station-comparison}
+comparison_data <- station_daily %>%
+  filter(station %in% c("KC10", "FZH01")) %>%
+  select(date, station, int_chla) %>%
+  pivot_wider(names_from = station, values_from = int_chla,
+              names_prefix = "integrated_") %>%
+  filter(!is.na(integrated_KC10), !is.na(integrated_FZH01))
+
+cor_test <- cor.test(comparison_data$integrated_KC10, comparison_data$integrated_FZH01)
+lm_fit <- lm(integrated_FZH01 ~ integrated_KC10, data = comparison_data)
+
+stats_text <- paste0(
+  "r = ", round(cor_test$estimate, 3), "\n",
+  "p = ", format.pval(cor_test$p.value, digits = 3), "\n",
+  "R² = ", round(summary(lm_fit)$r.squared, 3), "\n",
+  "slope = ", round(coef(lm_fit)[2], 3), "\n",
+  "n = ", nrow(comparison_data)
+)
+
+axis_limits <- range(c(comparison_data$integrated_KC10,
+                       comparison_data$integrated_FZH01), na.rm = TRUE)
+
+ggplot(comparison_data, aes(x = integrated_KC10, y = integrated_FZH01)) +
+  geom_point(size = 3, alpha = 0.7, color = "#2E86AB") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey50", linewidth = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "#A23B72",
+              fill = "#A23B72", alpha = 0.2) +
+  annotate("text",
+           x = axis_limits[1] + diff(axis_limits) * 0.05,
+           y = axis_limits[2] - diff(axis_limits) * 0.05,
+           label = stats_text, hjust = 0, vjust = 1, size = 4, fontface = "bold") +
+  coord_fixed(ratio = 1, xlim = axis_limits, ylim = axis_limits) +
+  labs(x = expression(KC10~"0-30 m integrated Chl"~(mg~m^-2)),
+       y = expression(FZH01~"0-30 m integrated Chl"~(mg~m^-2)),
+       title = "Integrated chlorophyll: KC10 vs FZH01",
+       subtitle = "Daily station means on dates both stations were sampled",
+       caption = "Dashed line = 1:1") +
+  theme_bw(base_size = 14) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold"))
+
+ggsave(here("figures", "integrated_comparison_station_2026-10-13.png"), width = 9, height = 6)
+```

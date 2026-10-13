@@ -1,0 +1,553 @@
+---
+title: "CTD Fluorescence Correction Pipeline (KC10, FZH01)"
+output: html_notebook
+---
+
+This notebook turns raw CTD fluorescence profiles from KC10 and FZH01 into a
+chlorophyll product calibrated against discrete samples. It runs from raw
+Portal downloads to the final CSV. The exploratory analysis behind these choices
+(dark offset investigations, replicate-cast timing, slope seasonality and
+biomass dependence, low-biomass fits) is in the original workbook
+`CTD Fluorometer Correction Workbook`, kept as an archive.
+
+**Steps**
+
+1. Keep downcasts and profiles passing visual QC (`fluorescence_QC_flags_*.csv`).
+2. Dark offset: median of the 10 lowest values deeper than 100 m, per cast,
+   subtracted from the profile (floored at 0). Casts too shallow for this get
+   the nearest deep offset from the same sensor.
+3. Average replicate casts by date, station, depth and sensor.
+4. Discrete chlorophyll: bulk GF/F, gap-filled with the size-fractionated sum.
+5. Cast-by-cast regressions of discrete chlorophyll on fluorescence, with and
+   without the 1 m sample (to handle surface quenching).
+6. Sensor-wide calibrations from casts flagged AV in `ctd_discrete_flags5.csv`
+   plus 1-2 sample casts. Applied as `f_calibrated = slope * f_dm`. The intercept
+   is deliberately not applied: the dark offset has already been removed, so the
+   calibration is treated as a pure gain.
+7. NPQ hybrid correction for profiles listed as AV in `quench_correction_fits.xlsx`.
+8. Saturated profiles replaced with interpolated discrete chlorophyll.
+
+**Manual decisions** live in two files rather than in the code:
+`manual_decisions.csv` (outlier exclusions, separate calibration groups,
+saturated profiles, each with a reason) and `quench_correction_fits.xlsx`
+(which profiles get NPQ correction, with per-profile settings and comments).
+In the quench file, `SVD` means "do not apply the correction".
+
+**Output columns** of the final file include `f_dm` (dark-corrected daily-mean
+fluorescence), `f_calibrated` (slope-corrected), `f_final` (best estimate:
+NPQ- or saturation-corrected where applicable, otherwise `f_calibrated`) and
+`profile_correction` (which correction produced `f_final` for that profile).
+
+```{r setup}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(purrr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(here)
+library(readxl)
+library(patchwork)
+library(rioja) # interp.dataset() for saturated profiles
+
+source(here("functions", "fluor_qc_functions.R"))
+
+make_figures <- TRUE # set FALSE to just produce the output files
+run_date <- Sys.Date()
+```
+
+```{r settings}
+# Input files
+paths <- list(
+  ctd       = here("files", "8_binAvg-1762199720021.csv"),           # Portal CTD profiles
+  ctd_flags = here("outputs", "fluorescence_QC_flags_20251103.csv"),  # visual profile QC
+  chl       = here("files", "2025-11-03_HakaiData_chlorophyll.csv"),  # discrete chl
+  hplc      = here("files", "2025-11-18_HakaiData_hplc.csv"),         # validation only
+  fit_flags = here("outputs", "ctd_discrete_flags5.csv"),             # cast-fit QC
+  npq_fits  = here("outputs", "quench_correction_fits.xlsx"),         # NPQ settings
+  decisions = here("files", "manual_decisions.csv")                 # exclusions etc.
+)
+
+# Output files
+out <- list(
+  calibration = here("outputs", paste0("ctd_fluorescence_calibration_stats_", run_date, ".csv")),
+  cast_fits   = here("outputs", paste0("ctd_cast_fits_", run_date, ".csv")),
+  final       = here("outputs", paste0("flu_qc_", run_date, ".csv"))
+)
+
+stations        <- c("KC10", "FZH01")
+dark_min_pres   <- 100  # dark offset uses data deeper than this (dbar)
+dark_n          <- 10   # ...needs at least this many bins, and uses the n lowest
+min_cast_samples <- 3   # casts with fewer discrete samples go to the sensor-wide fit only
+sat_span        <- 0.3  # loess span for saturated-profile interpolation
+```
+
+## Load data
+
+```{r load}
+f_raw     <- read_csv(paths$ctd)
+flags     <- read_csv(paths$ctd_flags)
+chl_raw   <- read_csv(paths$chl)
+hplc_raw  <- read.csv(paths$hplc)
+fit_flag  <- read_csv(paths$fit_flags)
+npq_fits  <- read_excel(paths$npq_fits)
+decisions <- read_decisions(paths$decisions)
+```
+
+## 1. CTD profiles and QC
+
+```{r ctd}
+f_all <- f_raw %>%
+  filter(`Cast Direction Flag` == "d") %>%
+  mutate(date = date(`Measurement time`),
+         year = year(`Measurement time`)) %>%
+  select(castpk = `Cast PK`,
+         hakai_id = `Hakai ID`,
+         Cruise,
+         ctdNum = `CTD serial number`,
+         station = Station,
+         lat = Latitude...11,
+         long = Longitude...12,
+         time = `Measurement time`,
+         date, year,
+         pres = `Pressure (dbar)`,
+         flu = `Fluorometry Chlorophyll (ug/L)`,
+         flu_flag = `Fluorometry Chlorophyll flag`,
+         par = `PAR (umol m-2 s-1)`,
+         turb = `Turbidity (FTU)`)
+
+# The join message shows which columns link the QC flags to the profiles.
+f_flagged <- f_all %>% left_join(flags)
+
+f_issue <- f_flagged %>% filter(flag != "AV")  # removed profiles, for the figure below
+f <- f_flagged %>% filter(flag == "AV", station %in% stations)
+```
+
+```{r fig-removed-profiles, eval = make_figures}
+ggplot(f_issue %>% filter(pres < 100), aes(x = flu, y = pres)) +
+  geom_line(orientation = "y") +
+  geom_point() +
+  geom_text(data = f_issue %>% filter(pres < 100) %>% group_by(castpk) %>% slice(1),
+            aes(label = comment), x = Inf, y = Inf, hjust = 1.1, vjust = 1.5, size = 3) +
+  scale_y_reverse() +
+  facet_wrap(~ castpk, scales = "free_x") +
+  labs(x = "Fluorescence", y = "Pressure (dbar)")
+
+ggsave(here("figures", "fluorescence_issue_profiles.png"), width = 10, height = 8, dpi = 300)
+```
+
+## 2. Dark offset
+
+```{r dark-offset}
+dark_offsets <- f %>%
+  filter(pres > dark_min_pres) %>%
+  group_by(castpk, date, station, ctdNum) %>%
+  filter(n() >= dark_n) %>%
+  slice_min(flu, n = dark_n) %>%
+  summarise(dark_offset = median(flu, na.rm = TRUE),
+            dark_offset_sd = sd(flu, na.rm = TRUE),
+            max_depth = max(pres),
+            .groups = "drop")
+
+# Early casts that were too shallow get the nearest deep offset from the same
+# sensor. Shallow-derived offsets are biased high (see archive workbook), and
+# these sensors' deep offsets are stable, so this adds little error.
+f <- f %>%
+  left_join(dark_offsets, by = c("castpk", "date", "station", "ctdNum")) %>%
+  mutate(dark_offset_filled = is.na(dark_offset)) %>%
+  arrange(ctdNum, date) %>%
+  group_by(ctdNum) %>%
+  fill(dark_offset, dark_offset_sd, .direction = "downup") %>%
+  ungroup() %>%
+  mutate(f_offset = pmax(flu - dark_offset, 0))
+```
+
+```{r fig-dark-offsets, eval = make_figures}
+dark_offsets %>%
+  ggplot(aes(x = date, y = dark_offset, color = as.factor(ctdNum))) +
+  geom_errorbar(aes(ymin = dark_offset - dark_offset_sd,
+                    ymax = dark_offset + dark_offset_sd), width = 0, alpha = 0.4) +
+  geom_point(size = 2) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  scale_color_brewer(palette = "Dark2") +
+  labs(y = expression(paste("Dark offset (mg ", m^{-3}, ")")),
+       title = "Fluorometer dark offsets from deep water (>100 m)") +
+  facet_grid(ctdNum ~ ., scales = "free_y") +
+  theme_bw(base_size = 16) +
+  theme(legend.position = "none", axis.title.x = element_blank(),
+        panel.grid.minor = element_blank())
+
+ggsave(here("figures", "dark_offsets.png"), width = 14, height = 8, dpi = 300)
+```
+
+## 3. Daily-mean profiles
+
+Replicate casts on the same day are averaged. A few days have casts several
+hours apart (e.g. 2017-08-31 FZH01), which adds scatter to the matchups;
+matching bottles to the nearest cast in time would be an improvement.
+
+```{r daily-mean}
+f_dm <- f %>%
+  group_by(date, station, pres, ctdNum) %>%
+  summarise(f_dm = mean(f_offset),
+            f_sd = sd(f_offset),
+            n_prof = n(),
+            .groups = "drop") %>%
+  mutate(f_dm = round(f_dm, 2),
+         f_lower = f_dm - f_sd,
+         f_upper = f_dm + f_sd) %>%
+  unite(id, c(date, station, ctdNum), sep = "-", remove = FALSE)
+```
+
+## 4. Discrete chlorophyll
+
+Bulk GF/F is used where available, gap-filled with the size-fractionated sum
+(complete 3-filter sets only). Flags AV, SVC, ADL and unflagged are accepted:
+SVC samples usually look fine (metadata notes on filter handling), and ADL
+samples (pre-dilution era, above calibration range) should in theory skew low
+but don't obviously. Surface samples (0 m) are set to 1 m to match the CTD.
+
+```{r discrete}
+ok_flags <- c("AV", "SVC", "ADL")
+
+c_dm <- chl_raw %>%
+  select(date, station = site_id, line_out_depth, filter_type, chla, chla_flag) %>%
+  filter(filter_type == "Bulk GF/F",
+         chla_flag %in% ok_flags | is.na(chla_flag)) %>%
+  group_by(date, station, line_out_depth) %>%
+  summarise(chl_dm = mean(chla), .groups = "drop") %>%
+  mutate(pres = round(line_out_depth)) %>%
+  drop_na() %>%
+  group_by(date, station) %>%
+  mutate(n_dep = n()) %>%
+  ungroup() %>%
+  mutate(year = year(date),
+         pres = if_else(pres == 0, 1, as.numeric(pres)))
+
+# Size-fractionated: daily mean per filter, keep complete 3-filter sets, sum.
+# (The middle filter changed from 2 to 3 um; this doesn't affect the sum.)
+# Note: unlike bulk, SF depths are not rounded, so a non-integer SF depth will
+# not match a CTD bin.
+c_sum <- chl_raw %>%
+  select(date, station = site_id, line_out_depth, filter_type, chla, chla_flag) %>%
+  filter(filter_type != "Bulk GF/F",
+         chla_flag %in% ok_flags | is.na(chla_flag),
+         !is.na(chla), chla > 0) %>%
+  group_by(date, station, line_out_depth, filter_type) %>%
+  summarise(avg_chla = mean(chla), .groups = "drop") %>%
+  group_by(date, station, line_out_depth) %>%
+  filter(n() == 3) %>%
+  summarise(sum = sum(avg_chla), .groups = "drop") %>%
+  rename(pres = line_out_depth) %>%
+  mutate(pres = if_else(pres == 0, 1, as.numeric(pres)))
+
+c_join <- c_dm %>%
+  full_join(c_sum, by = c("date", "station", "pres")) %>%
+  mutate(chl_comb = if_else(is.na(chl_dm), sum, chl_dm)) %>%
+  group_by(date, station) %>%
+  mutate(n_dep = n()) %>%
+  ungroup() %>%
+  select(date, station, pres, n_dep, sum, chl_dm, chl_comb) %>%
+  mutate(diff = round(chl_dm - sum, 2))
+
+f_dm <- f_dm %>% left_join(c_join, by = c("date", "station", "pres"))
+```
+
+```{r fig-discrete-validation, eval = make_figures}
+# Bulk vs SF sum (slope ~0.89: bulk slightly higher, possibly pigment loss
+# through stacked filters) and combined product vs HPLC (slope ~1.55).
+c_join_comp <- c_join %>%
+  filter(!is.na(chl_dm), !is.na(sum)) %>%
+  mutate(outlier = abs(chl_dm - sum) >= 5)
+
+hplc <- hplc_raw %>%
+  mutate(date = ymd(date)) %>%
+  group_by(date, site_id, line_out_depth) %>%
+  summarise(tchl_dm = mean(all_chl_a), .groups = "drop") %>%
+  mutate(pres = round(line_out_depth)) %>%
+  drop_na() %>%
+  mutate(pres = if_else(pres == 0, 1, as.numeric(pres))) %>%
+  rename(station = site_id)
+
+c_join_hplc <- c_join_comp %>%
+  filter(!outlier) %>%
+  left_join(hplc, by = c("date", "station", "pres")) %>%
+  filter(!is.na(tchl_dm), !is.na(chl_comb))
+
+one_to_one_plot <- function(d, x, y, xlab, ylab, colour_outliers = FALSE) {
+  fit_d <- if (colour_outliers) filter(d, !outlier) else d
+  m <- lm(reformulate(x, y), data = fit_d)
+  lims <- range(c(d[[x]], d[[y]]), na.rm = TRUE)
+  lab <- sprintf("y = %.2fx + %.2f\nR² = %.3f\nn = %d", coef(m)[2], coef(m)[1],
+                 summary(m)$r.squared, nrow(fit_d))
+  p <- ggplot(d, aes(.data[[x]], .data[[y]])) +
+    geom_abline(linetype = "dashed", color = "gray50") +
+    geom_smooth(data = fit_d, method = "lm", color = "#2166ac", fill = "#2166ac", alpha = 0.2) +
+    annotate("text", x = lims[1] + 0.1 * diff(lims), y = lims[2] - 0.1 * diff(lims),
+             label = lab, hjust = 0, size = 3.5) +
+    coord_fixed(xlim = lims, ylim = lims) +
+    labs(x = xlab, y = ylab) +
+    theme_bw() + theme(panel.grid.minor = element_blank())
+  if (colour_outliers) {
+    p + geom_point(aes(color = outlier), size = 3, alpha = 0.6) +
+      scale_color_manual(values = c("FALSE" = "black", "TRUE" = "#d73027"),
+                         labels = c("Included", "Outlier (|diff| >= 5)"), name = NULL)
+  } else {
+    p + geom_point(size = 3, alpha = 0.6)
+  }
+}
+
+p_sf <- one_to_one_plot(c_join_comp, "chl_dm", "sum",
+                        expression("Chl"[BULK]~"(mg m"^-3*")"),
+                        expression("Chl"[SF-SUM]~"(mg m"^-3*")"), colour_outliers = TRUE)
+p_hplc <- one_to_one_plot(c_join_hplc, "tchl_dm", "chl_comb",
+                          expression("Chl"[HPLC]~"(mg m"^-3*")"),
+                          expression("Chl"[COMB]~"(mg m"^-3*")"))
+p_sf
+ggsave(here("figures", "chl_comparison.png"), p_sf, width = 6, height = 6, dpi = 300, bg = "white")
+p_hplc
+ggsave(here("figures", "chl_hplc_comparison.png"), p_hplc, width = 6, height = 6, dpi = 300, bg = "white")
+```
+
+## 5. Cast-by-cast fits
+
+Matchups are split into casts with 3+ discrete samples (cast-specific fits) and
+casts with 1-2 samples (used only in the sensor-wide calibration). Individual
+matchups listed under `exclude_fit_point` in `manual_decisions.csv` are removed
+first; these are mostly discrete samples that appear to miss a narrow SCM.
+
+```{r cast-fits}
+point_excl <- decisions %>%
+  filter(decision == "exclude_fit_point") %>%
+  transmute(id, pres = as.numeric(pres))
+
+f_fit <- f_dm %>% filter(!is.na(chl_comb), !is.na(f_dm))
+
+f_fit_multi <- f_fit %>%
+  group_by(date, station, ctdNum) %>%
+  filter(n() >= min_cast_samples) %>%
+  ungroup()
+
+warn_unmatched(paste(point_excl$id, point_excl$pres),
+               paste(f_fit_multi$id, f_fit_multi$pres), "exclude_fit_point")
+
+f_fit_multi <- f_fit_multi %>% anti_join(point_excl, by = c("id", "pres"))
+
+f_fit_few <- f_fit %>%
+  group_by(date, station, ctdNum) %>%
+  filter(n() < min_cast_samples) %>%
+  ungroup()
+
+cast_models <- f_fit_multi %>%
+  group_by(date, station, ctdNum) %>%
+  group_modify(~ select_cast_model(.x)) %>%
+  ungroup() %>%
+  unite(id, c(date, station, ctdNum), sep = "-", remove = FALSE) %>%
+  arrange(date, station, ctdNum) %>%
+  mutate(method = "cast_specific")
+```
+
+## 6. Sensor-wide calibrations
+
+```{r calibration}
+fit_flag_clean <- fit_flag %>%
+  mutate(id = paste(id, ctdNum, sep = "-")) %>%
+  select(id, slope_flag = flag)
+
+# Multi-sample casts I judged acceptable (AV), using the surface sample only
+# where the cast fit chose to.
+f_fit_av <- f_fit_multi %>%
+  left_join(cast_models %>% select(id, intercept, slope, r2, p.value,
+                                   use_surface, quenched, nobs), by = "id") %>%
+  left_join(fit_flag_clean, by = "id") %>%
+  filter(slope_flag == "AV") %>%
+  filter(use_surface | pres != 1)
+
+few_excl    <- decision_ids(decisions, "exclude_single_depth_cast")
+sensor_excl <- decision_ids(decisions, "exclude_single_depth_sensor")
+sep_ids     <- decision_ids(decisions, "separate_calibration")
+warn_unmatched(few_excl, f_fit_few$id, "exclude_single_depth_cast")
+warn_unmatched(sep_ids, f_fit_av$id, "separate_calibration")
+
+f_fit_combined <- bind_rows(
+  f_fit_av %>% mutate(data_type = "multiple_depths"),
+  f_fit_few %>%
+    filter(!id %in% few_excl, !ctdNum %in% sensor_excl) %>%
+    mutate(data_type = "single_depth")
+) %>%
+  assign_calibration_type(sep_ids)
+
+sep_vec <- paste0("c('", paste(sep_ids, collapse = "', '"), "')")
+
+calibration_stats <- f_fit_combined %>%
+  group_by(ctdNum, calibration_type) %>%
+  group_modify(~ fit_line(.x)) %>%
+  ungroup() %>%
+  mutate(id_filter = case_when(
+    calibration_type == "excl_april" ~ paste0("!id %in% ", sep_vec),
+    calibration_type == "april_only" ~ paste0("id %in% ", sep_vec),
+    TRUE ~ NA_character_
+  )) %>%
+  arrange(match(calibration_type, c("standard", "excl_april", "april_only")), ctdNum) %>%
+  select(ctdNum, slope, intercept, r2, adj_r2, p_value, n, calibration_type, id_filter)
+
+calibration_stats
+```
+
+```{r fig-calibration, eval = make_figures}
+cal_labels <- calibration_stats %>%
+  group_by(ctdNum) %>%
+  summarise(label = paste(sprintf("%s: y = %.2fx + %.2f, R² = %.2f, n = %d",
+                                  calibration_type, slope, intercept, r2, n),
+                          collapse = "\n"), .groups = "drop")
+
+ggplot(f_fit_combined, aes(f_dm, chl_comb)) +
+  geom_abline(linetype = "dashed", color = "gray40") +
+  geom_smooth(data = ~ filter(.x, data_type == "multiple_depths"), aes(group = id),
+              method = "lm", se = FALSE, linewidth = 0.4, color = "steelblue") +
+  geom_abline(data = calibration_stats,
+              aes(slope = slope, intercept = intercept, linetype = calibration_type),
+              linewidth = 1.2) +
+  geom_point(aes(color = data_type), size = 2.5, alpha = 0.6) +
+  geom_text(data = cal_labels, aes(x = Inf, y = -Inf, label = label),
+            hjust = 1.02, vjust = -0.3, size = 3, inherit.aes = FALSE) +
+  scale_color_manual(values = c(multiple_depths = "gray30", single_depth = "orange"),
+                     name = "Data type") +
+  scale_linetype_manual(values = c(standard = "solid", excl_april = "solid", april_only = "dotted"),
+                        name = "Calibration") +
+  facet_wrap(~ ctdNum, scales = "free", labeller = labeller(ctdNum = ~ paste("Sensor", .x))) +
+  labs(x = "CTD fluorescence, dark corrected (f_dm)",
+       y = expression(paste("Discrete chlorophyll (mg m"^-3, ")")),
+       title = "CTD fluorescence calibrations by sensor",
+       subtitle = "Blue = individual cast fits; black = calibration applied; dashed grey = 1:1") +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "top", panel.grid.minor = element_blank(), aspect.ratio = 1)
+
+ggsave(here("figures", "fluorescence_calibration_by_sensor_2026-10-13.png"), width = 12, height = 10, dpi = 300)
+```
+
+```{r apply-calibration}
+f_dm_cal <- f_dm %>%
+  assign_calibration_type(sep_ids) %>%
+  inner_join(calibration_stats %>% select(-id_filter), by = c("ctdNum", "calibration_type")) %>%
+  relocate(calibration_type, .after = n) %>%
+  mutate(f_calibrated = slope * f_dm)
+
+# Profiles from sensors without a calibration are dropped by the join above.
+setdiff(unique(f_dm$ctdNum), unique(calibration_stats$ctdNum))
+```
+
+## 7. NPQ hybrid correction
+
+Profiles flagged `AV` in `quench_correction_fits.xlsx` get the hybrid
+correction (see `npq_hybrid()` in the functions file). `threshold` and `span`
+were tuned per profile with `plot_npq_correction()`. Note that where the
+discrete samples stop shallower than the transition depth (e.g. 2016-03-25 and
+2016-09-23 FZH01, sampled only to 30 m), `f_final` switches back to
+`f_calibrated` below the deepest sample.
+
+```{r npq}
+npq_av <- npq_fits %>% filter(quench_cor_flag == "AV")
+warn_unmatched(npq_av$id, f_dm_cal$id, "quench_correction_fits")
+
+npq_corrected <- pmap_dfr(
+  list(npq_av$id, npq_av$threshold, npq_av$span),
+  function(pid, thr, sp) {
+    npq_hybrid(filter(f_dm_cal, id == pid), threshold = thr, span = sp) %>%
+      select(id, pres, f_calibrated_npq = f_npq)
+  }
+)
+
+f_dm_cal <- f_dm_cal %>%
+  left_join(npq_corrected, by = c("id", "pres")) %>%
+  mutate(f_final = if_else(!is.na(f_calibrated_npq), f_calibrated_npq, f_calibrated)) %>%
+  select(-f_calibrated_npq)
+```
+
+```{r fig-npq-example, eval = make_figures}
+# Example; try other profiles/settings when adding rows to the quench file.
+plot_npq_correction("2021-09-05-KC10-18032", data = f_dm_cal, threshold = 1, span = 0.3)
+```
+
+## 8. Saturated profiles
+
+Two high-biomass KC10 profiles saturated the fluorometer near 5 mg m-3. These
+are replaced with a loess interpolation of the discrete samples (1 m
+resolution, down to the deepest sample). For these profiles `f_dm` is NA and
+`f_calibrated = f_final = interpolated discrete chlorophyll`.
+
+```{r saturated}
+sat_keys <- tibble(key = decision_ids(decisions, "replace_saturated")) %>%
+  mutate(date = as.Date(str_sub(key, 1, 10)),
+         station = str_sub(key, 12))
+
+sat_interp <- c_join %>%
+  semi_join(sat_keys, by = c("date", "station")) %>%
+  select(date, station, pres, chla = chl_comb) %>%
+  interp_discrete_profiles(span = sat_span)
+
+# Built from all downcasts (the saturated casts may have failed visual QC).
+# One row per depth even if there were replicate casts.
+sat_rows <- f_all %>%
+  semi_join(sat_keys, by = c("date", "station")) %>%
+  distinct(date, station, ctdNum, pres, year) %>%
+  left_join(sat_interp, by = c("date", "station", "pres")) %>%
+  transmute(id = paste(date, station, ctdNum, sep = "-"),
+            date, station, ctdNum, year, pres,
+            f_final = f_interpolated,
+            f_dm = NA_real_,
+            f_calibrated = f_final)
+
+f_final <- f_dm_cal %>%
+  filter(!id %in% sat_rows$id) %>%
+  bind_rows(sat_rows) %>%
+  arrange(date, station, pres) %>%
+  mutate(profile_correction = case_when(
+    id %in% sat_rows$id ~ "saturation_discrete_interp",
+    id %in% npq_av$id   ~ "slope_npq_loess",
+    TRUE                ~ "slope"
+  ))
+```
+
+```{r fig-saturated, eval = make_figures}
+f_all %>%
+  semi_join(sat_keys, by = c("date", "station")) %>%
+  filter(pres < 50) %>%
+  ggplot(aes(y = pres)) +
+  geom_line(aes(x = flu, color = "Raw fluorescence", group = castpk), orientation = "y") +
+  geom_line(data = filter(sat_interp, pres < 50),
+            aes(x = f_interpolated, color = "Interpolated discrete"), orientation = "y") +
+  geom_point(data = c_join %>% semi_join(sat_keys, by = c("date", "station")) %>% filter(pres < 50),
+             aes(x = chl_comb, color = "Discrete samples"), size = 3) +
+  scale_y_reverse(name = "Pressure (dbar)") +
+  scale_color_manual(name = "", values = c("Raw fluorescence" = "#2E86AB",
+                                           "Interpolated discrete" = "#F18F01",
+                                           "Discrete samples" = "#A23B72")) +
+  facet_wrap(~ date, scales = "free_x") +
+  labs(x = "Chlorophyll (mg m-3)") +
+  theme_bw(base_size = 14) + theme(legend.position = "top")
+
+ggsave(here("figures", "sensor_issues_2022.png"), width = 7, height = 8)
+```
+
+## Write outputs
+
+```{r write}
+write_csv(calibration_stats, out$calibration)
+write_csv(cast_models, out$cast_fits)
+write_csv(f_final, out$final)
+```
+
+## Diagnostics
+
+Use `plot_cast_detailed()` to look at why a cast's matchup is poor.
+
+```{r diagnostics, eval = FALSE}
+sensor_medians <- cast_models %>%
+  group_by(ctdNum) %>%
+  summarise(median_slope = median(slope, na.rm = TRUE),
+            median_intercept = median(intercept, na.rm = TRUE))
+
+plot_cast_detailed("2014-06-19-KC10-18066", f_dm, f_fit_multi, cast_models, sensor_medians)
+```
